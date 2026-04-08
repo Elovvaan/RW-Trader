@@ -60,11 +60,14 @@ async fn main() -> Result<()> {
 
         // --serve: read-only web UI against an existing database (no trading)
         if let Some(pos) = args.iter().position(|a| a == "--serve") {
+            let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
+            let default_addr = format!("0.0.0.0:{}", port);
             let addr = args.get(pos + 1)
-                .map(|s| s.as_str())
-                .unwrap_or("127.0.0.1:8080");
+                .map(|s| s.clone())
+                .unwrap_or(default_addr);
 
             tracing_subscriber::fmt().with_env_filter("info").init();
+            info!("Server running on port {}", port);
 
             let db_path = std::env::var("EVENT_DB_PATH")
                 .unwrap_or_else(|_| "rw-trader-events.db".into());
@@ -100,7 +103,7 @@ async fn main() -> Result<()> {
                 authority: Arc::new(authority::AuthorityLayer::new()),
                 strategy:  Arc::new(Mutex::new(strategy::StrategyEngine::new())),
             };
-            webui::run(addr, state).await?;
+            webui::run(&addr, state).await?;
             return Ok(());
         }
         if let Some(pos) = args.iter().position(|a| a == "--recent") {
@@ -183,7 +186,10 @@ async fn main() -> Result<()> {
 
     // ── 1c. Web UI address (optional) ────────────────────────────────────────
     // Spawn is deferred to step 6b, after exec/truth/risk are constructed.
-    let web_ui_addr = std::env::var("WEB_UI_ADDR").ok();
+    // If WEB_UI_ADDR is not set, fall back to 0.0.0.0:{PORT} when PORT is available.
+    let web_ui_addr = std::env::var("WEB_UI_ADDR")
+        .ok()
+        .or_else(|| std::env::var("PORT").ok().map(|p| format!("0.0.0.0:{}", p)));
 
     // ── 2. Executor (starts in Booting, wired to event store) ───────────────
     let cb_config = executor::CircuitBreakerConfig {
@@ -296,6 +302,12 @@ async fn main() -> Result<()> {
             authority: Arc::clone(&authority),
             strategy: Arc::clone(&strategy_engine),
         };
+        // Capture the port from the env var directly; fall back to parsing the address.
+        let port_str = std::env::var("PORT")
+            .unwrap_or_else(|_| std::env::var("WEB_UI_ADDR")
+                .ok()
+                .and_then(|a| a.rsplit(':').next().map(str::to_string))
+                .unwrap_or_else(|| "8080".to_string()));
         let addr = addr.clone();
         tokio::spawn(async move {
             if let Err(e) = webui::run(&addr, ui_state).await {
@@ -303,6 +315,7 @@ async fn main() -> Result<()> {
             }
         });
         info!("Web UI available at http://{}", web_ui_addr.as_deref().unwrap_or(""));
+        info!("Server running on port {}", port_str);
     }
 
     // ── 7. Spawn reconciliation loop (with executor + event store) ──────────
