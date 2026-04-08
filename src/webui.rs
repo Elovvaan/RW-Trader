@@ -1309,6 +1309,10 @@ mod tests {
         let r = page_assistant(&state).await;
         assert!(!r.contains("<script>xss()"), "Operator action must be HTML-escaped");
     }
+
+    // ── page_trade - empty id shows form ─────────────────────────────────────
+    #[tokio::test]
+    async fn test_trade_empty_id_shows_form() {
         let state = filled_state();
         let r = page_trade(&state, "").await;
         assert!(r.starts_with("HTTP/1.1 200 OK"));
