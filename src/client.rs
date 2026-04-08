@@ -564,6 +564,77 @@ impl BinanceClient {
 
         Self::parse_response(resp, "place_order").await
     }
+
+    // ── User data stream ──────────────────────────────────────────────────────
+    //
+    // A listenKey is required to subscribe to user data events (order fills,
+    // account updates) via WebSocket.
+    //
+    // Workflow:
+    //   1. Call `create_listen_key()` to obtain a key (valid for 60 minutes).
+    //   2. Connect to: `wss://stream.binance.us:9443/ws/{listenKey}`
+    //      (use `feed::build_user_data_url(ws_stream_base, &listen_key)`)
+    //   3. Call `keepalive_listen_key()` every ~30 minutes to extend validity.
+    //   4. Call `delete_listen_key()` on clean shutdown.
+    //
+    // Note: these endpoints require only the API key header, not a signature.
+
+    /// Create a new listenKey for the user data stream.
+    /// `POST /api/v3/userDataStream`
+    pub async fn create_listen_key(&self) -> Result<String> {
+        let url = format!("{}/api/v3/userDataStream", self.base_url);
+        debug!("POST userDataStream (create listenKey)");
+        let resp = self
+            .http
+            .post(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await?;
+        let body: serde_json::Value = Self::parse_response(resp, "userDataStream/create").await?;
+        body["listenKey"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("userDataStream/create: listenKey missing in response"))
+    }
+
+    /// Extend the validity of an existing listenKey by 60 minutes.
+    /// Call this every ~30 minutes while the stream is active.
+    /// `PUT /api/v3/userDataStream`
+    pub async fn keepalive_listen_key(&self, listen_key: &str) -> Result<()> {
+        let url = format!(
+            "{}/api/v3/userDataStream?listenKey={}",
+            self.base_url, listen_key
+        );
+        debug!(listen_key, "PUT userDataStream (keepalive)");
+        let resp = self
+            .http
+            .put(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await?;
+        // 200 OK with empty body `{}` on success
+        Self::parse_response::<serde_json::Value>(resp, "userDataStream/keepalive").await?;
+        Ok(())
+    }
+
+    /// Close and invalidate a listenKey.
+    /// Call this on clean shutdown.
+    /// `DELETE /api/v3/userDataStream`
+    pub async fn delete_listen_key(&self, listen_key: &str) -> Result<()> {
+        let url = format!(
+            "{}/api/v3/userDataStream?listenKey={}",
+            self.base_url, listen_key
+        );
+        debug!(listen_key, "DELETE userDataStream (close)");
+        let resp = self
+            .http
+            .delete(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await?;
+        Self::parse_response::<serde_json::Value>(resp, "userDataStream/delete").await?;
+        Ok(())
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
