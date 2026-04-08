@@ -168,16 +168,25 @@ impl FeedState {
 /// Reconnects automatically. Runs until the process exits.
 ///
 /// This is the production path used by the signal loop.
+///
+/// `ws_stream_base` must be the **stream** base URL — the host-only portion of
+/// the Binance stream endpoint, with no trailing path.  Examples:
+///   - Binance.US production:  `wss://stream.binance.us:9443`
+///   - Binance testnet:        `wss://testnet.binance.vision`
+///
+/// This is distinct from the WebSocket API base (`wss://ws-api.binance.us:443/ws-api/v3`),
+/// which is used for signed API calls and is not used here.
+///
+/// The combined stream URL is constructed as:
+///   `{ws_stream_base}/stream?streams={sym}@bookTicker/{sym}@trade`
 pub async fn run_feed_with_state(
-    ws_base: &str,
+    ws_stream_base: &str,
     symbol: &str,
     feed_state: Arc<Mutex<FeedState>>,
 ) -> Result<()> {
-    let sym_lower = symbol.to_lowercase();
-    let stream_path = format!("{}@bookTicker/{}@trade", sym_lower, sym_lower);
-    let url = format!("{}/stream?streams={}", ws_base.trim_end_matches('/'), stream_path);
+    let url = build_market_data_url(ws_stream_base, symbol);
 
-    info!(url = %url, "Connecting to Binance WebSocket (signal mode)");
+    info!(url = %url, "Connecting to Binance market-data stream (signal mode)");
 
     let mut reconnect_delay = Duration::from_secs(1);
     let mut attempt = 0u32;
@@ -200,11 +209,13 @@ pub async fn run_feed_with_state(
 }
 
 /// Original logging-only feed. Kept for standalone use / testing without signal engine.
-pub async fn run_feed(ws_base: &str, symbol: &str) -> Result<()> {
-    let sym_lower = symbol.to_lowercase();
-    let stream_path = format!("{}@bookTicker/{}@trade", sym_lower, sym_lower);
-    let url = format!("{}/stream?streams={}", ws_base.trim_end_matches('/'), stream_path);
-    info!(url = %url, "Connecting to Binance WebSocket");
+///
+/// `ws_stream_base` must be the **stream** base URL (e.g. `wss://stream.binance.us:9443`
+/// for Binance.US, or `wss://testnet.binance.vision` for testnet).  Do not include a
+/// trailing path; the combined stream path `/stream?streams=…` is appended here.
+pub async fn run_feed(ws_stream_base: &str, symbol: &str) -> Result<()> {
+    let url = build_market_data_url(ws_stream_base, symbol);
+    info!(url = %url, "Connecting to Binance market-data stream");
 
     let mut reconnect_delay = Duration::from_secs(1);
     let mut attempt = 0u32;
@@ -343,5 +354,77 @@ fn dispatch_logging(text: &str) {
             }
         }
         Err(e) => { debug!(error = %e, "Could not parse message"); }
+    }
+}
+
+// ── URL helpers ───────────────────────────────────────────────────────────────
+
+/// Build the combined market-data stream URL for bookTicker + trade.
+///
+/// `ws_stream_base` must be the host-only stream base URL, e.g.:
+///   - `wss://stream.binance.us:9443`  (Binance.US production)
+///   - `wss://testnet.binance.vision`  (Binance testnet)
+///
+/// The returned URL uses the combined-stream endpoint:
+///   `{ws_stream_base}/stream?streams={sym}@bookTicker/{sym}@trade`
+pub fn build_market_data_url(ws_stream_base: &str, symbol: &str) -> String {
+    let sym_lower = symbol.to_lowercase();
+    let stream_path = format!("{}@bookTicker/{}@trade", sym_lower, sym_lower);
+    format!("{}/stream?streams={}", ws_stream_base.trim_end_matches('/'), stream_path)
+}
+
+/// Build the user data stream URL for a given listenKey.
+///
+/// `ws_stream_base` is the same stream base URL as for market data.
+/// The returned URL uses the single-stream `/ws/` path:
+///   `{ws_stream_base}/ws/{listenKey}`
+pub fn build_user_data_url(ws_stream_base: &str, listen_key: &str) -> String {
+    format!("{}/ws/{}", ws_stream_base.trim_end_matches('/'), listen_key)
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn market_data_url_binance_us() {
+        let url = build_market_data_url("wss://stream.binance.us:9443", "BTCUSDT");
+        assert_eq!(
+            url,
+            "wss://stream.binance.us:9443/stream?streams=btcusdt@bookTicker/btcusdt@trade"
+        );
+    }
+
+    #[test]
+    fn market_data_url_testnet() {
+        let url = build_market_data_url("wss://testnet.binance.vision", "BTCUSDT");
+        assert_eq!(
+            url,
+            "wss://testnet.binance.vision/stream?streams=btcusdt@bookTicker/btcusdt@trade"
+        );
+    }
+
+    #[test]
+    fn market_data_url_trailing_slash_stripped() {
+        // Ensure a trailing slash in the base URL doesn't produce a double slash.
+        let url = build_market_data_url("wss://stream.binance.us:9443/", "ETHUSDT");
+        assert_eq!(
+            url,
+            "wss://stream.binance.us:9443/stream?streams=ethusdt@bookTicker/ethusdt@trade"
+        );
+    }
+
+    #[test]
+    fn user_data_url_binance_us() {
+        let url = build_user_data_url("wss://stream.binance.us:9443", "abc123listenkey");
+        assert_eq!(url, "wss://stream.binance.us:9443/ws/abc123listenkey");
+    }
+
+    #[test]
+    fn user_data_url_trailing_slash_stripped() {
+        let url = build_user_data_url("wss://stream.binance.us:9443/", "mykey");
+        assert_eq!(url, "wss://stream.binance.us:9443/ws/mykey");
     }
 }

@@ -159,7 +159,7 @@ async fn main() -> Result<()> {
     let api_key    = require_env("BINANCE_API_KEY")?;
     let api_secret = require_env("BINANCE_API_SECRET")?;
     let rest_url   = require_env("BINANCE_REST_URL")?;
-    let ws_url     = require_env("BINANCE_WS_URL")?;
+    let ws_url     = require_env("BINANCE_WS_STREAM_URL")?;
     let symbol     = std::env::var("SYMBOL").unwrap_or_else(|_| "BTCUSDT".into());
     let live_trade = std::env::var("LIVE_TRADE")
         .map(|v| v.eq_ignore_ascii_case("true"))

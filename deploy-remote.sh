@@ -56,7 +56,16 @@ if [ ! -f "${ENV_FILE}" ]; then
 BINANCE_API_KEY=your_binance_testnet_api_key_here
 BINANCE_API_SECRET=your_binance_testnet_api_secret_here
 BINANCE_REST_URL=https://testnet.binance.vision
-BINANCE_WS_URL=wss://testnet.binance.vision/ws
+# Stream base URL for market-data WebSocket feeds (bookTicker, trade, etc.).
+# This is the host-only stream endpoint — do NOT include a path suffix.
+#
+# Binance.US production:  wss://stream.binance.us:9443
+# Binance testnet:        wss://testnet.binance.vision
+#
+# NOTE: This is the *stream* base, not the WebSocket API base.
+# The WebSocket API base (wss://ws-api.binance.us:443/ws-api/v3) is used for
+# signed order-placement calls and is separate from this market-data stream.
+BINANCE_WS_STREAM_URL=wss://testnet.binance.vision
 
 # ── Symbol ─────────────────────────────────────────────────
 SYMBOL=BTCUSDT
