@@ -1,1 +1,1 @@
-web: cargo run
+web: ./bin/rw-trader
