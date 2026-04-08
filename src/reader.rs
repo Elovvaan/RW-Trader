@@ -36,7 +36,7 @@ pub enum LifecycleStage {
 }
 
 impl LifecycleStage {
-    fn label(&self) -> &'static str {
+    pub fn label(&self) -> &'static str {
         match self {
             LifecycleStage::MarketContext   => "MARKET",
             LifecycleStage::SignalGenerated => "SIGNAL",

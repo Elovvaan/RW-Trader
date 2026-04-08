@@ -186,7 +186,8 @@ impl EventStore for SqliteEventStore {
                  ORDER BY id DESC
                  LIMIT ?1"
             )?;
-            collect_rows(stmt.query(params![limit as i64])?)
+            let rows = collect_rows(stmt.query(params![limit as i64])?);
+            rows
         })
     }
 
@@ -206,11 +207,12 @@ impl EventStore for SqliteEventStore {
                    AND occurred_at <= ?3
                  ORDER BY id ASC"
             )?;
-            collect_rows(stmt.query(params![
+            let rows = collect_rows(stmt.query(params![
                 symbol,
                 from.to_rfc3339(),
                 to.to_rfc3339(),
-            ])?)
+            ])?);
+            rows
         })
     }
 
@@ -223,7 +225,8 @@ impl EventStore for SqliteEventStore {
                  WHERE client_order_id = ?1
                  ORDER BY id ASC"
             )?;
-            collect_rows(stmt.query(params![client_order_id])?)
+            let rows = collect_rows(stmt.query(params![client_order_id])?);
+            rows
         })
     }
 
@@ -236,7 +239,8 @@ impl EventStore for SqliteEventStore {
                  WHERE correlation_id = ?1
                  ORDER BY id ASC"
             )?;
-            collect_rows(stmt.query(params![correlation_id])?)
+            let rows = collect_rows(stmt.query(params![correlation_id])?);
+            rows
         })
     }
 
@@ -250,7 +254,8 @@ impl EventStore for SqliteEventStore {
                    AND occurred_at <= ?2
                  ORDER BY id ASC"
             )?;
-            collect_rows(stmt.query(params![from.to_rfc3339(), to.to_rfc3339()])?)
+            let rows = collect_rows(stmt.query(params![from.to_rfc3339(), to.to_rfc3339()])?);
+            rows
         })
     }
 
@@ -271,11 +276,12 @@ impl EventStore for SqliteEventStore {
                    AND occurred_at <= ?3
                  ORDER BY id ASC"
             )?;
-            collect_rows(stmt.query(params![
+            let rows = collect_rows(stmt.query(params![
                 symbol,
                 from.to_rfc3339(),
                 to.to_rfc3339(),
-            ])?)
+            ])?);
+            rows
         })
     }
 
@@ -296,11 +302,12 @@ impl EventStore for SqliteEventStore {
                    AND occurred_at <= ?3
                  ORDER BY id ASC"
             )?;
-            collect_rows(stmt.query(params![
+            let rows = collect_rows(stmt.query(params![
                 symbol,
                 from.to_rfc3339(),
                 to.to_rfc3339(),
-            ])?)
+            ])?);
+            rows
         })
     }
 }

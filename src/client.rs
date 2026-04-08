@@ -85,7 +85,7 @@ pub struct Fill {
     pub trade_id: i64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct MyTrade {
     pub id: i64,
     pub symbol: String,
@@ -588,7 +588,7 @@ fn urlenccode(s: &str) -> String {
 
 /// Compute average fill price from a FULL order response's fills.
 fn avg_fill_price(fills: &Vec<Fill>) -> Option<f64> {
-    let total_qty: f64 = fills.iter().filter_map(|f| f.qty.parse().ok()).sum();
+    let total_qty: f64 = fills.iter().filter_map(|f| f.qty.parse::<f64>().ok()).sum();
     if total_qty == 0.0 {
         return None;
     }
