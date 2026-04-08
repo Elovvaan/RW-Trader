@@ -24,6 +24,8 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::store::EventStore;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();

@@ -469,6 +469,10 @@ mod tests {
                 cooldown_after_loss: Duration::from_secs(60),
                 max_spread_bps:      10.0,
                 max_feed_staleness:  Duration::from_secs(5),
+                min_order_interval:  Duration::from_secs(1),
+                signal_dedup_window: Duration::from_secs(5),
+                max_open_orders:     1,
+                max_slippage_bps:    20.0,
             },
             pos,
         )
@@ -488,11 +492,13 @@ mod tests {
     }
 
     fn buy_order(qty: f64) -> ProposedOrder {
-        ProposedOrder { symbol: "BTCUSDT".into(), side: OrderSide::Buy, qty }
+        // expected_price: 0.0 skips slippage check; these tests focus on other risk gates
+        ProposedOrder { symbol: "BTCUSDT".into(), side: OrderSide::Buy, qty, expected_price: 0.0 }
     }
 
     fn sell_order(qty: f64) -> ProposedOrder {
-        ProposedOrder { symbol: "BTCUSDT".into(), side: OrderSide::Sell, qty }
+        // expected_price: 0.0 skips slippage check; these tests focus on other risk gates
+        ProposedOrder { symbol: "BTCUSDT".into(), side: OrderSide::Sell, qty, expected_price: 0.0 }
     }
 
     // ── Kill switch ───────────────────────────────────────────────────────────
