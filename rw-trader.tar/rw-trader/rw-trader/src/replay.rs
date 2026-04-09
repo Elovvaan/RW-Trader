@@ -511,6 +511,9 @@ mod tests {
             signal_dedup_window: Duration::from_secs(0),
             max_open_orders:     10,
             max_slippage_bps:    100.0,
+            max_loss_per_trade_usd: 1_000.0,
+            max_consecutive_losses: 999,
+            loss_streak_cooldown: Duration::from_secs(1),
         }
     }
 
