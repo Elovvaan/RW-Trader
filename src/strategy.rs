@@ -149,7 +149,13 @@ fn common_guards(
         return Some(StrategyDecision::wait(id.clone(), "no market data"));
     }
     if metrics.spread_bps > max_spread_bps {
-        return Some(StrategyDecision::wait(id.clone(), format!("spread {:.1}bps > {:.1}", metrics.spread_bps, max_spread_bps)));
+        return Some(StrategyDecision::wait(
+            id.clone(),
+            format!(
+                "entry_rejected stage=strategy.common_guards spread_bps={:.2} threshold_bps={:.2}",
+                metrics.spread_bps, max_spread_bps
+            ),
+        ));
     }
     None
 }

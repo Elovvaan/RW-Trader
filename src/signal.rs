@@ -286,12 +286,18 @@ impl SignalEngine {
     ) -> Option<SignalResult> {
         // Guard: spread pre-filter (risk re-checks, but save the round-trip)
         if metrics.spread_bps > self.config.max_entry_spread_bps {
-            debug!(
-                spread_bps = metrics.spread_bps,
-                limit = self.config.max_entry_spread_bps,
-                "Entry blocked: spread too wide"
+            let reason = format!(
+                "entry_rejected stage=signal.entry.spread_guard spread_bps={:.2} threshold_bps={:.2}",
+                metrics.spread_bps,
+                self.config.max_entry_spread_bps
             );
-            return None;
+            warn!(
+                spread_bps = metrics.spread_bps,
+                threshold_bps = self.config.max_entry_spread_bps,
+                stage = "signal.entry.spread_guard",
+                "Entry blocked: spread too wide (hard gate)"
+            );
+            return Some(self.hold(metrics, &reason));
         }
 
         // Guard: minimum data samples
@@ -797,12 +803,19 @@ mod tests {
         let mut feed = build_bullish_feed();
         // Widen spread beyond 5 bps limit
         feed.bid = 50000.0;
-        feed.ask = 50010.0; // ~20 bps
+        feed.ask = 50100.0; // ~20 bps
         let truth = clean_truth("BTCUSDT");
 
         let result = engine.evaluate(&feed, &truth);
-        assert_ne!(result.decision, SignalDecision::Buy,
-            "Should not buy on wide spread");
+        assert_eq!(result.decision, SignalDecision::Hold,
+            "Wide spread must hard-reject entry at signal layer");
+        assert!(
+            result.reason.contains("stage=signal.entry.spread_guard")
+                && result.reason.contains("spread_bps=")
+                && result.reason.contains("threshold_bps="),
+            "expected spread rejection reason with stage/spread/threshold, got: {}",
+            result.reason
+        );
     }
 
     #[test]
