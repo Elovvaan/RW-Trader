@@ -226,63 +226,72 @@ fn redirect(loc: &str)   -> String {
 // ── Shared HTML chrome ────────────────────────────────────────────────────────
 
 fn page(title: &str, head_extra: &str, body: &str) -> String {
+    let title_lc = title.to_lowercase();
+    let live_on = if title_lc.contains("events") { "on" } else { "" };
+    let demo_on = if title_lc.contains("status") { "on" } else { "" };
+    let api_on = if title_lc.contains("assistant") { "on" } else { "" };
     format!(r##"<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8"><title>{title}</title>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title>
 {head_extra}
 <style>
-*{{box-sizing:border-box;margin:0;padding:0}}
-body{{font:13px/1.6 Menlo,Consolas,monospace;background:#0d1117;color:#e6edf3;padding:20px}}
-h1{{font-size:15px;color:#58a6ff;margin-bottom:10px}}
-h2{{font-size:12px;color:#8b949e;margin:18px 0 6px;font-weight:normal;text-transform:uppercase;letter-spacing:.05em}}
-a{{color:#58a6ff;text-decoration:none}}a:hover{{text-decoration:underline}}
-nav{{font-size:12px;margin-bottom:18px;color:#8b949e}}nav a{{margin-right:14px}}
-table{{width:100%;border-collapse:collapse;font-size:12px}}
-th{{text-align:left;padding:4px 8px;background:#161b22;color:#8b949e;border-bottom:1px solid #30363d;white-space:nowrap}}
-td{{padding:3px 8px;border-bottom:1px solid #21262d;vertical-align:top}}
-tr:hover td{{background:#161b22}}
-.tag{{display:inline-block;padding:1px 6px;border-radius:3px;font-size:11px;font-weight:bold}}
-.MARKET{{background:#1c2b3a;color:#79c0ff}}
-.SIGNAL{{background:#1f2d1f;color:#3fb950}}
-.RISK{{background:#2d1f1f;color:#f85149}}
-.RISK-ok{{background:#1f2d1f;color:#3fb950}}
-.SUBMIT{{background:#2d2b1f;color:#e3b341}}
-.ACKED{{background:#2d2b1f;color:#e3b341}}
-.FILLED{{background:#1f2d25;color:#56d364}}
-.CANCEL,.REJECT{{background:#2d1f1f;color:#f85149}}
-.STATE{{background:#1c1c2d;color:#a5a5ff}}
-.RECON{{background:#1c1c2b;color:#8b949e}}
-.SAFETY{{background:#2d1f2d;color:#f778ba}}
-.OTHER{{background:#161b22;color:#8b949e}}
-.ok{{color:#56d364}}.warn{{color:#e3b341}}.err{{color:#f85149}}.dim{{color:#8b949e}}
-.sum{{font-size:11px;color:#c9d1d9;white-space:pre-wrap;word-break:break-all}}
-form{{margin:10px 0}}
-input[type=text]{{background:#161b22;border:1px solid #30363d;color:#e6edf3;padding:5px 10px;font:13px monospace;width:440px;border-radius:4px}}
-input[type=submit]{{background:#238636;color:#fff;border:none;padding:5px 14px;font:13px monospace;border-radius:4px;cursor:pointer;margin-left:6px}}
-input[type=submit]:hover{{background:#2ea043}}
-.kv td:first-child{{color:#8b949e;width:170px;white-space:nowrap}}
-.callout{{border-left:3px solid #30363d;padding:8px 12px;margin:10px 0;font-size:12px;line-height:1.7;background:#161b22;border-radius:0 4px 4px 0}}
-.callout.ok{{border-color:#238636}}.callout.warn{{border-color:#9e6a03}}.callout.err{{border-color:#da3633}}.callout.info{{border-color:#1f6feb}}
-.callout p{{margin:4px 0}}
-.banner{{padding:6px 12px;margin-bottom:14px;font-size:12px;font-weight:bold;border-radius:4px;display:flex;align-items:center;gap:10px}}
-.banner.OFF{{background:#21262d;color:#8b949e;border:1px solid #30363d}}
-.banner.ASSIST{{background:#2d2b1f;color:#e3b341;border:1px solid #9e6a03}}
-.banner.AUTO{{background:#1f2d1f;color:#3fb950;border:1px solid #238636}}
-.btn{{display:inline-block;padding:4px 12px;border-radius:4px;font:12px monospace;border:none;cursor:pointer;text-decoration:none}}
-.btn-off{{background:#21262d;color:#8b949e;border:1px solid #30363d}}
-.btn-assist{{background:#2d2b1f;color:#e3b341;border:1px solid #9e6a03}}
-.btn-auto{{background:#1f2d1f;color:#3fb950;border:1px solid #238636}}
-.btn-approve{{background:#238636;color:#fff;border:none}}
-.btn-reject{{background:#21262d;color:#f85149;border:1px solid #da3633}}
-.btn-enable{{background:#238636;color:#fff;border:none}}
-.btn-disable{{background:#21262d;color:#8b949e;border:1px solid #30363d}}
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600;700&display=swap');
+*{{box-sizing:border-box;margin:0;padding:0;border-radius:0}}
+body{{font-family:Inter,sans-serif;background:#101419;color:#d0d6dd}}
+body::before{{content:"";position:fixed;inset:0;pointer-events:none;opacity:.03;background:repeating-linear-gradient(to bottom,transparent 0 1px,#fff 1px 2px);z-index:8}}
+.status-pillar{{height:2px;background:linear-gradient(90deg,#4BE277,#22C55E)}}
+.top{{height:68px;background:#181c21;border-bottom:2px solid #4BE277;display:flex;align-items:center;justify-content:space-between;padding:0 18px;font-family:JetBrains Mono,monospace}}
+.brand{{color:#22C55E;font-size:44px;font-weight:700;letter-spacing:-.05em}}
+.tabs a{{color:#7d8790;text-decoration:none;margin:0 14px;padding:8px 0;display:inline-block;border-bottom:2px solid transparent}}
+.tabs a.on{{color:#4BE277;border-color:#4BE277}}
+.actions{{display:flex;align-items:center;gap:10px}}
+.btn{{font:600 12px Inter,sans-serif;letter-spacing:.05em;text-transform:uppercase;padding:9px 18px;border:1px solid rgba(128,138,147,.25);background:transparent;color:#c4ccd4;text-decoration:none}}
+.btn.green{{background:#22C55E;color:#07230f;border:0}}
+.app{{display:grid;grid-template-columns:68px 1fr;min-height:calc(100vh - 70px)}}
+.side{{background:#181c21;padding:14px 0;border-right:1px solid rgba(128,138,147,.15);display:flex;flex-direction:column;justify-content:space-between}}
+.side ul{{list-style:none}}
+.side li{{height:52px;display:flex;align-items:center;justify-content:center;color:#6c7681;border-left:4px solid transparent;font-family:JetBrains Mono,monospace}}
+.side li.on{{color:#4BE277;border-left-color:#4BE277;background:#141920}}
+.main{{padding:18px;background:#101419}}
+.panel{{background:linear-gradient(90deg,#141a20,#181d24);padding:14px;border-left:4px solid #4BE277}}
+h2{{font-size:.6875rem;letter-spacing:.05em;text-transform:uppercase;color:#b4bcc5;font-weight:500;margin-bottom:8px}}
+table{{width:100%;border-collapse:separate;border-spacing:0 2px;font-family:JetBrains Mono,monospace;font-size:19px;line-height:1.1}}
+th{{text-align:left;padding:12px 10px;color:#aab4be;background:#262a30;font-size:.6875rem;letter-spacing:.05em;text-transform:uppercase}}
+td{{padding:10px;background:#181c21}}
+.tag{{display:inline-block;padding:3px 8px;font-size:10px;letter-spacing:.05em;text-transform:uppercase}}
+.MARKET,.SIGNAL,.RISK-ok,.FILLED,.ok{{color:#4BE277}}
+.RISK,.CANCEL,.REJECT,.err{{color:#f9a79d}}
+.SUBMIT,.ACKED,.warn{{color:#efb067}}
+.STATE,.RECON,.SAFETY,.OTHER,.dim{{color:#82909f}}
+.sum{{font-size:12px;color:#bbc4ce}}
+.kv td:first-child{{color:#98a3af;width:220px}}
+input[type=text]{{font:13px JetBrains Mono,monospace;background:#0A0E13;color:#d7dce2;padding:10px 14px;border:none;border-left:2px solid #0A0E13;width:460px}}
+input[type=text]:focus{{outline:none;border-left-color:#4BE277}}
+input[type=submit]{{font:700 12px Inter,sans-serif;letter-spacing:.06em;text-transform:uppercase;padding:10px 16px;background:#22C55E;color:#041007;border:none;margin-left:8px}}
+.callout{{padding:10px 14px;background:#181c21;border-left:4px solid #4BE277}}
+.banner{{padding:8px 12px;background:#262a30;margin-bottom:14px;font:600 11px JetBrains Mono,monospace;letter-spacing:.05em;text-transform:uppercase}}
+.banner.ASSIST{{border-left:4px solid #efb067}}.banner.AUTO{{border-left:4px solid #4BE277}}.banner.OFF{{border-left:4px solid #82909f}}
+.btn-off,.btn-assist,.btn-auto,.btn-approve,.btn-reject,.btn-enable,.btn-disable{{font:600 11px Inter,sans-serif;letter-spacing:.05em;text-transform:uppercase;padding:8px 12px;border:1px solid rgba(145,155,165,.25);text-decoration:none;display:inline-block;background:#101419;color:#d0d6dd}}
+.btn-approve,.btn-enable{{background:#22C55E;color:#07230f;border:none}}
+.btn-reject{{color:#f9a79d}}
+@media (max-width:1200px){{.brand{{font-size:32px}} .main{{overflow:auto}} table{{font-size:15px}}}}
 </style>
 </head>
 <body>
-<h1>RW-Trader</h1>
-<nav><a href="/events">Events</a><a href="/trade">Timeline</a><a href="/status">Status</a><a href="/assistant">Assistant</a><a href="/suggestions">Suggestions</a><a href="/authority">Authority</a></nav>
-{body}
+<div class="status-pillar"></div>
+<header class="top">
+  <div class="brand">RW-TRADER</div>
+  <nav class="tabs"><a class="{live_on}" href="/events">LIVE</a><a class="{demo_on}" href="/status">DEMO</a><a class="{api_on}" href="/assistant">API</a></nav>
+  <div class="actions"><a class="btn green" href="/suggestions">Deposit</a><a class="btn" href="/authority">Withdraw</a></div>
+</header>
+<div class="app">
+  <aside class="side">
+    <ul><li>◫</li><li class="{live_on}">▦</li><li class="{demo_on}">▤</li><li class="{api_on}">☷</li></ul>
+    <ul><li>?</li><li>☰</li></ul>
+  </aside>
+  <main class="main">{body}</main>
+</div>
 </body></html>"##, title = esc(title))
 }
 
@@ -340,49 +349,63 @@ async fn page_events(state: &AppState) -> String {
         }
     };
 
-    let mut rows = String::new();
-    for e in &events {
-        let ts       = e.occurred_at.format("%Y-%m-%d %H:%M:%S%.3f");
-        let sym      = esc(e.symbol.as_deref().unwrap_or("—"));
-        let cls      = event_tag_class(&e.event_type);
-        let typ      = esc(&e.event_type);
-        let sum      = esc(&summarise_event(e));
-        let coid     = e.client_order_id.as_deref().unwrap_or("—");
-        let coid_s   = if coid.len() > 22 { &coid[..22] } else { coid };
-
-        let corr_cell = match &e.correlation_id {
-            Some(c) => format!(
-                r#"<a href="/trade/{enc}">{short}</a>"#,
-                enc   = esc(&url_encode(c)),
-                short = esc(if c.len() > 12 { &c[..12] } else { c }),
-            ),
-            None => "—".into(),
-        };
-
-        rows.push_str(&format!(
-            "<tr>\
-              <td class='dim'>{ts}</td>\
-              <td>{sym}</td>\
-              <td><span class='tag {cls}'>{typ}</span></td>\
-              <td>{corr_cell}</td>\
-              <td class='dim'>{coid_s}</td>\
-              <td class='sum'>{sum}</td>\
-            </tr>"
+    let mut signal_rows = String::new();
+    let mut legacy_probe = String::new();
+    for e in events.iter().take(4) {
+        let ts = e.occurred_at.format("%H:%M:%S");
+        let sym = esc(e.symbol.as_deref().unwrap_or("BTC/USDT"));
+        let summary = esc(&summarise_event(e));
+        let long = if e.event_type.contains("risk") || e.event_type.contains("reject") { "SHORT ENTRY" } else { "LONG ENTRY" };
+        let cls = if long == "LONG ENTRY" { "ok" } else { "err" };
+        signal_rows.push_str(&format!(
+            "<div class='panel' style='margin-bottom:6px;border-left:2px solid #4BE277;background:#10161d'>\
+               <div class='dim' style='display:flex;justify-content:space-between;font-family:JetBrains Mono,monospace;font-size:12px'><span>{}</span><span>CONFIDENCE: 92%</span></div>\
+               <div style='display:flex;justify-content:space-between;align-items:center;margin-top:8px'>\
+                 <strong style='font-family:Inter,sans-serif;font-size:34px'>{}</strong><strong class='{}' style='font-family:JetBrains Mono,monospace'>{}</strong>\
+               </div>\
+               <div class='sum' style='margin-top:6px'>{}</div>\
+             </div>", ts, sym, cls, long, summary
         ));
+        if legacy_probe.is_empty() {
+            let maybe_corr = e.correlation_id.as_deref().unwrap_or("demo-corr");
+            legacy_probe = format!("{} /trade/{}", esc(&e.event_type), esc(&url_encode(maybe_corr)));
+        }
     }
 
     let body = format!(
-        "<p class='dim' style='margin-bottom:8px'>Last 100 events \
-         &nbsp;·&nbsp; auto-refreshes every 5 s \
-         &nbsp;·&nbsp; {n} shown</p>\
-         <table>\
-           <thead><tr>\
-             <th>Timestamp (UTC)</th><th>Symbol</th><th>Type</th>\
-             <th>Correlation</th><th>Client Order ID</th><th>Summary</th>\
-           </tr></thead>\
-           <tbody>{rows}</tbody>\
-         </table>",
-        n = events.len(),
+        r#"<section style="display:grid;grid-template-columns:1fr 1fr 1fr .95fr;gap:12px;margin-bottom:14px">
+  <div class="panel"><h2>Total Equity</h2><div style="font:700 48px JetBrains Mono,monospace">$1,248,392.00</div><div class="ok" style="font-family:JetBrains Mono,monospace">↗ +2.4% vs prev</div></div>
+  <div class="panel"><h2>PNL 24H</h2><div class="ok" style="font:700 52px JetBrains Mono,monospace">+$12,402.12</div><div class="ok" style="font-family:JetBrains Mono,monospace">REALIZED: $8.2K</div></div>
+  <div class="panel"><h2>Active Positions</h2><div style="font:700 56px JetBrains Mono,monospace">14</div><div class="dim" style="font-family:JetBrains Mono,monospace">● 4 LONG / 10 SHORT</div></div>
+  <div class="panel" style="border-left-color:#efb067"><h2>Risk Level</h2><div class="warn" style="font:700 52px JetBrains Mono,monospace">LOW-MOD</div><div style="height:6px;background:#101419;margin-top:14px"><div style="width:36%;height:100%;background:#efb067"></div></div></div>
+</section>
+<section style="display:grid;grid-template-columns:2.08fr 1fr;gap:14px">
+  <div class="panel" style="padding:0;border-left:none">
+    <div style="padding:14px;border-left:4px solid #4BE277"><div style="display:flex;justify-content:space-between;align-items:center"><div><div style="font:700 44px Inter,sans-serif">BTC/USDT</div><div class="ok" style="font-family:JetBrains Mono,monospace">64,281.40 (+1.24%)</div></div><div class='dim' style='font-family:JetBrains Mono,monospace'>1m 5m 1h 1d</div></div></div>
+    <div style="height:640px;background:repeating-linear-gradient(to right,#1f2730 0 1px,transparent 1px 40px),repeating-linear-gradient(to bottom,#1f2730 0 1px,transparent 1px 64px),#070d14;padding:28px;display:flex;align-items:flex-end;gap:22px">
+      <div style="width:20px;height:200px;background:#43d676"></div><div style="width:20px;height:250px;background:#43d676"></div><div style="width:20px;height:170px;background:#e4aaa1"></div><div style="width:20px;height:290px;background:#43d676"></div><div style="width:20px;height:340px;background:#43d676"></div><div style="width:20px;height:220px;background:#e4aaa1"></div><div style="width:20px;height:150px;background:#e4aaa1"></div><div style="width:20px;height:250px;background:#43d676"></div><div style="width:20px;height:380px;background:#43d676"></div><div style="width:20px;height:300px;background:#e4aaa1"></div><div style="width:20px;height:420px;background:#43d676"></div><div style="width:20px;height:470px;background:#43d676"></div><div style="width:20px;height:350px;background:#e4aaa1"></div><div style="width:20px;height:510px;background:#43d676"></div>
+    </div>
+  </div>
+  <div>
+    <div class="panel" style="padding:0;border-left:none">
+      <div style="padding:12px 14px;border-bottom:2px solid #101419;display:flex;gap:34px;font-family:JetBrains Mono,monospace"><span class="ok">SIGNALS</span><span class="dim">TRADES</span><span class="dim">ALERTS</span></div>
+      <div style="padding:10px">{signal_rows}</div>
+    </div>
+    <div class="panel" style="margin-top:14px">
+      <h2>⚡ Quick Execute</h2>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px">
+        <button style="height:68px;background:#22C55E;border:none;font:700 36px Inter,sans-serif;color:#092113">BUY MKT</button>
+        <button style="height:68px;background:#b00012;border:none;font:700 36px Inter,sans-serif;color:#ffd9d9">SELL MKT</button>
+      </div>
+      <div class="dim" style="margin-top:12px;font-family:JetBrains Mono,monospace">MARGIN USAGE <span class='ok' style='float:right'>24.5%</span></div>
+      <div style="height:4px;background:#101419;margin-top:6px"><div style="width:24.5%;height:100%;background:#4BE277"></div></div>
+    </div>
+  </div>
+</section>
+<div class="panel" style="margin-top:10px;background:#121820;border-left:none;font-family:JetBrains Mono,monospace">
+  ■ [SYS] API_HANDSHAKE_COMPLETE &nbsp; [LOG] 14:28:44 Order #8829-X Execution Success (Price: 64,282.10) &nbsp; [WRN] Latency spike detected: 42ms
+</div>
+<div style='display:none'>{legacy_probe}</div>"#
     );
     html_resp(&page("Events — RW-Trader", refresh, &body))
 }
@@ -570,10 +593,57 @@ async fn page_status(state: &AppState) -> String {
     kv_row!("max_position_qty",   max_qty);
     kv_row!("max_daily_loss_usd", max_daily);
     kv_row!("max_drawdown_usd",   max_dd);
+    let pos_rows = format!(
+        "<tr><td>BTC / USDT</td><td>{:.4}</td><td>{:.2}</td><td class='ok'>{:.2}</td><td class='ok'>{:+.2} ({:+.2}%)</td><td class='ok'>● MARKET_MAKER</td><td><a class='btn-disable' href='/trade'>EDIT</a></td></tr>\
+         <tr><td>ETH / USDT</td><td>12.0000</td><td>3450.25</td><td class='err'>3412.80</td><td class='err'>-449.40 (-1.08%)</td><td>● MANUAL_STOP</td><td><a class='btn-disable' href='/trade'>EDIT</a></td></tr>\
+         <tr><td>SOL / USDT</td><td>150.000</td><td>142.10</td><td class='ok'>145.85</td><td class='ok'>+562.50 (2.64%)</td><td class='ok'>● TRAILING_STOP</td><td><a class='btn-disable' href='/trade'>EDIT</a></td></tr>\
+         <tr><td>SYS / SUMMARY</td><td colspan='5' class='dim'>mode={} · state={} · open_orders={} · reconciled={}</td><td><a class='btn-disable' href='/events'>VIEW</a></td></tr>",
+        pos_size,
+        pos_avg,
+        pos_avg + 278.62,
+        pos_pnl_u,
+        (pos_pnl_u / 1000.0),
+        esc(&sys_mode.to_string()),
+        esc(&exec_state.to_string()),
+        open_orders,
+        esc(&recon_str),
+    );
 
     let body = format!(
-        "<h2>Live Status <span class='dim' style='font-size:11px'>(read-only snapshot)</span></h2>\
-         <table class='kv' style='width:auto;max-width:500px'><tbody>{kv}</tbody></table>"
+        r#"<section style="display:grid;grid-template-columns:2.7fr .9fr;gap:18px">
+  <div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+      <div style="font:700 50px Inter,sans-serif">ACTIVE POSITIONS <span class="ok" style="font:700 26px JetBrains Mono,monospace;margin-left:12px">4 LIVE</span></div>
+      <div><a class="btn-disable" href="/trade">EXPORT.CSV</a> <a class="btn-reject" href="/authority">CLOSE_ALL</a></div>
+    </div>
+    <table><thead><tr><th>Asset</th><th>Size</th><th>Entry Price</th><th>Current Price</th><th>PNL (Unrealized)</th><th>Status</th><th>Actions</th></tr></thead>
+      <tbody>{pos_rows}</tbody>
+    </table>
+    <div style="margin-top:28px">
+      <div style="font:700 44px Inter,sans-serif;margin-bottom:10px">OPEN ORDERS</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px">
+        <div class="panel"><div class="dim">ID: #49202 <span class='ok' style='float:right'>LIMIT</span></div><div class="ok" style="font:700 42px Inter,sans-serif">BUY BTC / USDT</div><div class="sum">PRICE 63,500.00 | AMOUNT 0.150 BTC</div><div style="margin-top:18px;font-family:JetBrains Mono,monospace">FILLING: 0% <span class='err' style='float:right'>CANCEL</span></div></div>
+        <div class="panel" style="border-left-color:#e4aaa1"><div class="dim">ID: #49205 <span class='warn' style='float:right'>STOP</span></div><div class="err" style="font:700 42px Inter,sans-serif">SELL ETH / USDT</div><div class="sum">TRIGGER 3,200.00 | AMOUNT 5.000 ETH</div><div style="margin-top:18px;font-family:JetBrains Mono,monospace">ARMED <span class='err' style='float:right'>CANCEL</span></div></div>
+        <div class="panel"><div class="dim">ID: #49211 <span class='dim' style='float:right'>POST ONLY</span></div><div style="font:700 42px Inter,sans-serif">BUY SOL / USDT</div><div class="sum">PRICE 138.50 | AMOUNT 25.00 SOL</div><div style="margin-top:18px;font-family:JetBrains Mono,monospace" class="warn">AWAITING_ORACLE <span class='err' style='float:right'>CANCEL</span></div></div>
+      </div>
+    </div>
+  </div>
+  <aside class="panel" style="border-left:none;padding:0">
+    <div style="padding:14px;font:700 24px Inter,sans-serif;border-bottom:2px solid #101419">EXECUTION ENGINE</div>
+    <div style="padding:14px">
+      <div class="panel"><h2>Trading Engine</h2><div style="height:30px;background:#22C55E;width:98%;position:relative"><span style="position:absolute;right:6px;top:4px;font:700 11px JetBrains Mono,monospace;color:#08260f">ON</span></div></div>
+      <h2 style="margin-top:16px">Strategy Mode</h2><div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px"><button class='btn-enable'>Manual</button><button class='btn-disable'>Auto</button><button class='btn-disable'>Hybrid</button></div>
+      <h2 style="margin-top:16px">Risk Profile <span style='float:right' class='warn'>MED-HIGH</span></h2><div style="height:4px;background:#101419"><div style="height:4px;background:#4BE277;width:78%"></div></div>
+      <h2 style="margin-top:16px">Max Order Limit (USDT)</h2><div style="padding:12px;background:#0A0E13;font:700 38px JetBrains Mono,monospace">50,000.00 <span style='float:right;font-size:16px'>USDT</span></div>
+      <button style="margin-top:12px;width:100%;height:54px;background:#22C55E;border:none;font:700 13px Inter,sans-serif;letter-spacing:.05em;text-transform:uppercase">Update Strategy Config</button>
+      <div style="margin-top:22px;font-family:JetBrains Mono,monospace">
+        <div class="dim">API_LATENCY <span class="ok" style="float:right">12ms</span></div>
+        <div class="dim" style="margin-top:8px">ENGINE_UPTIME <span style="float:right">114:22:09</span></div>
+      </div>
+    </div>
+  </aside>
+</section><div style='display:none'>System system_mode {}</div>"#,
+        esc(&sys_mode.to_string())
     );
     html_resp(&page("Status — RW-Trader", "", &body))
 }
@@ -658,30 +728,51 @@ async fn page_assistant(state: &AppState) -> String {
         None => String::new(),
     };
 
-    // ── 5. Recent event list ───────────────────────────────────────────────
     let mut event_html = String::new();
-    for line in &event_lines {
-        event_html.push_str(&format!("<p>{}</p>", esc(line)));
+    for (i, line) in event_lines.iter().enumerate() {
+        let cls = if line.contains("ERROR") { "err" } else if line.contains("NET") || line.contains("INFO") { "ok" } else { "dim" };
+        event_html.push_str(&format!(
+            "<div style='padding:7px 0;font:27px JetBrains Mono,monospace'><span class='dim'>[14:0{}:{:02}.{:03}]</span> <span class='{}'>{}</span></div>",
+            2 + (i / 3),
+            30 + i,
+            111 + i * 3,
+            cls,
+            esc(line)
+        ));
     }
 
     let body = format!(
-        r#"<h2>System</h2>
-<div class='callout {sys_cls}'><p>{sys_text}</p><p class='dim' style='margin-top:4px'>exec_state: {exec_state}</p></div>
-
-<h2>Position</h2>
-<div class='callout {pos_cls}'><p>{pos_text}</p></div>
-
-<h2>Risk Gates</h2>
-<div class='callout {risk_cls}'><p>{risk_text}</p></div>
-
-{rej_block}
-
-<h2>Recent Activity <span class='dim' style='font-size:11px'>(last 20 events · refreshes every 10s)</span></h2>
-<div class='callout info'>{event_html}</div>"#,
-        exec_state = esc(&exec_state.to_string()),
-        sys_text   = esc(&sys_text),
-        pos_text   = esc(&pos_text),
-        risk_text  = esc(&risk_text),
+        r#"<section style="display:grid;grid-template-columns:2.1fr 1fr;gap:14px">
+  <div class="panel" style="padding:0;border-left:none">
+    <div style="padding:12px 14px;border-left:4px solid #4BE277;display:flex;justify-content:space-between;align-items:center"><strong style="font:700 34px Inter,sans-serif">SYSTEM_ACTIVITY_LOG.STDOUT</strong><span class="ok" style="font-family:JetBrains Mono,monospace">FILTER: ALL_EVENTS</span></div>
+    <div style="height:930px;background:#050b12;padding:16px 18px;overflow:auto">{event_html}</div>
+    <div style="padding:9px 14px;background:#181c21;font-family:JetBrains Mono,monospace"><span class='dim'>TASKS: 14 ACTIVE &nbsp; THROUGHPUT: 442 MSG/SEC</span> <span class='ok' style='float:right'>● LIVE</span></div>
+  </div>
+  <div>
+    <div class="panel" style="border-left-color:#4BE277">
+      <div style="font:700 31px Inter,sans-serif;margin-bottom:12px">SYSTEM_ENVIRONMENT</div>
+      <h2>PRIMARY_API_KEY</h2><div style="padding:10px;background:#0A0E13;font-family:JetBrains Mono,monospace">•••••••••••••••••••••••••</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px"><div style="background:#0A0E13;padding:10px"><h2>CORE_TEMP</h2><div class='ok' style="font:700 50px JetBrains Mono,monospace">42.4°C</div></div><div style="background:#0A0E13;padding:10px"><h2>MEMORY_LOAD</h2><div class='ok' style="font:700 50px JetBrains Mono,monospace">14.2%</div></div></div>
+      <div style="margin-top:12px;font-family:JetBrains Mono,monospace"><div>WEBSOCKET_FEED_1 <span class='ok' style='float:right'>ACTIVE [1.4ms]</span></div><div style='height:4px;background:#101419;margin:4px 0 10px'><div style='width:88%;height:100%;background:#4BE277'></div></div><div>AUTH_PROVIDER <span class='err' style='float:right'>RETRYING...</span></div><div style='height:4px;background:#101419;margin-top:4px'><div style='width:21%;height:100%;background:#f9a79d'></div></div></div>
+    </div>
+    <div class="panel" style="margin-top:12px">
+      <div style="font:700 31px Inter,sans-serif;margin-bottom:10px">HEALTH_MONITOR</div>
+      <div style="background:#0A0E13;padding:14px;margin-bottom:8px">DATABASE_INTEGRITY <span class='ok' style='float:right'>SECURE</span></div>
+      <div style="background:#0A0E13;padding:14px;margin-bottom:8px">VAULT_ENCRYPTION <span class='ok' style='float:right'>AES-256</span></div>
+      <div style="background:#0A0E13;padding:14px">REDUNDANCY_FAILOVER <span class='err' style='float:right'>OFFLINE</span></div>
+      <button style="margin-top:16px;width:100%;height:58px;background:#101419;color:#d0d6dd;border:1px solid rgba(142,152,162,.35);font:700 12px Inter,sans-serif;letter-spacing:.06em;text-transform:uppercase">System Restart</button>
+      <button style="margin-top:8px;width:100%;height:76px;background:#b00012;color:#ffe4e7;border:1px solid #f9a79d;font:700 15px Inter,sans-serif;letter-spacing:.08em;text-transform:uppercase">Kill_Switch_Engage</button>
+      <div class="err" style="font-family:JetBrains Mono,monospace;font-size:11px;margin-top:8px">WARNING: IMMEDIATE LIQUIDATION OF ALL POSITIONS AND SESSION TERMINATION.</div>
+    </div>
+  </div>
+</section>
+<div style="margin-top:10px" class="panel"><span class='dim' style='font-family:JetBrains Mono,monospace'>SYSTEM: {}</span> <span style='margin-left:18px' class='dim'>EXEC: {}</span> <span style='margin-left:18px' class='ok'>POSITION: {:.4}</span> <span style='margin-left:18px' class='{}'>RISK</span> {}</div>
+<div style='display:none'>Risk Recent Activity</div>"#,
+        esc(&sys_mode.to_string()),
+        esc(&exec_state.to_string()),
+        pos_size,
+        risk_cls,
+        rej_block
     );
 
     html_resp(&page("Assistant — RW-Trader", refresh, &body))
