@@ -334,27 +334,30 @@ fn page(title: &str, head_extra: &str, body: &str) -> String {
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600;700&display=swap');
 *{{box-sizing:border-box;margin:0;padding:0;border-radius:0}}
+html,body{{height:100%;overflow:hidden}}
 body{{font-family:Inter,sans-serif;background:#101419;color:#d0d6dd}}
 body::before{{content:"";position:fixed;inset:0;pointer-events:none;opacity:.03;background:repeating-linear-gradient(to bottom,transparent 0 1px,#fff 1px 2px);z-index:8}}
 .status-pillar{{height:2px;background:linear-gradient(90deg,#4BE277,#22C55E)}}
-.top{{height:68px;background:#181c21;border-bottom:2px solid #4BE277;display:flex;align-items:center;justify-content:space-between;padding:0 18px;font-family:JetBrains Mono,monospace}}
-.brand{{color:#22C55E;font-size:44px;font-weight:700;letter-spacing:-.05em}}
-.tabs a{{color:#7d8790;text-decoration:none;margin:0 14px;padding:8px 0;display:inline-block;border-bottom:2px solid transparent}}
+.top{{height:50px;background:#181c21;border-bottom:2px solid #4BE277;display:flex;align-items:center;justify-content:space-between;padding:0 18px;font-family:JetBrains Mono,monospace}}
+.brand{{color:#22C55E;font-size:26px;font-weight:700;letter-spacing:-.05em}}
+.tabs a{{color:#7d8790;text-decoration:none;margin:0 10px;padding:6px 0;display:inline-block;border-bottom:2px solid transparent;font-size:12px}}
 .tabs a.on{{color:#4BE277;border-color:#4BE277}}
-.actions{{display:flex;align-items:center;gap:10px}}
-.btn{{font:600 12px Inter,sans-serif;letter-spacing:.05em;text-transform:uppercase;padding:9px 18px;border:1px solid rgba(128,138,147,.25);background:transparent;color:#c4ccd4;text-decoration:none}}
+.actions{{display:flex;align-items:center;gap:8px}}
+.btn{{font:600 11px Inter,sans-serif;letter-spacing:.05em;text-transform:uppercase;padding:7px 14px;border:1px solid rgba(128,138,147,.25);background:transparent;color:#c4ccd4;text-decoration:none}}
 .btn.green{{background:#22C55E;color:#07230f;border:0}}
-.app{{display:grid;grid-template-columns:68px 1fr;min-height:calc(100vh - 70px)}}
-.side{{background:#181c21;padding:14px 0;border-right:1px solid rgba(128,138,147,.15);display:flex;flex-direction:column;justify-content:space-between}}
+.app{{display:grid;grid-template-columns:68px 1fr;height:calc(100vh - 52px);overflow:hidden}}
+.side{{background:#181c21;padding:14px 0;border-right:1px solid rgba(128,138,147,.15);display:flex;flex-direction:column;justify-content:space-between;overflow:hidden}}
 .side ul{{list-style:none}}
 .side li{{height:52px;display:flex;align-items:center;justify-content:center;color:#6c7681;border-left:4px solid transparent;font-family:JetBrains Mono,monospace}}
 .side li.on{{color:#4BE277;border-left-color:#4BE277;background:#141920}}
-.main{{padding:18px;background:#101419}}
+.main{{padding:0;background:#101419;overflow:hidden;height:100%;display:flex;flex-direction:column}}
+.page-scroll{{flex:1;overflow-y:auto;overflow-x:hidden;padding:18px}}
 .panel{{background:linear-gradient(90deg,#141a20,#181d24);padding:14px;border-left:4px solid #4BE277}}
+.panel-scroll{{overflow-y:auto;overflow-x:hidden}}
 h2{{font-size:.6875rem;letter-spacing:.05em;text-transform:uppercase;color:#b4bcc5;font-weight:500;margin-bottom:8px}}
-table{{width:100%;border-collapse:separate;border-spacing:0 2px;font-family:JetBrains Mono,monospace;font-size:19px;line-height:1.1}}
-th{{text-align:left;padding:12px 10px;color:#aab4be;background:#262a30;font-size:.6875rem;letter-spacing:.05em;text-transform:uppercase}}
-td{{padding:10px;background:#181c21}}
+table{{width:100%;border-collapse:separate;border-spacing:0 2px;font-family:JetBrains Mono,monospace;font-size:13px;line-height:1.1}}
+th{{text-align:left;padding:8px 10px;color:#aab4be;background:#262a30;font-size:.6875rem;letter-spacing:.05em;text-transform:uppercase}}
+td{{padding:7px 10px;background:#181c21}}
 .tag{{display:inline-block;padding:3px 8px;font-size:10px;letter-spacing:.05em;text-transform:uppercase}}
 .MARKET,.SIGNAL,.RISK-ok,.FILLED,.ok{{color:#4BE277}}
 .RISK,.CANCEL,.REJECT,.err{{color:#f9a79d}}
@@ -366,12 +369,17 @@ input[type=text]{{font:13px JetBrains Mono,monospace;background:#0A0E13;color:#d
 input[type=text]:focus{{outline:none;border-left-color:#4BE277}}
 input[type=submit]{{font:700 12px Inter,sans-serif;letter-spacing:.06em;text-transform:uppercase;padding:10px 16px;background:#22C55E;color:#041007;border:none;margin-left:8px}}
 .callout{{padding:10px 14px;background:#181c21;border-left:4px solid #4BE277}}
-.banner{{padding:8px 12px;background:#262a30;margin-bottom:14px;font:600 11px JetBrains Mono,monospace;letter-spacing:.05em;text-transform:uppercase}}
+.banner{{padding:6px 12px;background:#262a30;margin-bottom:10px;font:600 11px JetBrains Mono,monospace;letter-spacing:.05em;text-transform:uppercase}}
 .banner.ASSIST{{border-left:4px solid #efb067}}.banner.AUTO{{border-left:4px solid #4BE277}}.banner.OFF{{border-left:4px solid #82909f}}
 .btn-off,.btn-assist,.btn-auto,.btn-approve,.btn-reject,.btn-enable,.btn-disable{{font:600 11px Inter,sans-serif;letter-spacing:.05em;text-transform:uppercase;padding:8px 12px;border:1px solid rgba(145,155,165,.25);text-decoration:none;display:inline-block;background:#101419;color:#d0d6dd}}
 .btn-approve,.btn-enable{{background:#22C55E;color:#07230f;border:none}}
 .btn-reject{{color:#f9a79d}}
-@media (max-width:1200px){{.brand{{font-size:32px}} .main{{overflow:auto}} table{{font-size:15px}}}}
+.log-dock{{background:#0d1117;border-top:1px solid rgba(128,138,147,.18);font-family:JetBrains Mono,monospace;font-size:11px}}
+.log-dock>summary{{padding:5px 12px;cursor:pointer;list-style:none;display:flex;align-items:center;gap:8px;background:#181c21;border-bottom:1px solid rgba(128,138,147,.12);color:#7d8790;user-select:none}}
+.log-dock>summary::before{{content:"▸";color:#4BE277}}
+.log-dock[open]>summary::before{{content:"▾"}}
+.log-content{{height:110px;overflow-y:auto;padding:7px 14px;color:#82909f}}
+@media (max-width:1200px){{.brand{{font-size:20px}} .page-scroll{{overflow-y:auto}} table{{font-size:12px}}}}
 </style>
 </head>
 <body>
@@ -455,27 +463,28 @@ async fn page_events(state: &AppState, query: &str) -> String {
     let events = match state.store.fetch_recent(100) {
         Ok(v)  => v,
         Err(e) => {
-            let b = format!("<p class='err'>Store error: {}</p>", esc(&e.to_string()));
+            let b = format!("<div class='page-scroll'><p class='err'>Store error: {}</p></div>", esc(&e.to_string()));
             return html_resp(&page("Events — RW-Trader", refresh, &b));
         }
     };
 
+    // Build signal rows for the right panel (scrollable list)
     let mut signal_rows = String::new();
     let mut legacy_probe = String::new();
-    for e in events.iter().take(4) {
+    for e in events.iter().take(8) {
         let ts = e.occurred_at.format("%H:%M:%S");
         let sym = esc(e.symbol.as_deref().unwrap_or("BTC/USDT"));
         let summary = esc(&summarise_event(e));
         let long = if e.event_type.contains("risk") || e.event_type.contains("reject") { "SHORT ENTRY" } else { "LONG ENTRY" };
         let cls = if long == "LONG ENTRY" { "ok" } else { "err" };
         signal_rows.push_str(&format!(
-            "<div class='panel' style='margin-bottom:6px;border-left:2px solid #4BE277;background:#10161d'>\
-               <div class='dim' style='display:flex;justify-content:space-between;font-family:JetBrains Mono,monospace;font-size:12px'><span>{}</span><span>CONFIDENCE: 92%</span></div>\
-               <div style='display:flex;justify-content:space-between;align-items:center;margin-top:8px'>\
-                 <strong style='font-family:Inter,sans-serif;font-size:34px'>{}</strong><strong class='{}' style='font-family:JetBrains Mono,monospace'>{}</strong>\
+            "<div style='padding:8px 10px;border-bottom:1px solid rgba(128,138,147,.1);background:#10161d'>\
+               <div class='dim' style='display:flex;justify-content:space-between;font-family:JetBrains Mono,monospace;font-size:11px'><span>{ts}</span><span>92%</span></div>\
+               <div style='display:flex;justify-content:space-between;align-items:center;margin-top:4px'>\
+                 <strong style='font-family:Inter,sans-serif;font-size:15px'>{sym}</strong><strong class='{cls}' style='font-family:JetBrains Mono,monospace;font-size:12px'>{long}</strong>\
                </div>\
-               <div class='sum' style='margin-top:6px'>{}</div>\
-             </div>", ts, sym, cls, long, summary
+               <div class='sum' style='margin-top:3px;font-size:11px'>{summary}</div>\
+             </div>"
         ));
         if legacy_probe.is_empty() {
             let maybe_corr = e.correlation_id.as_deref().unwrap_or("demo-corr");
@@ -483,40 +492,177 @@ async fn page_events(state: &AppState, query: &str) -> String {
         }
     }
 
+    // Build positions rows for the center panel bottom table (scrollable)
+    let pos_rows =
+        "<tr><td>BTC/USDT</td><td>0.150</td><td>63,500.00</td><td class='ok'>64,281.40</td><td class='ok'>+$117.21 (+0.18%)</td><td class='ok'>● MARKET_MAKER</td></tr>\
+         <tr><td>ETH/USDT</td><td>12.000</td><td>3,450.25</td><td class='err'>3,412.80</td><td class='err'>-$449.40 (-1.08%)</td><td>● MANUAL_STOP</td></tr>\
+         <tr><td>SOL/USDT</td><td>150.00</td><td>142.10</td><td class='ok'>145.85</td><td class='ok'>+$562.50 (+2.64%)</td><td class='ok'>● TRAILING_STOP</td></tr>";
+
+    // 3-column fixed layout: left asset nav | center chart+positions | right controls
     let body = format!(
-        r#"{flash}<section style="display:grid;grid-template-columns:1fr 1fr 1fr .95fr;gap:12px;margin-bottom:14px">
-  <div class="panel"><h2>Total Equity</h2><div style="font:700 48px JetBrains Mono,monospace">$1,248,392.00</div><div class="ok" style="font-family:JetBrains Mono,monospace">↗ +2.4% vs prev</div></div>
-  <div class="panel"><h2>PNL 24H</h2><div class="ok" style="font:700 52px JetBrains Mono,monospace">+$12,402.12</div><div class="ok" style="font-family:JetBrains Mono,monospace">REALIZED: $8.2K</div></div>
-  <div class="panel"><h2>Active Positions</h2><div style="font:700 56px JetBrains Mono,monospace">14</div><div class="dim" style="font-family:JetBrains Mono,monospace">● 4 LONG / 10 SHORT</div></div>
-  <div class="panel" style="border-left-color:#efb067"><h2>Risk Level</h2><div class="warn" style="font:700 52px JetBrains Mono,monospace">LOW-MOD</div><div style="height:6px;background:#101419;margin-top:14px"><div style="width:36%;height:100%;background:#efb067"></div></div></div>
-</section>
-<section style="display:grid;grid-template-columns:2.08fr 1fr;gap:14px">
-  <div class="panel" style="padding:0;border-left:none">
-    <div style="padding:14px;border-left:4px solid #4BE277"><div style="display:flex;justify-content:space-between;align-items:center"><div><div style="font:700 44px Inter,sans-serif">BTC/USDT</div><div class="ok" style="font-family:JetBrains Mono,monospace">64,281.40 (+1.24%)</div></div><div style='font-family:JetBrains Mono,monospace'><a class='dim' href='/events?tf=1m'>1m</a> <a class='dim' href='/events?tf=5m'>5m</a> <a class='dim' href='/events?tf=1h'>1h</a> <a class='dim' href='/events?tf=1d'>1d</a></div></div></div>
-    <div style="height:640px;background:repeating-linear-gradient(to right,#1f2730 0 1px,transparent 1px 40px),repeating-linear-gradient(to bottom,#1f2730 0 1px,transparent 1px 64px),#070d14;padding:28px;display:flex;align-items:flex-end;gap:22px">
-      <div style="width:20px;height:200px;background:#43d676"></div><div style="width:20px;height:250px;background:#43d676"></div><div style="width:20px;height:170px;background:#e4aaa1"></div><div style="width:20px;height:290px;background:#43d676"></div><div style="width:20px;height:340px;background:#43d676"></div><div style="width:20px;height:220px;background:#e4aaa1"></div><div style="width:20px;height:150px;background:#e4aaa1"></div><div style="width:20px;height:250px;background:#43d676"></div><div style="width:20px;height:380px;background:#43d676"></div><div style="width:20px;height:300px;background:#e4aaa1"></div><div style="width:20px;height:420px;background:#43d676"></div><div style="width:20px;height:470px;background:#43d676"></div><div style="width:20px;height:350px;background:#e4aaa1"></div><div style="width:20px;height:510px;background:#43d676"></div>
-    </div>
+        r#"{flash}<div style="display:flex;flex-direction:column;height:100%;overflow:hidden">
+
+<!-- ── Compact metrics bar ── -->
+<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px;padding:8px 12px;background:#0d1117;border-bottom:1px solid rgba(128,138,147,.15);flex-shrink:0">
+  <div style="background:#141a20;padding:8px 12px;border-left:3px solid #4BE277">
+    <div class='dim' style='font-size:10px;letter-spacing:.05em;text-transform:uppercase'>Total Equity</div>
+    <div style='font:700 20px JetBrains Mono,monospace'>$1,248,392</div>
+    <div class='ok' style='font-size:11px;font-family:JetBrains Mono,monospace'>↗ +2.4%</div>
   </div>
-  <div>
-    <div class="panel" style="padding:0;border-left:none">
-      <div style="padding:12px 14px;border-bottom:2px solid #101419;display:flex;gap:34px;font-family:JetBrains Mono,monospace"><a class="ok" href='/events?panel=signals'>SIGNALS</a><a class="dim" href='/events?panel=trades'>TRADES</a><a class="dim" href='/events?panel=alerts'>ALERTS</a></div>
-      <div style="padding:10px">{signal_rows}</div>
-    </div>
-    <div class="panel" style="margin-top:14px">
-      <h2>⚡ Quick Execute</h2>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px">
-        <form method='post' action='/events/quick/buy'><button data-loading-text='Submitting...' style="height:68px;width:100%;background:#22C55E;border:none;font:700 36px Inter,sans-serif;color:#092113" type='submit'>BUY MKT</button></form>
-        <form method='post' action='/events/quick/sell'><button data-loading-text='Submitting...' style="height:68px;width:100%;background:#b00012;border:none;font:700 36px Inter,sans-serif;color:#ffd9d9" type='submit'>SELL MKT</button></form>
-      </div>
-      <div class="dim" style="margin-top:12px;font-family:JetBrains Mono,monospace">MARGIN USAGE <span class='ok' style='float:right'>24.5%</span></div>
-      <div style="height:4px;background:#101419;margin-top:6px"><div style="width:24.5%;height:100%;background:#4BE277"></div></div>
-    </div>
+  <div style="background:#141a20;padding:8px 12px;border-left:3px solid #4BE277">
+    <div class='dim' style='font-size:10px;letter-spacing:.05em;text-transform:uppercase'>PNL 24H</div>
+    <div class='ok' style='font:700 20px JetBrains Mono,monospace'>+$12,402</div>
+    <div class='ok' style='font-size:11px;font-family:JetBrains Mono,monospace'>REALIZED: $8.2K</div>
   </div>
-</section>
-<div class="panel" style="margin-top:10px;background:#121820;border-left:none;font-family:JetBrains Mono,monospace">
-  ■ [SYS] API_HANDSHAKE_COMPLETE &nbsp; [LOG] 14:28:44 Order #8829-X Execution Success (Price: 64,282.10) &nbsp; [WRN] Latency spike detected: 42ms
+  <div style="background:#141a20;padding:8px 12px;border-left:3px solid #4BE277">
+    <div class='dim' style='font-size:10px;letter-spacing:.05em;text-transform:uppercase'>Active Positions</div>
+    <div style='font:700 20px JetBrains Mono,monospace'>14</div>
+    <div class='dim' style='font-size:11px;font-family:JetBrains Mono,monospace'>4 LONG / 10 SHORT</div>
+  </div>
+  <div style="background:#141a20;padding:8px 12px;border-left:3px solid #efb067">
+    <div class='dim' style='font-size:10px;letter-spacing:.05em;text-transform:uppercase'>Risk Level</div>
+    <div class='warn' style='font:700 20px JetBrains Mono,monospace'>LOW-MOD</div>
+    <div style='height:4px;background:#101419;margin-top:6px'><div style='width:36%;height:100%;background:#efb067'></div></div>
+  </div>
 </div>
-<div style='display:none'>{legacy_probe}</div>"#
+
+<!-- ── 3-column workspace ── -->
+<div style="display:grid;grid-template-columns:160px 1fr 290px;flex:1;overflow:hidden;min-height:0">
+
+  <!-- Left: asset nav panel -->
+  <div style="background:#181c21;border-right:1px solid rgba(128,138,147,.15);display:flex;flex-direction:column;overflow:hidden">
+    <div style="padding:8px 10px;border-bottom:1px solid rgba(128,138,147,.12);font:600 10px JetBrains Mono,monospace;letter-spacing:.08em;text-transform:uppercase;color:#7d8790">Markets</div>
+    <div style="flex:1;overflow-y:auto">
+      <div style="padding:8px 10px;background:#141920;border-left:3px solid #4BE277">
+        <div style='font:700 13px JetBrains Mono,monospace'>BTC/USDT</div>
+        <div class='ok' style='font-size:11px'>64,281.40</div>
+        <div class='ok' style='font-size:10px'>+1.24%</div>
+      </div>
+      <div style="padding:8px 10px;border-bottom:1px solid rgba(128,138,147,.08)">
+        <div style='font:600 13px JetBrains Mono,monospace'>ETH/USDT</div>
+        <div class='err' style='font-size:11px'>3,412.80</div>
+        <div class='err' style='font-size:10px'>-1.08%</div>
+      </div>
+      <div style="padding:8px 10px;border-bottom:1px solid rgba(128,138,147,.08)">
+        <div style='font:600 13px JetBrains Mono,monospace'>SOL/USDT</div>
+        <div class='ok' style='font-size:11px'>145.85</div>
+        <div class='ok' style='font-size:10px'>+2.64%</div>
+      </div>
+      <div style="padding:8px 10px;border-bottom:1px solid rgba(128,138,147,.08)">
+        <div style='font:600 13px JetBrains Mono,monospace'>BNB/USDT</div>
+        <div class='dim' style='font-size:11px'>412.30</div>
+        <div class='dim' style='font-size:10px'>-0.32%</div>
+      </div>
+      <div style="padding:8px 10px;border-bottom:1px solid rgba(128,138,147,.08)">
+        <div style='font:600 13px JetBrains Mono,monospace'>XRP/USDT</div>
+        <div class='ok' style='font-size:11px'>0.6284</div>
+        <div class='ok' style='font-size:10px'>+0.71%</div>
+      </div>
+    </div>
+    <div style="padding:8px 10px;border-top:1px solid rgba(128,138,147,.12);font-size:10px;font-family:JetBrains Mono,monospace">
+      <div class='dim'>FEED <span class='ok' style='float:right'>● LIVE</span></div>
+      <div class='dim' style='margin-top:4px'>LAT <span style='float:right'>1.4ms</span></div>
+    </div>
+  </div>
+
+  <!-- Center: chart + positions table -->
+  <div style="display:flex;flex-direction:column;overflow:hidden;border-right:1px solid rgba(128,138,147,.15)">
+    <!-- Chart header -->
+    <div style="padding:8px 12px;background:#181c21;border-bottom:1px solid rgba(128,138,147,.12);display:flex;justify-content:space-between;align-items:center;flex-shrink:0">
+      <div>
+        <span style='font:700 18px Inter,sans-serif'>BTC/USDT</span>
+        <span class='ok' style='font-family:JetBrains Mono,monospace;margin-left:10px;font-size:13px'>64,281.40 (+1.24%)</span>
+      </div>
+      <div style='font-family:JetBrains Mono,monospace;font-size:12px'>
+        <a class='dim' href='/events?tf=1m' style='margin-right:8px'>1m</a>
+        <a class='dim' href='/events?tf=5m' style='margin-right:8px'>5m</a>
+        <a class='dim' href='/events?tf=1h' style='margin-right:8px'>1h</a>
+        <a class='dim' href='/events?tf=1d'>1d</a>
+      </div>
+    </div>
+    <!-- Chart canvas -->
+    <div style="flex:1;background:repeating-linear-gradient(to right,#1f2730 0 1px,transparent 1px 40px),repeating-linear-gradient(to bottom,#1f2730 0 1px,transparent 1px 48px),#070d14;padding:16px 20px;display:flex;align-items:flex-end;gap:10px;overflow:hidden;min-height:0">
+      <div style="width:16px;height:38%;background:#43d676"></div><div style="width:16px;height:48%;background:#43d676"></div><div style="width:16px;height:33%;background:#e4aaa1"></div><div style="width:16px;height:56%;background:#43d676"></div><div style="width:16px;height:65%;background:#43d676"></div><div style="width:16px;height:42%;background:#e4aaa1"></div><div style="width:16px;height:29%;background:#e4aaa1"></div><div style="width:16px;height:48%;background:#43d676"></div><div style="width:16px;height:73%;background:#43d676"></div><div style="width:16px;height:58%;background:#e4aaa1"></div><div style="width:16px;height:81%;background:#43d676"></div><div style="width:16px;height:90%;background:#43d676"></div><div style="width:16px;height:67%;background:#e4aaa1"></div><div style="width:16px;height:98%;background:#43d676"></div><div style="width:16px;height:85%;background:#43d676"></div><div style="width:16px;height:72%;background:#e4aaa1"></div><div style="width:16px;height:78%;background:#43d676"></div><div style="width:16px;height:88%;background:#43d676"></div>
+    </div>
+    <!-- Positions table (scrollable) -->
+    <div style="height:160px;overflow-y:auto;border-top:2px solid rgba(128,138,147,.15);flex-shrink:0">
+      <div style="padding:5px 12px;background:#181c21;border-bottom:1px solid rgba(128,138,147,.12);display:flex;justify-content:space-between;align-items:center">
+        <span style='font:600 10px JetBrains Mono,monospace;letter-spacing:.08em;text-transform:uppercase;color:#7d8790'>Open Positions</span>
+        <div>
+          <a class="btn-disable" href="/status/export.csv" style='font-size:10px;padding:4px 8px'>EXPORT</a>
+          <form method='post' action='/status/close-all' style='display:inline;margin-left:4px'><button data-loading-text='Closing...' class="btn-reject" type='submit' style='font-size:10px;padding:4px 8px'>CLOSE ALL</button></form>
+        </div>
+      </div>
+      <table style='font-size:12px'>
+        <thead><tr><th>Asset</th><th>Size</th><th>Entry</th><th>Current</th><th>PNL</th><th>Strategy</th></tr></thead>
+        <tbody>{pos_rows}</tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Right: signals + execution + controls (always visible, no page scroll) -->
+  <div style="display:flex;flex-direction:column;overflow:hidden;background:#0d1117">
+
+    <!-- Signals feed (scrollable) -->
+    <div style="flex:1;overflow:hidden;display:flex;flex-direction:column;min-height:0">
+      <div style="padding:8px 12px;border-bottom:1px solid rgba(128,138,147,.12);display:flex;gap:16px;font-family:JetBrains Mono,monospace;font-size:11px;background:#181c21;flex-shrink:0">
+        <a class="ok" href='/events?panel=signals'>SIGNALS</a>
+        <a class="dim" href='/events?panel=trades'>TRADES</a>
+        <a class="dim" href='/events?panel=alerts'>ALERTS</a>
+      </div>
+      <div class="panel-scroll" style="flex:1;overflow-y:auto">{signal_rows}</div>
+    </div>
+
+    <!-- BUY / SELL execution (always visible) -->
+    <div style="padding:10px 12px;border-top:2px solid rgba(128,138,147,.15);background:#101419;flex-shrink:0">
+      <div style='font:600 10px JetBrains Mono,monospace;letter-spacing:.08em;text-transform:uppercase;color:#7d8790;margin-bottom:8px'>⚡ Quick Execute</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+        <form method='post' action='/events/quick/buy'><button data-loading-text='...' style="height:52px;width:100%;background:#22C55E;border:none;font:700 22px Inter,sans-serif;color:#092113" type='submit'>BUY</button></form>
+        <form method='post' action='/events/quick/sell'><button data-loading-text='...' style="height:52px;width:100%;background:#b00012;border:none;font:700 22px Inter,sans-serif;color:#ffd9d9" type='submit'>SELL</button></form>
+      </div>
+      <div class="dim" style="margin-top:8px;font-family:JetBrains Mono,monospace;font-size:11px">MARGIN <span class='ok' style='float:right'>24.5%</span></div>
+      <div style="height:3px;background:#101419;margin-top:4px;border:1px solid rgba(128,138,147,.1)"><div style="width:24.5%;height:100%;background:#4BE277"></div></div>
+    </div>
+
+    <!-- Strategy & risk controls (always visible) -->
+    <div style="padding:10px 12px;border-top:1px solid rgba(128,138,147,.15);background:#141a20;flex-shrink:0">
+      <div style='font:600 10px JetBrains Mono,monospace;letter-spacing:.08em;text-transform:uppercase;color:#7d8790;margin-bottom:8px'>Strategy &amp; Risk</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px;margin-bottom:8px">
+        <a class='btn-enable' href='/status?mode=Manual' style='text-align:center;font-size:10px;padding:6px 4px'>Manual</a>
+        <a class='btn-disable' href='/status?mode=Auto' style='text-align:center;font-size:10px;padding:6px 4px'>Auto</a>
+        <a class='btn-disable' href='/status?mode=Hybrid' style='text-align:center;font-size:10px;padding:6px 4px'>Hybrid</a>
+      </div>
+      <div style="font-family:JetBrains Mono,monospace;font-size:11px">
+        <div class='dim' style='margin-bottom:4px'>Risk Profile <span class='warn' style='float:right'>MED-HIGH</span></div>
+        <div style='height:3px;background:#101419;border:1px solid rgba(128,138,147,.1)'><div style='height:100%;background:#4BE277;width:78%'></div></div>
+        <div class='dim' style='margin-top:6px'>Max Order <span style='float:right'>50,000 USDT</span></div>
+      </div>
+      <form method='post' action='/status/update-strategy' style='margin-top:8px'>
+        <button data-loading-text='Saving...' style="width:100%;height:34px;background:#22C55E;border:none;font:700 11px Inter,sans-serif;letter-spacing:.05em;text-transform:uppercase;color:#041007" type='submit'>Update Config</button>
+      </form>
+      <div style="margin-top:8px;font-family:JetBrains Mono,monospace;font-size:10px">
+        <div class='dim'>API_LAT <span class='ok' style='float:right'>12ms</span></div>
+        <div class='dim' style='margin-top:3px'>UPTIME <span style='float:right'>114:22:09</span></div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ── Collapsible log dock ── -->
+<details class="log-dock">
+  <summary>■ SYSTEM LOG &nbsp;<span class='dim' style='font-weight:normal;font-size:10px'>API_HANDSHAKE_COMPLETE · Order #8829-X Executed · Latency spike 42ms</span></summary>
+  <div class="log-content">
+    <div><span class='dim'>[14:28:44]</span> [SYS] API_HANDSHAKE_COMPLETE</div>
+    <div><span class='dim'>[14:28:44]</span> <span class='ok'>[LOG]</span> Order #8829-X Execution Success (Price: 64,282.10)</div>
+    <div><span class='dim'>[14:28:45]</span> <span class='warn'>[WRN]</span> Latency spike detected: 42ms</div>
+    <div><span class='dim'>[14:28:46]</span> [SYS] RECONCILE_COMPLETE — 3 positions verified</div>
+    <div><span class='dim'>[14:28:47]</span> <span class='ok'>[NET]</span> WebSocket feed heartbeat OK</div>
+  </div>
+</details>
+
+<div style='display:none'>{legacy_probe}</div>
+</div>"#
     );
     html_resp(&page("Events — RW-Trader", refresh, &body))
 }
@@ -534,8 +680,9 @@ async fn page_trade(state: &AppState, corr_id: &str) -> String {
 
     if corr_id.is_empty() {
         let body = format!(
-            "{form}\
-             <p class='dim' style='margin-top:10px'>Enter a correlation_id to reconstruct a trade lifecycle.</p>"
+            "<div class='page-scroll'>{form}\
+             <p class='dim' style='margin-top:10px'>Enter a correlation_id to reconstruct a trade lifecycle.</p>\
+             </div>"
         );
         return html_resp(&page("Timeline — RW-Trader", "", &body));
     }
@@ -544,7 +691,7 @@ async fn page_trade(state: &AppState, corr_id: &str) -> String {
         Ok(t)  => t,
         Err(e) => {
             let body = format!(
-                "{form}<p class='err' style='margin-top:10px'>{}</p>",
+                "<div class='page-scroll'>{form}<p class='err' style='margin-top:10px'>{}</p></div>",
                 esc(&e.to_string())
             );
             return html_resp(&page("Timeline — RW-Trader", "", &body));
@@ -613,7 +760,8 @@ async fn page_trade(state: &AppState, corr_id: &str) -> String {
     };
 
     let body = format!(
-        "{form}\
+        "<div class='page-scroll'>\
+         {form}\
          <h2>Trade Summary</h2>\
          <table class='kv' style='width:auto;max-width:780px'><tbody>{kv}</tbody></table>\
          <h2>Event Sequence <span class='dim'>({n} events)</span></h2>\
@@ -625,7 +773,8 @@ async fn page_trade(state: &AppState, corr_id: &str) -> String {
            <tbody>{erows}</tbody>\
          </table>\
          <h2>Explanation</h2>\
-         <div class='callout {expl_cls}'><p>{explanation}</p></div>",
+         <div class='callout {expl_cls}'><p>{explanation}</p></div>\
+         </div>",
         n = timeline.events.len(),
         explanation = esc(&explanation),
     );
@@ -723,39 +872,40 @@ async fn page_status(state: &AppState, query: &str) -> String {
     );
 
     let body = format!(
-        r#"{flash}<section style="display:grid;grid-template-columns:2.7fr .9fr;gap:18px">
+        r#"<div class="page-scroll">{flash}<section style="display:grid;grid-template-columns:2.7fr .9fr;gap:18px">
   <div>
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
-      <div style="font:700 50px Inter,sans-serif">ACTIVE POSITIONS <span class="ok" style="font:700 26px JetBrains Mono,monospace;margin-left:12px">4 LIVE</span></div>
+      <div style="font:700 28px Inter,sans-serif">ACTIVE POSITIONS <span class="ok" style="font:700 16px JetBrains Mono,monospace;margin-left:12px">4 LIVE</span></div>
       <div><a class="btn-disable" href="/status/export.csv">EXPORT.CSV</a> <form method='post' action='/status/close-all' style='display:inline'><button data-loading-text='Closing...' class="btn-reject" type='submit'>CLOSE_ALL</button></form></div>
     </div>
     <table><thead><tr><th>Asset</th><th>Size</th><th>Entry Price</th><th>Current Price</th><th>PNL (Unrealized)</th><th>Status</th><th>Actions</th></tr></thead>
       <tbody>{pos_rows}</tbody>
     </table>
-    <div style="margin-top:28px">
-      <div style="font:700 44px Inter,sans-serif;margin-bottom:10px">OPEN ORDERS</div>
+    <div style="margin-top:18px">
+      <div style="font:700 24px Inter,sans-serif;margin-bottom:10px">OPEN ORDERS</div>
       <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px">
-        <div class="panel"><div class="dim">ID: #49202 <span class='ok' style='float:right'>LIMIT</span></div><div class="ok" style="font:700 42px Inter,sans-serif">BUY BTC / USDT</div><div class="sum">PRICE 63,500.00 | AMOUNT 0.150 BTC</div><div style="margin-top:18px;font-family:JetBrains Mono,monospace">FILLING: 0% <form method='post' action='/status/cancel/49202' style='display:inline;float:right'><button data-loading-text='Canceling...' class='btn-reject' type='submit'>CANCEL</button></form></div></div>
-        <div class="panel" style="border-left-color:#e4aaa1"><div class="dim">ID: #49205 <span class='warn' style='float:right'>STOP</span></div><div class="err" style="font:700 42px Inter,sans-serif">SELL ETH / USDT</div><div class="sum">TRIGGER 3,200.00 | AMOUNT 5.000 ETH</div><div style="margin-top:18px;font-family:JetBrains Mono,monospace">ARMED <form method='post' action='/status/cancel/49205' style='display:inline;float:right'><button data-loading-text='Canceling...' class='btn-reject' type='submit'>CANCEL</button></form></div></div>
-        <div class="panel"><div class="dim">ID: #49211 <span class='dim' style='float:right'>POST ONLY</span></div><div style="font:700 42px Inter,sans-serif">BUY SOL / USDT</div><div class="sum">PRICE 138.50 | AMOUNT 25.00 SOL</div><div style="margin-top:18px;font-family:JetBrains Mono,monospace" class="warn">AWAITING_ORACLE <form method='post' action='/status/cancel/49211' style='display:inline;float:right'><button data-loading-text='Canceling...' class='btn-reject' type='submit'>CANCEL</button></form></div></div>
+        <div class="panel"><div class="dim">ID: #49202 <span class='ok' style='float:right'>LIMIT</span></div><div class="ok" style="font:700 22px Inter,sans-serif">BUY BTC / USDT</div><div class="sum">PRICE 63,500.00 | AMOUNT 0.150 BTC</div><div style="margin-top:10px;font-family:JetBrains Mono,monospace">FILLING: 0% <form method='post' action='/status/cancel/49202' style='display:inline;float:right'><button data-loading-text='Canceling...' class='btn-reject' type='submit'>CANCEL</button></form></div></div>
+        <div class="panel" style="border-left-color:#e4aaa1"><div class="dim">ID: #49205 <span class='warn' style='float:right'>STOP</span></div><div class="err" style="font:700 22px Inter,sans-serif">SELL ETH / USDT</div><div class="sum">TRIGGER 3,200.00 | AMOUNT 5.000 ETH</div><div style="margin-top:10px;font-family:JetBrains Mono,monospace">ARMED <form method='post' action='/status/cancel/49205' style='display:inline;float:right'><button data-loading-text='Canceling...' class='btn-reject' type='submit'>CANCEL</button></form></div></div>
+        <div class="panel"><div class="dim">ID: #49211 <span class='dim' style='float:right'>POST ONLY</span></div><div style="font:700 22px Inter,sans-serif">BUY SOL / USDT</div><div class="sum">PRICE 138.50 | AMOUNT 25.00 SOL</div><div style="margin-top:10px;font-family:JetBrains Mono,monospace" class="warn">AWAITING_ORACLE <form method='post' action='/status/cancel/49211' style='display:inline;float:right'><button data-loading-text='Canceling...' class='btn-reject' type='submit'>CANCEL</button></form></div></div>
       </div>
     </div>
+    <div style="margin-top:18px"><h2>System State</h2><table class='kv' style='width:auto;max-width:600px'><tbody>{kv}</tbody></table></div>
   </div>
   <aside class="panel" style="border-left:none;padding:0">
-    <div style="padding:14px;font:700 24px Inter,sans-serif;border-bottom:2px solid #101419">EXECUTION ENGINE</div>
+    <div style="padding:12px 14px;font:700 18px Inter,sans-serif;border-bottom:2px solid #101419">EXECUTION ENGINE</div>
     <div style="padding:14px">
-      <div class="panel"><h2>Trading Engine</h2><div style="height:30px;background:#22C55E;width:98%;position:relative"><span style="position:absolute;right:6px;top:4px;font:700 11px JetBrains Mono,monospace;color:#08260f">ON</span></div></div>
-      <h2 style="margin-top:16px">Strategy Mode</h2><div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px"><a class='btn-enable' href='/status?mode=Manual'>Manual</a><a class='btn-disable' href='/status?mode=Auto'>Auto</a><a class='btn-disable' href='/status?mode=Hybrid'>Hybrid</a></div><div class='dim' style='margin-top:6px;font-size:11px'>Selected mode: {selected_mode}</div>
-      <h2 style="margin-top:16px">Risk Profile <span style='float:right' class='warn'>MED-HIGH</span></h2><div style="height:4px;background:#101419"><div style="height:4px;background:#4BE277;width:78%"></div></div>
-      <h2 style="margin-top:16px">Max Order Limit (USDT)</h2><div style="padding:12px;background:#0A0E13;font:700 38px JetBrains Mono,monospace">50,000.00 <span style='float:right;font-size:16px'>USDT</span></div>
-      <form method='post' action='/status/update-strategy'><button data-loading-text='Saving...' style="margin-top:12px;width:100%;height:54px;background:#22C55E;border:none;font:700 13px Inter,sans-serif;letter-spacing:.05em;text-transform:uppercase" type='submit'>Update Strategy Config</button></form>
-      <div style="margin-top:22px;font-family:JetBrains Mono,monospace">
+      <div class="panel"><h2>Trading Engine</h2><div style="height:26px;background:#22C55E;width:98%;position:relative"><span style="position:absolute;right:6px;top:4px;font:700 11px JetBrains Mono,monospace;color:#08260f">ON</span></div></div>
+      <h2 style="margin-top:14px">Strategy Mode</h2><div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px"><a class='btn-enable' href='/status?mode=Manual'>Manual</a><a class='btn-disable' href='/status?mode=Auto'>Auto</a><a class='btn-disable' href='/status?mode=Hybrid'>Hybrid</a></div><div class='dim' style='margin-top:6px;font-size:11px'>Selected mode: {selected_mode}</div>
+      <h2 style="margin-top:14px">Risk Profile <span style='float:right' class='warn'>MED-HIGH</span></h2><div style="height:4px;background:#101419"><div style="height:4px;background:#4BE277;width:78%"></div></div>
+      <h2 style="margin-top:14px">Max Order Limit (USDT)</h2><div style="padding:10px;background:#0A0E13;font:700 24px JetBrains Mono,monospace">50,000.00 <span style='float:right;font-size:14px'>USDT</span></div>
+      <form method='post' action='/status/update-strategy'><button data-loading-text='Saving...' style="margin-top:10px;width:100%;height:44px;background:#22C55E;border:none;font:700 12px Inter,sans-serif;letter-spacing:.05em;text-transform:uppercase" type='submit'>Update Strategy Config</button></form>
+      <div style="margin-top:16px;font-family:JetBrains Mono,monospace">
         <div class="dim">API_LATENCY <span class="ok" style="float:right">12ms</span></div>
-        <div class="dim" style="margin-top:8px">ENGINE_UPTIME <span style="float:right">114:22:09</span></div>
+        <div class="dim" style="margin-top:6px">ENGINE_UPTIME <span style="float:right">114:22:09</span></div>
       </div>
     </div>
   </aside>
-</section><div style='display:none'>System system_mode {}</div>"#,
+</section><div style='display:none'>System system_mode {}</div></div>"#,
         esc(&sys_mode.to_string())
     );
     html_resp(&page("Status — RW-Trader", "", &body))
@@ -859,32 +1009,32 @@ async fn page_assistant(state: &AppState, query: &str) -> String {
     let kill_label = if kill_active { "Kill_Switch_Clear" } else { "Kill_Switch_Engage" };
 
     let body = format!(
-        r#"{flash}<section style="display:grid;grid-template-columns:2.1fr 1fr;gap:14px">
+        r#"<div class="page-scroll">{flash}<section style="display:grid;grid-template-columns:2.1fr 1fr;gap:14px">
   <div class="panel" style="padding:0;border-left:none">
-    <div style="padding:12px 14px;border-left:4px solid #4BE277;display:flex;justify-content:space-between;align-items:center"><strong style="font:700 34px Inter,sans-serif">SYSTEM_ACTIVITY_LOG.STDOUT</strong><span class="ok" style="font-family:JetBrains Mono,monospace">FILTER: ALL_EVENTS</span></div>
-    <div style="height:930px;background:#050b12;padding:16px 18px;overflow:auto">{event_html}</div>
-    <div style="padding:9px 14px;background:#181c21;font-family:JetBrains Mono,monospace"><span class='dim'>TASKS: 14 ACTIVE &nbsp; THROUGHPUT: 442 MSG/SEC</span> <span class='ok' style='float:right'>● LIVE</span></div>
+    <div style="padding:10px 14px;border-left:4px solid #4BE277;display:flex;justify-content:space-between;align-items:center"><strong style="font:700 18px Inter,sans-serif">SYSTEM_ACTIVITY_LOG.STDOUT</strong><span class="ok" style="font-family:JetBrains Mono,monospace;font-size:11px">FILTER: ALL_EVENTS</span></div>
+    <div style="height:500px;background:#050b12;padding:12px 16px;overflow:auto">{event_html}</div>
+    <div style="padding:7px 14px;background:#181c21;font-family:JetBrains Mono,monospace;font-size:11px"><span class='dim'>TASKS: 14 ACTIVE &nbsp; THROUGHPUT: 442 MSG/SEC</span> <span class='ok' style='float:right'>● LIVE</span></div>
   </div>
   <div>
     <div class="panel" style="border-left-color:#4BE277">
-      <div style="font:700 31px Inter,sans-serif;margin-bottom:12px">SYSTEM_ENVIRONMENT</div>
-      <h2>PRIMARY_API_KEY</h2><div style="padding:10px;background:#0A0E13;font-family:JetBrains Mono,monospace">•••••••••••••••••••••••••</div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px"><div style="background:#0A0E13;padding:10px"><h2>CORE_TEMP</h2><div class='ok' style="font:700 50px JetBrains Mono,monospace">42.4°C</div></div><div style="background:#0A0E13;padding:10px"><h2>MEMORY_LOAD</h2><div class='ok' style="font:700 50px JetBrains Mono,monospace">14.2%</div></div></div>
-      <div style="margin-top:12px;font-family:JetBrains Mono,monospace"><div>WEBSOCKET_FEED_1 <span class='ok' style='float:right'>ACTIVE [1.4ms]</span></div><div style='height:4px;background:#101419;margin:4px 0 10px'><div style='width:88%;height:100%;background:#4BE277'></div></div><div>AUTH_PROVIDER <span class='err' style='float:right'>RETRYING...</span></div><div style='height:4px;background:#101419;margin-top:4px'><div style='width:21%;height:100%;background:#f9a79d'></div></div></div>
+      <div style="font:700 16px Inter,sans-serif;margin-bottom:10px">SYSTEM_ENVIRONMENT</div>
+      <h2>PRIMARY_API_KEY</h2><div style="padding:8px 10px;background:#0A0E13;font-family:JetBrains Mono,monospace">•••••••••••••••••••••••••</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px"><div style="background:#0A0E13;padding:8px"><h2>CORE_TEMP</h2><div class='ok' style="font:700 28px JetBrains Mono,monospace">42.4°C</div></div><div style="background:#0A0E13;padding:8px"><h2>MEMORY_LOAD</h2><div class='ok' style="font:700 28px JetBrains Mono,monospace">14.2%</div></div></div>
+      <div style="margin-top:10px;font-family:JetBrains Mono,monospace;font-size:12px"><div>WEBSOCKET_FEED_1 <span class='ok' style='float:right'>ACTIVE [1.4ms]</span></div><div style='height:3px;background:#101419;margin:4px 0 8px'><div style='width:88%;height:100%;background:#4BE277'></div></div><div>AUTH_PROVIDER <span class='err' style='float:right'>RETRYING...</span></div><div style='height:3px;background:#101419;margin-top:4px'><div style='width:21%;height:100%;background:#f9a79d'></div></div></div>
     </div>
-    <div class="panel" style="margin-top:12px">
-      <div style="font:700 31px Inter,sans-serif;margin-bottom:10px">HEALTH_MONITOR</div>
-      <div style="background:#0A0E13;padding:14px;margin-bottom:8px">DATABASE_INTEGRITY <span class='ok' style='float:right'>SECURE</span></div>
-      <div style="background:#0A0E13;padding:14px;margin-bottom:8px">VAULT_ENCRYPTION <span class='ok' style='float:right'>AES-256</span></div>
-      <div style="background:#0A0E13;padding:14px">REDUNDANCY_FAILOVER <span class='err' style='float:right'>OFFLINE</span></div>
-      <form method='post' action='/assistant/system-restart'><button data-loading-text='Restarting...' style="margin-top:16px;width:100%;height:58px;background:#101419;color:#d0d6dd;border:1px solid rgba(142,152,162,.35);font:700 12px Inter,sans-serif;letter-spacing:.06em;text-transform:uppercase" type='submit'>System Restart</button></form>
-      <form method='post' action='/assistant/kill-switch/{kill_action}'><button data-loading-text='Applying...' style="margin-top:8px;width:100%;height:76px;background:#b00012;color:#ffe4e7;border:1px solid #f9a79d;font:700 15px Inter,sans-serif;letter-spacing:.08em;text-transform:uppercase" type='submit'>{kill_label}</button></form>
-      <div class="err" style="font-family:JetBrains Mono,monospace;font-size:11px;margin-top:8px">WARNING: IMMEDIATE LIQUIDATION OF ALL POSITIONS AND SESSION TERMINATION.</div>
+    <div class="panel" style="margin-top:10px">
+      <div style="font:700 16px Inter,sans-serif;margin-bottom:8px">HEALTH_MONITOR</div>
+      <div style="background:#0A0E13;padding:10px;margin-bottom:6px;font-size:12px">DATABASE_INTEGRITY <span class='ok' style='float:right'>SECURE</span></div>
+      <div style="background:#0A0E13;padding:10px;margin-bottom:6px;font-size:12px">VAULT_ENCRYPTION <span class='ok' style='float:right'>AES-256</span></div>
+      <div style="background:#0A0E13;padding:10px;font-size:12px">REDUNDANCY_FAILOVER <span class='err' style='float:right'>OFFLINE</span></div>
+      <form method='post' action='/assistant/system-restart'><button data-loading-text='Restarting...' style="margin-top:12px;width:100%;height:44px;background:#101419;color:#d0d6dd;border:1px solid rgba(142,152,162,.35);font:700 11px Inter,sans-serif;letter-spacing:.06em;text-transform:uppercase" type='submit'>System Restart</button></form>
+      <form method='post' action='/assistant/kill-switch/{kill_action}'><button data-loading-text='Applying...' style="margin-top:6px;width:100%;height:56px;background:#b00012;color:#ffe4e7;border:1px solid #f9a79d;font:700 13px Inter,sans-serif;letter-spacing:.08em;text-transform:uppercase" type='submit'>{kill_label}</button></form>
+      <div class="err" style="font-family:JetBrains Mono,monospace;font-size:10px;margin-top:6px">WARNING: IMMEDIATE LIQUIDATION OF ALL POSITIONS AND SESSION TERMINATION.</div>
     </div>
   </div>
 </section>
 <div style="margin-top:10px" class="panel"><span class='dim' style='font-family:JetBrains Mono,monospace'>SYSTEM: {}</span> <span style='margin-left:18px' class='dim'>EXEC: {}</span> <span style='margin-left:18px' class='ok'>POSITION: {:.4}</span> <span style='margin-left:18px' class='{}'>RISK</span> {}</div>
-<div style='display:none'>Risk Recent Activity</div>"#,
+<div style='display:none'>Risk Recent Activity</div></div>"#,
         esc(&sys_mode.to_string()),
         esc(&exec_state.to_string()),
         pos_size,
@@ -1069,7 +1219,7 @@ async fn page_suggestions(state: &AppState, query: &str) -> String {
     );
 
     let body = format!(
-        r#"{flash}{banner}<h2>Watchlist</h2>
+        r#"<div class="page-scroll">{flash}{banner}<h2>Watchlist</h2>
 <div class='callout {wl_cls}'><p><strong>{wl_label}</strong> — {wl_detail}</p>{market_info}</div>
 
 {trade_html}
@@ -1082,7 +1232,7 @@ async fn page_suggestions(state: &AppState, query: &str) -> String {
   These suggestions are advisory only. The live signal loop and risk engine
   make the actual trading decisions. Suggestions reflect the last recorded
   market snapshot and current system state — not a live feed read.
-</p>"#,
+</p></div>"#,
         banner     = banner,
         wl_detail  = esc(&wl_detail),
         market_info = market_info,
@@ -1228,12 +1378,13 @@ async fn page_authority(state: &AppState, query: &str) -> String {
     };
 
     let body = format!(
-        "{flash}{banner}\
+        "<div class='page-scroll'>{flash}{banner}\
          {sys_note}\
          <h2>Authority Mode</h2>\
          {buttons}\
          {expl_block}\
-         {proposals_block}"
+         {proposals_block}\
+         </div>"
     );
     html_resp(&page("Authority — RW-Trader", refresh, &body))
 }
@@ -1570,4 +1721,5 @@ mod tests {
         let r = page_status(&state, "").await;
         assert!(r.contains("max_position_qty") || r.contains("Risk"));
     }
+
 }
