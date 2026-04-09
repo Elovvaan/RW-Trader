@@ -349,8 +349,10 @@ async fn main() -> Result<()> {
 
     if !live_trade {
         info!("LIVE_TRADE=false — monitor mode. Set LIVE_TRADE=true to enable signal loop.");
-        // REST polling only — WebSocket is disabled
-        feed::run_rest_polling(Arc::clone(&client), &symbol, Arc::clone(&feed_state), Duration::from_secs(1)).await?;
+        // REST polling is already running in a spawned task (step 8).
+        // Park main() indefinitely so the tokio runtime — and all spawned tasks
+        // (REST poller, web UI, reconciler, watchdog) — stay alive.
+        std::future::pending::<()>().await;
         return Ok(());
     }
 
