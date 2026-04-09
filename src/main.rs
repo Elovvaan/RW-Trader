@@ -5,6 +5,7 @@ mod events;
 mod executor;
 mod feed;
 mod orders;
+mod portfolio;
 mod position;
 mod reader;
 mod reconciler;
@@ -161,6 +162,12 @@ async fn main() -> Result<()> {
     let api_secret = require_env("BINANCE_API_SECRET")?;
     let rest_url   = require_env("BINANCE_REST_URL")?;
     let symbol     = std::env::var("SYMBOL").unwrap_or_else(|_| "BTCUSDT".into());
+    let symbols: Vec<String> = std::env::var("SYMBOLS")
+        .unwrap_or_else(|_| symbol.clone())
+        .split(',')
+        .map(|s| s.trim().to_uppercase())
+        .filter(|s| !s.is_empty())
+        .collect();
     let live_trade = std::env::var("LIVE_TRADE")
         .map(|v| v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
@@ -286,6 +293,30 @@ async fn main() -> Result<()> {
     let signal_engine  = Arc::new(Mutex::new(signal::SignalEngine::new(signal_config)));
     // StrategyEngine replaces direct use of signal_engine for decision-making.
     let strategy_engine = Arc::new(Mutex::new(strategy::StrategyEngine::new()));
+    let portfolio_config = portfolio::PortfolioConfig {
+        initial_equity_usd: env_f64("PORTFOLIO_INITIAL_EQUITY_USD", 10_000.0),
+        reserve_cash_buffer: env_f64("PORTFOLIO_RESERVE_BUFFER", 0.20),
+        max_total_exposure: env_f64("PORTFOLIO_MAX_TOTAL_EXPOSURE", 0.95),
+        max_correlated_exposure: env_f64("PORTFOLIO_MAX_CORRELATED_EXPOSURE", 0.45),
+        max_symbol_exposure: env_f64("PORTFOLIO_MAX_SYMBOL_EXPOSURE", 0.35),
+        max_strategy_exposure: env_f64("PORTFOLIO_MAX_STRATEGY_EXPOSURE", 0.45),
+        max_intraday_drawdown: env_f64("PORTFOLIO_MAX_INTRADAY_DRAWDOWN", 0.06),
+        max_strategy_loss: env_f64("PORTFOLIO_MAX_STRATEGY_LOSS", 0.03),
+        max_symbol_loss: env_f64("PORTFOLIO_MAX_SYMBOL_LOSS", 0.03),
+        max_turnover_per_hour: env_f64("PORTFOLIO_MAX_TURNOVER_PER_HOUR", 4.0),
+        defensive_drawdown: env_f64("PORTFOLIO_DEFENSIVE_DRAWDOWN", 0.04),
+        recovery_drawdown: env_f64("PORTFOLIO_RECOVERY_DRAWDOWN", 0.02),
+        defensive_hit_rate: env_f64("PORTFOLIO_DEFENSIVE_HIT_RATE", 0.45),
+        min_confidence_normal: env_f64("PORTFOLIO_MIN_CONF_NORMAL", 0.70),
+        min_confidence_defensive: env_f64("PORTFOLIO_MIN_CONF_DEFENSIVE", 0.82),
+        max_concurrent_positions_normal: env_u64("PORTFOLIO_MAX_CONCURRENT_NORMAL", 6) as usize,
+        max_concurrent_positions_defensive: env_u64("PORTFOLIO_MAX_CONCURRENT_DEFENSIVE", 3) as usize,
+    };
+    let portfolio_allocator = Arc::new(portfolio::PortfolioAllocator::new(portfolio_config.clone()));
+    let portfolio_risk = Arc::new(portfolio::PortfolioRiskEngine::new(portfolio_config.clone()));
+    let portfolio_state = Arc::new(Mutex::new(portfolio::PortfolioState::new(&portfolio_config)));
+    let strategy_scoreboard = Arc::new(Mutex::new(portfolio::StrategyScoreboard::default()));
+    let execution_quality = Arc::new(Mutex::new(portfolio::ExecutionQualityTracker::default()));
 
     // ── 6. Feed state ────────────────────────────────────────────────────────
     let feed_state = Arc::new(Mutex::new(feed::FeedState::new(Duration::from_secs(10))));
@@ -397,8 +428,8 @@ async fn main() -> Result<()> {
 
     // ── 10. Signal + execution loop ───────────────────────────────────────────
     info!("=== LIVE_TRADE=true — signal loop active ===");
-    info!("Symbol={} qty={} SL={:.2}% TP={:.2}%",
-        symbol, order_qty,
+    info!("Symbols={:?} primary={} qty={} SL={:.2}% TP={:.2}%",
+        symbols, symbol, order_qty,
         env_f64("SIGNAL_STOP_LOSS_PCT",   0.0020) * 100.0,
         env_f64("SIGNAL_TAKE_PROFIT_PCT", 0.0040) * 100.0,
     );
@@ -511,6 +542,72 @@ async fn main() -> Result<()> {
             }
         }
 
+        // ── Portfolio ranking + allocation (signal -> ranking -> allocation) ─
+        let opportunity = portfolio::OpportunityCandidate {
+            symbol: symbol.clone(),
+            strategy: strategy_decision.strategy_id.clone(),
+            side: match &signal_result.decision {
+                signal::SignalDecision::Buy => risk::OrderSide::Buy,
+                signal::SignalDecision::Exit { .. } => risk::OrderSide::Sell,
+                signal::SignalDecision::Hold => unreachable!(),
+            },
+            confidence: signal_result.confidence,
+            regime_fit: regime_weight,
+            expected_reward_risk: ((signal_result.metrics.momentum_3s.abs() * 15_000.0)
+                / (signal_result.metrics.spread_bps.max(0.1))).clamp(0.0, 2.0),
+            volatility: signal_result.metrics.momentum_1s.abs()
+                + signal_result.metrics.momentum_3s.abs()
+                + signal_result.metrics.momentum_5s.abs(),
+            current_price: signal_result.metrics.mid,
+            reason: signal_result.reason.clone(),
+        };
+
+        let ranked = {
+            let mut pstate = portfolio_state.lock().await;
+            pstate.update_mode(&portfolio_config);
+            let scores = strategy_scoreboard.lock().await;
+            let eq = execution_quality.lock().await;
+            portfolio_allocator.rank_opportunities(&pstate, &scores, &eq, vec![opportunity])
+        };
+        let Some(top_opp) = ranked.first().cloned() else { continue; };
+        let portfolio_gate = {
+            let pstate = portfolio_state.lock().await;
+            portfolio_risk.check(&pstate, &top_opp)
+        };
+        if let Err(reason) = portfolio_gate {
+            info!(reason = %reason, symbol = %top_opp.candidate.symbol, "[PORTFOLIO] Rejected opportunity");
+            event_store.append(events::StoredEvent::new(
+                Some(symbol.clone()),
+                Some(correlation_id.clone()),
+                None,
+                events::TradingEvent::OperatorAction(events::OperatorActionPayload {
+                    action: "portfolio_rejection".into(),
+                    reason: format!("{} rank={:.3} mode={}", reason, top_opp.rank_score, {
+                        let p = portfolio_state.lock().await;
+                        p.mode.as_str()
+                    }),
+                }),
+            ));
+            continue;
+        }
+
+        event_store.append(events::StoredEvent::new(
+            Some(symbol.clone()),
+            Some(correlation_id.clone()),
+            None,
+            events::TradingEvent::OperatorAction(events::OperatorActionPayload {
+                action: "portfolio_ranked_opportunity".into(),
+                reason: format!(
+                    "rank={:.3} alloc_usd={:.2} div={:.2} corr_penalty={:.2} mode={}",
+                    top_opp.rank_score,
+                    top_opp.allocated_notional_usd,
+                    top_opp.diversification_benefit,
+                    top_opp.correlation_penalty,
+                    { let p = portfolio_state.lock().await; p.mode.as_str().to_string() }
+                ),
+            }),
+        ));
+
         // ── Route through risk engine ─────────────────────────────────────────
         let (order_side, proposed_price) = match &signal_result.decision {
             signal::SignalDecision::Buy       => (risk::OrderSide::Buy,  market_snapshot.ask),
@@ -545,9 +642,12 @@ async fn main() -> Result<()> {
 
         let dynamic_qty = {
             let strat = strategy_engine.lock().await;
+            let notional_budget_qty = if proposed_price > 0.0 {
+                top_opp.allocated_notional_usd / proposed_price
+            } else { 0.0 };
             match order_side {
                 risk::OrderSide::Buy => strat.compute_position_size(
-                    order_qty,
+                    order_qty.min(notional_budget_qty.max(0.0)),
                     signal_result.confidence,
                     regime_weight,
                     &signal_result.metrics,
@@ -714,6 +814,10 @@ async fn main() -> Result<()> {
                 // Check slippage vs expected price
                 if proposed_price > 0.0 && avg_price > 0.0 {
                     let slippage_bps = ((avg_price - proposed_price).abs() / proposed_price) * 10_000.0;
+                    {
+                        let mut eq = execution_quality.lock().await;
+                        eq.record("binance:market", slippage_bps, 0.0, false);
+                    }
                     if slippage_bps > env_f64("RISK_MAX_SPREAD_BPS", 10.0) * 2.0 {
                         warn!(
                             slippage_bps = format!("{:.2}", slippage_bps),
@@ -729,18 +833,50 @@ async fn main() -> Result<()> {
                 {
                     let mut strat = strategy_engine.lock().await;
                     let mut sig   = signal_engine.lock().await;
+                    let mut pstate = portfolio_state.lock().await;
                     match order_side {
                         risk::OrderSide::Buy  => {
                             strat.on_entry_submitted(&strategy_decision.strategy_id, avg_price.max(proposed_price));
                             sig.on_entry_submitted(avg_price.max(proposed_price));
+                            pstate.record_fill(&symbol, &strategy_decision.strategy_id, dynamic_qty * avg_price.max(proposed_price), true);
                         }
                         risk::OrderSide::Sell => {
                             strat.on_exit_submitted(&strategy_decision.strategy_id, avg_price.max(proposed_price));
                             sig.on_exit_submitted();
+                            pstate.record_fill(&symbol, &strategy_decision.strategy_id, dynamic_qty * avg_price.max(proposed_price), false);
                         }
                     }
                 }
                 let _ = &strategy_all; // comparison view available to UI via Arc<Mutex<StrategyEngine>>
+                {
+                    let mut pstate = portfolio_state.lock().await;
+                    let mut scores = strategy_scoreboard.lock().await;
+                    let realized = if proposed_price > 0.0 {
+                        (avg_price - proposed_price) / proposed_price
+                    } else { 0.0 };
+                    pstate.record_trade_result(dynamic_qty * (avg_price - proposed_price));
+                    scores.update(&strategy_decision.strategy_id, realized, pstate.drawdown());
+                    event_store.append(events::StoredEvent::new(
+                        Some(symbol.clone()),
+                        Some(correlation_id.clone()),
+                        Some(resp.client_order_id.clone()),
+                        events::TradingEvent::OperatorAction(events::OperatorActionPayload {
+                            action: "trade_lifecycle_analytics".into(),
+                            reason: format!(
+                                "strategy={} symbol={} regime_weight={:.3} confidence={:.3} entry_reason={} exit_reason={} edge_decay={:.4} slippage_bps={:.2} holding_secs=0.0 pnl_usd={:.4}",
+                                strategy_decision.strategy_id,
+                                symbol,
+                                regime_weight,
+                                signal_result.confidence,
+                                signal_result.reason.replace(' ', "_"),
+                                match &signal_result.decision { signal::SignalDecision::Exit { reason } => reason.to_string(), _ => "N/A".into() },
+                                signal_result.metrics.momentum_1s - signal_result.metrics.momentum_5s,
+                                if proposed_price > 0.0 { ((avg_price - proposed_price).abs() / proposed_price) * 10_000.0 } else { 0.0 },
+                                dynamic_qty * (avg_price - proposed_price),
+                            ),
+                        }),
+                    ));
+                }
 
                 signal::log_decision(&signal_result, Some("APPROVED"), "FILLED");
             }
