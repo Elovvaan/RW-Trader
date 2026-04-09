@@ -1721,4 +1721,5 @@ mod tests {
         let r = page_status(&state, "").await;
         assert!(r.contains("max_position_qty") || r.contains("Risk"));
     }
+
 }
