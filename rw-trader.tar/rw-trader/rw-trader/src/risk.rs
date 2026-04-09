@@ -60,6 +60,12 @@ pub struct RiskConfig {
     /// For market orders: expected price = ask (buy) or bid (sell).
     /// For limit orders: expected price = limit_price.
     pub max_slippage_bps: f64,
+    /// Hard cap on estimated loss for a single trade idea.
+    pub max_loss_per_trade_usd: f64,
+    /// Pause new entries after this many consecutive losing closes.
+    pub max_consecutive_losses: u32,
+    /// Cooldown duration after consecutive-loss halt.
+    pub loss_streak_cooldown: Duration,
 }
 
 impl RiskConfig {
@@ -76,6 +82,9 @@ impl RiskConfig {
             signal_dedup_window: Duration::from_secs(5),
             max_open_orders:     3,
             max_slippage_bps:    20.0,
+            max_loss_per_trade_usd: 20.0,
+            max_consecutive_losses: 3,
+            loss_streak_cooldown: Duration::from_secs(900),
         }
     }
 }
@@ -157,6 +166,8 @@ pub enum RejectionReason {
     DrawdownExceeded { drawdown_usd: f64, limit_usd: f64 },
     Cooldown { remaining_secs: f64 },
     PositionSizeExceeded { current_qty: f64, proposed_qty: f64, limit_qty: f64 },
+    PerTradeLossTooLarge { estimated_loss_usd: f64, limit_usd: f64 },
+    LossStreakCooldown { remaining_secs: f64, streak: u32 },
 }
 
 impl std::fmt::Display for RejectionReason {
@@ -180,6 +191,10 @@ impl std::fmt::Display for RejectionReason {
                 write!(f, "COOLDOWN: {:.0}s remaining after last losing trade", remaining_secs),
             RejectionReason::PositionSizeExceeded { current_qty, proposed_qty, limit_qty } =>
                 write!(f, "POSITION_SIZE: current {:.6} + proposed {:.6} > limit {:.6}", current_qty, proposed_qty, limit_qty),
+            RejectionReason::PerTradeLossTooLarge { estimated_loss_usd, limit_usd } =>
+                write!(f, "PER_TRADE_LOSS: est {:.2} USD > limit {:.2} USD", estimated_loss_usd, limit_usd),
+            RejectionReason::LossStreakCooldown { remaining_secs, streak } =>
+                write!(f, "LOSS_STREAK_COOLDOWN: {:.0}s remaining after {} consecutive losses", remaining_secs, streak),
         }
     }
 }
@@ -206,6 +221,8 @@ pub struct RiskEngine {
 
     /// Tracks the last known realized_pnl to detect when a fill closes at a loss.
     last_realized_pnl: f64,
+    consecutive_losses: u32,
+    loss_streak_cooldown_until: Option<Instant>,
 }
 
 impl RiskEngine {
@@ -220,6 +237,8 @@ impl RiskEngine {
             day_start_pnl: initial_pnl,
             cooldown_until: None,
             last_realized_pnl: current_pos.realized_pnl,
+            consecutive_losses: 0,
+            loss_streak_cooldown_until: None,
         }
     }
 
@@ -263,6 +282,19 @@ impl RiskEngine {
                 delta,
                 self.config.cooldown_after_loss.as_secs_f64()
             );
+            self.consecutive_losses += 1;
+            if self.consecutive_losses >= self.config.max_consecutive_losses {
+                let until = Instant::now() + self.config.loss_streak_cooldown;
+                self.loss_streak_cooldown_until = Some(until);
+                warn!(
+                    "RISK: {} consecutive losses reached. Loss-streak cooldown {:.0}s activated.",
+                    self.consecutive_losses,
+                    self.config.loss_streak_cooldown.as_secs_f64()
+                );
+            }
+        } else if delta > 0.0 {
+            self.consecutive_losses = 0;
+            self.loss_streak_cooldown_until = None;
         }
     }
 
@@ -360,6 +392,15 @@ impl RiskEngine {
         // ── Rule 6: Cooldown (BUY entries only) ───────────────────────────────
         // Sells are always allowed during cooldown — you must be able to exit.
         if order.side == OrderSide::Buy {
+            if let Some(until) = self.loss_streak_cooldown_until {
+                if Instant::now() < until {
+                    let remaining = until.duration_since(Instant::now());
+                    return self.reject(RejectionReason::LossStreakCooldown {
+                        remaining_secs: remaining.as_secs_f64(),
+                        streak: self.consecutive_losses,
+                    });
+                }
+            }
             if let Some(until) = self.cooldown_until {
                 if Instant::now() < until {
                     let remaining = until.duration_since(Instant::now());
@@ -379,6 +420,13 @@ impl RiskEngine {
                     current_qty: pos.size,
                     proposed_qty: order.qty,
                     limit_qty: self.config.max_position_qty,
+                });
+            }
+            let estimated_loss = order.qty * market.mid() * 0.0025;
+            if estimated_loss > self.config.max_loss_per_trade_usd {
+                return self.reject(RejectionReason::PerTradeLossTooLarge {
+                    estimated_loss_usd: estimated_loss,
+                    limit_usd: self.config.max_loss_per_trade_usd,
                 });
             }
         }
@@ -469,6 +517,13 @@ mod tests {
                 cooldown_after_loss: Duration::from_secs(60),
                 max_spread_bps:      10.0,
                 max_feed_staleness:  Duration::from_secs(5),
+                min_order_interval:  Duration::from_secs(1),
+                signal_dedup_window: Duration::from_secs(5),
+                max_open_orders:     3,
+                max_slippage_bps:    20.0,
+                max_loss_per_trade_usd: 20.0,
+                max_consecutive_losses: 3,
+                loss_streak_cooldown: Duration::from_secs(600),
             },
             pos,
         )

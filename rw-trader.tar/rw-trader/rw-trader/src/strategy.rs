@@ -54,6 +54,59 @@ impl std::fmt::Display for StrategyId {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarketRegime {
+    Trending,
+    Ranging,
+    HighVolatility,
+    LowVolatility,
+}
+
+impl std::fmt::Display for MarketRegime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MarketRegime::Trending => write!(f, "Trending"),
+            MarketRegime::Ranging => write!(f, "Ranging"),
+            MarketRegime::HighVolatility => write!(f, "HighVolatility"),
+            MarketRegime::LowVolatility => write!(f, "LowVolatility"),
+        }
+    }
+}
+
+fn detect_regime(metrics: &SignalMetrics) -> MarketRegime {
+    let trend_strength = metrics.momentum_5s.abs();
+    let short_impulse = metrics.momentum_1s.abs();
+    let vol_proxy = (short_impulse + metrics.spread_bps / 10_000.0).max(0.0);
+
+    if vol_proxy >= 0.0009 {
+        MarketRegime::HighVolatility
+    } else if vol_proxy <= 0.00015 {
+        MarketRegime::LowVolatility
+    } else if trend_strength >= 0.00018 {
+        MarketRegime::Trending
+    } else {
+        MarketRegime::Ranging
+    }
+}
+
+fn strategy_regime_fit(strategy: &StrategyId, regime: MarketRegime) -> bool {
+    match strategy {
+        StrategyId::MomentumMicro => matches!(regime, MarketRegime::Trending | MarketRegime::HighVolatility),
+        StrategyId::MeanReversionMicro => matches!(regime, MarketRegime::Ranging | MarketRegime::LowVolatility),
+        StrategyId::BreakoutMicro => matches!(regime, MarketRegime::Trending | MarketRegime::HighVolatility),
+    }
+}
+
+fn confidence_score(metrics: &SignalMetrics, raw_signal: f64, regime_fit: bool) -> f64 {
+    let momentum = (metrics.momentum_5s.abs() / 0.0015).clamp(0.0, 1.0);
+    let imbalance = ((metrics.imbalance_1s + metrics.imbalance_3s + metrics.imbalance_5s) / 1.8).clamp(0.0, 1.0);
+    let spread_quality = (1.0 - metrics.spread_bps / 8.0).clamp(0.0, 1.0);
+    let volatility_quality = (1.0 - ((metrics.momentum_1s.abs() - 0.0007).max(0.0) / 0.0015)).clamp(0.0, 1.0);
+    let recency = (1.0 - metrics.feed_age_ms / 3_000.0).clamp(0.0, 1.0);
+    let regime = if regime_fit { 1.0 } else { 0.0 };
+    ((raw_signal + momentum + imbalance + spread_quality + volatility_quality + recency + regime) / 7.0).clamp(0.0, 1.0)
+}
+
 /// All strategies in deterministic priority order.
 pub const ALL_STRATEGIES: &[StrategyId] = &[
     StrategyId::MomentumMicro,
@@ -96,14 +149,15 @@ pub struct StrategyDecision {
     pub action:      StrategyAction,
     pub confidence:  f64,
     pub reason:      String,
+    pub regime:      MarketRegime,
 }
 
 impl StrategyDecision {
     fn wait(id: StrategyId, reason: impl Into<String>) -> Self {
-        Self { strategy_id: id, action: StrategyAction::Wait, confidence: 0.0, reason: reason.into() }
+        Self { strategy_id: id, action: StrategyAction::Wait, confidence: 0.0, reason: reason.into(), regime: MarketRegime::Ranging }
     }
     fn stand_down(id: StrategyId, reason: impl Into<String>) -> Self {
-        Self { strategy_id: id, action: StrategyAction::StandDown, confidence: 1.0, reason: reason.into() }
+        Self { strategy_id: id, action: StrategyAction::StandDown, confidence: 1.0, reason: reason.into(), regime: MarketRegime::Ranging }
     }
 }
 
@@ -151,6 +205,12 @@ fn common_guards(
     if metrics.spread_bps > max_spread_bps {
         return Some(StrategyDecision::wait(id.clone(), format!("spread {:.1}bps > {:.1}", metrics.spread_bps, max_spread_bps)));
     }
+    if metrics.mid_samples < 6 {
+        return Some(StrategyDecision::wait(id.clone(), format!("insufficient mid samples: {}", metrics.mid_samples)));
+    }
+    if metrics.trade_samples < 4 {
+        return Some(StrategyDecision::wait(id.clone(), format!("insufficient trade samples: {}", metrics.trade_samples)));
+    }
     None
 }
 
@@ -172,23 +232,59 @@ fn evaluate_exit(
     let entry = entry_price_hint?;
     let _time = entry_time?;
     let mid   = metrics.mid;
+    let vol_boost = (metrics.momentum_1s.abs() * 1_500.0).clamp(0.0, 1.0);
+    let dynamic_stop_pct = stop_loss_pct * (1.0 + vol_boost);
+    let dynamic_tp_pct = take_profit_pct * (1.0 + (1.0 - vol_boost) * 0.4);
 
-    let sl = entry * (1.0 - stop_loss_pct);
+    let sl = entry * (1.0 - dynamic_stop_pct);
     if mid <= sl {
         return Some(StrategyDecision {
             strategy_id: id.clone(),
             action:      StrategyAction::ExitCandidate { reason: "STOP_LOSS".into() },
             confidence:  1.0,
-            reason:      format!("mid {:.2} ≤ stop {:.2} (entry {:.2})", mid, sl, entry),
+            reason:      format!("mid {:.2} ≤ dynamic stop {:.2} (entry {:.2})", mid, sl, entry),
+            regime:      detect_regime(metrics),
         });
     }
-    let tp = entry * (1.0 + take_profit_pct);
+    let tp = entry * (1.0 + dynamic_tp_pct);
     if mid >= tp {
         return Some(StrategyDecision {
             strategy_id: id.clone(),
             action:      StrategyAction::ExitCandidate { reason: "TAKE_PROFIT".into() },
             confidence:  1.0,
-            reason:      format!("mid {:.2} ≥ target {:.2} (entry {:.2})", mid, tp, entry),
+            reason:      format!("mid {:.2} ≥ dynamic target {:.2} (entry {:.2})", mid, tp, entry),
+            regime:      detect_regime(metrics),
+        });
+    }
+    // Trailing and break-even protection only when in profit.
+    if mid > entry {
+        let trailing_floor = entry * (1.0 + dynamic_tp_pct * 0.30);
+        if mid <= trailing_floor {
+            return Some(StrategyDecision {
+                strategy_id: id.clone(),
+                action:      StrategyAction::ExitCandidate { reason: "TRAILING_STOP".into() },
+                confidence:  0.9,
+                reason:      format!("in-profit trailing floor hit: mid {:.2} ≤ {:.2}", mid, trailing_floor),
+                regime:      detect_regime(metrics),
+            });
+        }
+        if mid >= entry * (1.0 + dynamic_tp_pct * 0.5) && mid <= entry * 1.0002 {
+            return Some(StrategyDecision {
+                strategy_id: id.clone(),
+                action:      StrategyAction::ExitCandidate { reason: "BREAK_EVEN_PROTECT".into() },
+                confidence:  0.85,
+                reason:      format!("break-even protection triggered near entry {:.2}", entry),
+                regime:      detect_regime(metrics),
+            });
+        }
+    }
+    if metrics.momentum_1s < -0.0002 && metrics.imbalance_1s < -0.15 {
+        return Some(StrategyDecision {
+            strategy_id: id.clone(),
+            action:      StrategyAction::ExitCandidate { reason: "EDGE_DECAY".into() },
+            confidence:  0.8,
+            reason:      format!("edge decay detected: m1={:+.5}, i1={:+.3}", metrics.momentum_1s, metrics.imbalance_1s),
+            regime:      detect_regime(metrics),
         });
     }
     if let Some(et) = entry_time {
@@ -198,6 +294,7 @@ fn evaluate_exit(
                 action:      StrategyAction::ExitCandidate { reason: "MAX_HOLD_TIME".into() },
                 confidence:  0.8,
                 reason:      format!("held {:.0}s ≥ limit {:.0}s", et.elapsed().as_secs_f64(), max_hold.as_secs_f64()),
+                regime:      detect_regime(metrics),
             });
         }
     }
@@ -264,6 +361,10 @@ impl Strategy for MomentumMicro {
 
         let m1 = metrics.momentum_1s;
         let m3 = metrics.momentum_3s;
+        let regime = detect_regime(metrics);
+        if !strategy_regime_fit(&StrategyId::MomentumMicro, regime) {
+            return StrategyDecision::wait(StrategyId::MomentumMicro, format!("regime {} not suitable", regime));
+        }
         let m5 = metrics.momentum_5s;
         let i1 = metrics.imbalance_1s;
         let i3 = metrics.imbalance_3s;
@@ -280,13 +381,14 @@ impl Strategy for MomentumMicro {
         let mom_score = (m5 / thr).min(1.0).max(0.0);
         let imb_score = i1.min(1.0).max(0.0);
         let spr_score = (1.0 - metrics.spread_bps / self.max_entry_spread_bps).min(1.0).max(0.0);
-        let confidence = (mom_score + imb_score + spr_score) / 3.0;
+        let confidence = confidence_score(metrics, (mom_score + imb_score + spr_score) / 3.0, true);
 
         StrategyDecision {
             strategy_id: StrategyId::MomentumMicro,
             action:      StrategyAction::BuyCandidate,
             confidence,
             reason:      format!("MomentumMicro: m1={:+.5} m3={:+.5} m5={:+.5} i1={:+.3} i3={:+.3} conf={:.2}", m1, m3, m5, i1, i3, confidence),
+            regime,
         }
     }
 }
@@ -358,6 +460,10 @@ impl Strategy for MeanReversionMicro {
 
         let m1 = metrics.momentum_1s;
         let m5 = metrics.momentum_5s;
+        let regime = detect_regime(metrics);
+        if !strategy_regime_fit(&StrategyId::MeanReversionMicro, regime) {
+            return StrategyDecision::wait(StrategyId::MeanReversionMicro, format!("regime {} not suitable", regime));
+        }
         let i1 = metrics.imbalance_1s;
 
         if m5 < self.min_5s_momentum {
@@ -381,13 +487,14 @@ impl Strategy for MeanReversionMicro {
         let trend_score  = (m5 / self.min_5s_momentum).min(1.0).max(0.0);
         let depth_score  = ((-m1) / (-self.min_1s_momentum)).min(1.0).max(0.0); // depth of dip
         let return_score = (i1 / 0.5).min(1.0).max(0.0);  // how much buy pressure is returning
-        let confidence   = (trend_score + depth_score + return_score) / 3.0;
+        let confidence   = confidence_score(metrics, (trend_score + depth_score + return_score) / 3.0, true);
 
         StrategyDecision {
             strategy_id: StrategyId::MeanReversionMicro,
             action:      StrategyAction::BuyCandidate,
             confidence,
             reason:      format!("MeanReversionMicro: dip m1={:+.5} in uptrend m5={:+.5} buy-return i1={:+.3} conf={:.2}", m1, m5, i1, confidence),
+            regime,
         }
     }
 }
@@ -455,6 +562,10 @@ impl Strategy for BreakoutMicro {
         let m1 = metrics.momentum_1s;
         let m5 = metrics.momentum_5s;
         let i1 = metrics.imbalance_1s;
+        let regime = detect_regime(metrics);
+        if !strategy_regime_fit(&StrategyId::BreakoutMicro, regime) {
+            return StrategyDecision::wait(StrategyId::BreakoutMicro, format!("regime {} not suitable", regime));
+        }
 
         if m5 < self.min_5s_momentum {
             return StrategyDecision::wait(StrategyId::BreakoutMicro,
@@ -474,13 +585,14 @@ impl Strategy for BreakoutMicro {
         let accel_score = (ratio / (self.breakout_ratio * 2.0)).min(1.0);
         let imb_score   = (i1 / 0.8).min(1.0).max(0.0);
         let spr_score   = (1.0 - metrics.spread_bps / self.max_entry_spread_bps).min(1.0).max(0.0);
-        let confidence  = (accel_score + imb_score + spr_score) / 3.0;
+        let confidence  = confidence_score(metrics, (accel_score + imb_score + spr_score) / 3.0, true);
 
         StrategyDecision {
             strategy_id: StrategyId::BreakoutMicro,
             action:      StrategyAction::BuyCandidate,
             confidence,
             reason:      format!("BreakoutMicro: m1/m5 ratio={:.2} m1={:+.5} m5={:+.5} i1={:+.3} conf={:.2}", ratio, m1, m5, i1, confidence),
+            regime,
         }
     }
 }
@@ -501,6 +613,7 @@ pub struct StrategyEngine {
     strategies:  Vec<Box<dyn Strategy>>,
     enabled:     HashMap<StrategyId, bool>,
     entry_state: HashMap<StrategyId, StrategyState>,
+    min_confidence: f64,
 }
 
 impl StrategyEngine {
@@ -517,7 +630,7 @@ impl StrategyEngine {
             enabled.insert(s.id().clone(), true);
             entry_state.insert(s.id().clone(), StrategyState::default());
         }
-        Self { strategies, enabled, entry_state }
+        Self { strategies, enabled, entry_state, min_confidence: 0.72 }
     }
 
     // ── Enable/disable ────────────────────────────────────────────────────────
@@ -601,6 +714,7 @@ impl StrategyEngine {
                     action:      StrategyAction::StandDown,
                     confidence:  0.0,
                     reason:      "disabled".into(),
+                    regime:      detect_regime(metrics),
                 });
                 continue;
             }
@@ -618,7 +732,7 @@ impl StrategyEngine {
                 "[STRATEGY] Decision"
             );
 
-            if decision.action.is_actionable() {
+            if decision.action.is_actionable() && decision.confidence >= self.min_confidence {
                 candidates.push(decision.clone());
             }
             all_decisions.push(decision);
@@ -676,6 +790,9 @@ impl StrategyDecision {
                     "STOP_LOSS"    => crate::signal::ExitReason::StopLoss,
                     "TAKE_PROFIT"  => crate::signal::ExitReason::TakeProfit,
                     "MAX_HOLD_TIME"=> crate::signal::ExitReason::MaxHoldTime,
+                    "TRAILING_STOP" => crate::signal::ExitReason::TrailingStop,
+                    "BREAK_EVEN_PROTECT" => crate::signal::ExitReason::BreakEvenProtect,
+                    "EDGE_DECAY" => crate::signal::ExitReason::EdgeDecay,
                     _              => crate::signal::ExitReason::MaxHoldTime, // safe fallback
                 };
                 crate::signal::SignalDecision::Exit { reason: exit_reason }
@@ -690,7 +807,7 @@ impl StrategyDecision {
     pub fn to_signal_result(&self, metrics: &SignalMetrics) -> crate::signal::SignalResult {
         crate::signal::SignalResult {
             decision:   self.to_signal_decision(),
-            reason:     format!("[{}] {}", self.strategy_id, self.reason),
+            reason:     format!("[{}|regime={}] {}", self.strategy_id, self.regime, self.reason),
             confidence: self.confidence,
             metrics:    metrics.clone(),
         }
@@ -954,12 +1071,14 @@ mod tests {
             action:      StrategyAction::BuyCandidate,
             confidence:  0.5,
             reason:      "test".into(),
+            regime:      MarketRegime::Trending,
         };
         let b = StrategyDecision {
             strategy_id: StrategyId::MomentumMicro,
             action:      StrategyAction::BuyCandidate,
             confidence:  0.5,
             reason:      "test".into(),
+            regime:      MarketRegime::Trending,
         };
         // Simulate the engine's reduce logic:
         let winner = [a, b].into_iter().reduce(|best, next| {
@@ -1029,6 +1148,7 @@ mod tests {
             action:      StrategyAction::BuyCandidate,
             confidence:  0.7,
             reason:      "test".into(),
+            regime:      MarketRegime::Trending,
         };
         let sr = d.to_signal_result(&base_metrics());
         assert!(matches!(sr.decision, crate::signal::SignalDecision::Buy));
@@ -1042,6 +1162,7 @@ mod tests {
             action:      StrategyAction::ExitCandidate { reason: "STOP_LOSS".into() },
             confidence:  1.0,
             reason:      "test".into(),
+            regime:      MarketRegime::Trending,
         };
         let sr = d.to_signal_result(&base_metrics());
         assert!(matches!(sr.decision, crate::signal::SignalDecision::Exit { reason: crate::signal::ExitReason::StopLoss }));
@@ -1054,6 +1175,7 @@ mod tests {
             action:      StrategyAction::Wait,
             confidence:  0.0,
             reason:      "waiting".into(),
+            regime:      MarketRegime::Ranging,
         };
         let sr = d.to_signal_result(&base_metrics());
         assert!(matches!(sr.decision, crate::signal::SignalDecision::Hold));

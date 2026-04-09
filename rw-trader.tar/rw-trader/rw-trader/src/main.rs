@@ -18,6 +18,7 @@ mod webui;
 
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::Result;
 use tokio::sync::Mutex;
@@ -84,6 +85,9 @@ async fn main() -> Result<()> {
                 signal_dedup_window: Duration::from_secs(0),
                 max_open_orders:     0,
                 max_slippage_bps:    0.0,
+                max_loss_per_trade_usd: 0.0,
+                max_consecutive_losses: 0,
+                loss_streak_cooldown: Duration::from_secs(0),
             }, &stub_pos);
             let stub_exec = executor::Executor::new(
                 "BTCUSDT".into(),
@@ -252,6 +256,9 @@ async fn main() -> Result<()> {
         signal_dedup_window: Duration::from_secs(5),
         max_open_orders:     1,
         max_slippage_bps:    20.0,
+        max_loss_per_trade_usd: env_f64("RISK_MAX_LOSS_PER_TRADE_USD", 20.0),
+        max_consecutive_losses: env_u64("RISK_MAX_CONSECUTIVE_LOSSES", 3) as u32,
+        loss_streak_cooldown: Duration::from_secs(env_u64("RISK_LOSS_STREAK_COOLDOWN_SECS", 900)),
     };
     let risk_engine = Arc::new(Mutex::new({
         let s = truth.lock().await;
@@ -272,6 +279,9 @@ async fn main() -> Result<()> {
         min_trade_samples:     3,
     };
     let order_qty      = signal_config.order_qty;
+    let min_confidence_threshold = env_f64("SIGNAL_MIN_CONFIDENCE", 0.72);
+    let entry_cooldown_after_exit = Duration::from_secs(env_u64("ENTRY_COOLDOWN_AFTER_EXIT_SECS", 20));
+    let failed_breakout_cooldown = Duration::from_secs(env_u64("FAILED_BREAKOUT_COOLDOWN_SECS", 45));
     // signal_engine retained for compute_metrics (SignalEngine still computes
     // the shared SignalMetrics that all strategies receive).
     let signal_engine  = Arc::new(Mutex::new(signal::SignalEngine::new(signal_config)));
@@ -336,6 +346,17 @@ async fn main() -> Result<()> {
         feed::run_feed(&ws_url, &symbol).await?;
         return Ok(());
     }
+    let smart_logic_validated = std::env::var("SIM_VALIDATED_SMART_LOGIC")
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !smart_logic_validated {
+        warn!(
+            "LIVE_TRADE requested but SIM_VALIDATED_SMART_LOGIC=true is not set. \
+             Refusing live entries until smarter logic is validated in simulation/paper mode."
+        );
+        feed::run_feed(&ws_url, &symbol).await?;
+        return Ok(());
+    }
 
     // ── 10. Signal + execution loop ───────────────────────────────────────────
     info!("=== LIVE_TRADE=true — signal loop active ===");
@@ -350,6 +371,9 @@ async fn main() -> Result<()> {
 
     // Monotonic sequence counter for deterministic coid generation
     let mut order_seq: u64 = 0;
+    let mut last_exit_at: Option<Instant> = None;
+    let mut last_failed_breakout_at: Option<Instant> = None;
+    let mut last_buy_signature: Option<(String, i64)> = None;
 
     // Give feed time to collect initial data
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -414,6 +438,26 @@ async fn main() -> Result<()> {
                 continue;
             }
             signal::SignalDecision::Buy => {
+                if signal_result.confidence < min_confidence_threshold {
+                    tracing::debug!(
+                        conf = signal_result.confidence,
+                        threshold = min_confidence_threshold,
+                        "[STRATEGY] Buy rejected by confidence threshold"
+                    );
+                    continue;
+                }
+                if let Some(last) = last_exit_at {
+                    if last.elapsed() < entry_cooldown_after_exit {
+                        tracing::debug!("[STRATEGY] Entry cooldown after exit active");
+                        continue;
+                    }
+                }
+                if let Some(last) = last_failed_breakout_at {
+                    if last.elapsed() < failed_breakout_cooldown {
+                        tracing::debug!("[STRATEGY] Failed-breakout cooldown active");
+                        continue;
+                    }
+                }
                 info!(
                     reason   = %signal_result.reason,
                     conf     = signal_result.confidence,
@@ -458,11 +502,27 @@ async fn main() -> Result<()> {
             signal::SignalDecision::Exit { .. }=> (risk::OrderSide::Sell, market_snapshot.bid),
             signal::SignalDecision::Hold       => unreachable!(),
         };
+        let adaptive_qty = if matches!(order_side, risk::OrderSide::Buy) {
+            let vol_penalty = (signal_result.metrics.momentum_1s.abs() / 0.0012).clamp(0.0, 0.5);
+            let conf_scale = signal_result.confidence.clamp(0.35, 1.0);
+            (order_qty * conf_scale * (1.0 - vol_penalty)).max(order_qty * 0.35)
+        } else {
+            order_qty
+        };
+        if matches!(order_side, risk::OrderSide::Buy) {
+            let spread_sig = (signal_result.metrics.spread_bps * 10.0).round() as i64;
+            let sig = (strategy_decision.strategy_id.to_string(), spread_sig);
+            if last_buy_signature.as_ref() == Some(&sig) {
+                tracing::debug!("[STRATEGY] Deduping repeated same-direction signal");
+                continue;
+            }
+            last_buy_signature = Some(sig);
+        }
 
         let proposed = risk::ProposedOrder {
             symbol:         symbol.clone(),
             side:           order_side,
-            qty:            order_qty,
+            qty:            adaptive_qty,
             expected_price: proposed_price,
         };
 
@@ -514,7 +574,7 @@ async fn main() -> Result<()> {
             let auth_result = authority.check(
                 &symbol,
                 side_str,
-                order_qty,
+                adaptive_qty,
                 &signal_result.reason,
                 signal_result.confidence,
                 sys_mode,
@@ -554,7 +614,7 @@ async fn main() -> Result<()> {
         // Incremented once per signal, not per retry. Retries reuse the same coid.
         order_seq += 1;
         let client_order_id = executor::make_client_order_id(order_seq);
-        let qty_str  = format!("{:.5}", order_qty);
+        let qty_str  = format!("{:.5}", adaptive_qty);
 
         // Persist order submission intent
         event_store.append(events::order_submitted_event(
@@ -623,8 +683,15 @@ async fn main() -> Result<()> {
                         risk::OrderSide::Sell => {
                             strat.on_exit_submitted(&strategy_decision.strategy_id);
                             sig.on_exit_submitted();
+                            last_exit_at = Some(Instant::now());
+                            last_buy_signature = None;
                         }
                     }
+                }
+                if matches!(order_side, risk::OrderSide::Sell)
+                    && matches!(&signal_result.decision, signal::SignalDecision::Exit { reason: signal::ExitReason::StopLoss })
+                {
+                    last_failed_breakout_at = Some(Instant::now());
                 }
                 let _ = &strategy_all; // comparison view available to UI via Arc<Mutex<StrategyEngine>>
 

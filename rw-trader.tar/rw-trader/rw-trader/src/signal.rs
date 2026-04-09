@@ -94,6 +94,9 @@ pub enum ExitReason {
     StopLoss,
     TakeProfit,
     MaxHoldTime,
+    TrailingStop,
+    BreakEvenProtect,
+    EdgeDecay,
 }
 
 impl std::fmt::Display for ExitReason {
@@ -102,6 +105,9 @@ impl std::fmt::Display for ExitReason {
             ExitReason::StopLoss    => write!(f, "STOP_LOSS"),
             ExitReason::TakeProfit  => write!(f, "TAKE_PROFIT"),
             ExitReason::MaxHoldTime => write!(f, "MAX_HOLD_TIME"),
+            ExitReason::TrailingStop => write!(f, "TRAILING_STOP"),
+            ExitReason::BreakEvenProtect => write!(f, "BREAK_EVEN_PROTECT"),
+            ExitReason::EdgeDecay => write!(f, "EDGE_DECAY"),
         }
     }
 }
