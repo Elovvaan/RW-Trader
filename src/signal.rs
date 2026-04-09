@@ -621,6 +621,7 @@ mod tests {
     }
 
     fn approx(a: f64, b: f64) -> bool { (a - b).abs() < 1e-9 }
+    const SIGNAL_MIN_CONFIDENCE: f64 = 0.72;
 
     // ── Momentum computation ──────────────────────────────────────────────────
 
@@ -868,29 +869,96 @@ mod tests {
     #[test]
     fn test_no_entry_negative_momentum() {
         let engine = SignalEngine::new(default_config());
+        let baseline_feed = build_bullish_feed();
+        let baseline_truth = clean_truth("BTCUSDT");
+        let baseline = engine.evaluate(&baseline_feed, &baseline_truth);
+
         let mut feed = good_feed(50000.0, 50001.0);
-        // Downward trend: 50010 → 50000 (falling)
-        add_mid_trend(&mut feed, 10, 6.0, 50010.0, 50000.0);
-        add_trades(&mut feed, 10, 5.0, 1.0, 0.8);
+        // Weak overall setup with clearly negative momentum.
+        add_mid_trend(&mut feed, 10, 6.0, 50020.0, 50000.0);
+        add_trades(&mut feed, 10, 5.0, 1.0, 0.55);
         let truth = clean_truth("BTCUSDT");
 
         let result = engine.evaluate(&feed, &truth);
-        assert_ne!(result.decision, SignalDecision::Buy,
-            "Should not buy on negative momentum");
+        assert!(result.metrics.momentum_5s < 0.0,
+            "expected negative 5s momentum, got {}", result.metrics.momentum_5s);
+        assert!(result.confidence <= baseline.confidence,
+            "negative momentum should reduce confidence: baseline {:.6}, got {:.6}",
+            baseline.confidence, result.confidence);
+
+        // Adaptive behavior: negative momentum penalizes confidence, and weak setup should HOLD.
+        assert!(result.confidence < SIGNAL_MIN_CONFIDENCE,
+            "weak negative-momentum setup should remain below confidence threshold {:.2}, got {:.6}",
+            SIGNAL_MIN_CONFIDENCE, result.confidence);
+        assert_eq!(result.decision, SignalDecision::Hold,
+            "weak negative-momentum setup should HOLD, got {:?} ({})", result.decision, result.reason);
     }
 
     #[test]
     fn test_no_entry_negative_imbalance() {
         let engine = SignalEngine::new(default_config());
+        let baseline_feed = build_bullish_feed();
+        let baseline_truth = clean_truth("BTCUSDT");
+        let baseline = engine.evaluate(&baseline_feed, &baseline_truth);
+
         let mut feed = good_feed(50000.0, 50001.0);
-        add_mid_trend(&mut feed, 10, 6.0, 49990.0, 50000.5);
-        // All sell aggression
+        add_mid_trend(&mut feed, 10, 6.0, 50010.0, 50000.0);
+        // Strongly opposing order-flow (all sells) should suppress entry confidence.
         add_trades(&mut feed, 10, 5.0, 1.0, 0.0);
         let truth = clean_truth("BTCUSDT");
 
         let result = engine.evaluate(&feed, &truth);
-        assert_ne!(result.decision, SignalDecision::Buy,
-            "Should not buy on sell imbalance");
+        assert!(result.metrics.imbalance_5s < 0.0,
+            "expected negative 5s imbalance, got {}", result.metrics.imbalance_5s);
+        assert!(result.confidence <= baseline.confidence,
+            "negative imbalance should reduce confidence: baseline {:.6}, got {:.6}",
+            baseline.confidence, result.confidence);
+        assert!(result.confidence < SIGNAL_MIN_CONFIDENCE,
+            "strong opposing flow should be below confidence threshold {:.2}, got {:.6}",
+            SIGNAL_MIN_CONFIDENCE, result.confidence);
+        assert_eq!(result.decision, SignalDecision::Hold,
+            "strong opposing factors should HOLD, got {:?} ({})", result.decision, result.reason);
+    }
+
+    #[test]
+    fn test_mixed_signals_negative_imbalance_conditional_behavior() {
+        let engine = SignalEngine::new(default_config());
+        let mut feed = good_feed(50000.0, 50001.0);
+        // Positive short-horizon trend to support entry side.
+        add_mid_trend(&mut feed, 12, 5.0, 49990.0, 50000.5);
+        // Mixed order-flow: recent buys (passes short-window gate), older sells (hurts 5s confidence).
+        for _ in 0..6 {
+            feed.trade_history.push_back(TradeSample {
+                timestamp: Instant::now() - Duration::from_millis(500),
+                qty: 1.0,
+                is_aggressor_buy: true,
+            });
+        }
+        for _ in 0..6 {
+            feed.trade_history.push_back(TradeSample {
+                timestamp: Instant::now() - Duration::from_millis(4500),
+                qty: 1.0,
+                is_aggressor_buy: false,
+            });
+        }
+        let truth = clean_truth("BTCUSDT");
+
+        let result = engine.evaluate(&feed, &truth);
+        assert!(result.metrics.imbalance_5s < result.metrics.imbalance_1s,
+            "expected mixed-flow profile with lower 5s imbalance: i1={:.6}, i5={:.6}",
+            result.metrics.imbalance_1s, result.metrics.imbalance_5s);
+
+        // Mixed signals are conditional: BUY is acceptable only at/above threshold,
+        // otherwise HOLD is expected.
+        match result.decision {
+            SignalDecision::Buy => assert!(result.confidence >= SIGNAL_MIN_CONFIDENCE,
+                "BUY in mixed signals must be supported by confidence >= {:.2}, got {:.6}",
+                SIGNAL_MIN_CONFIDENCE, result.confidence),
+            SignalDecision::Hold => assert!(result.confidence < SIGNAL_MIN_CONFIDENCE,
+                "HOLD in mixed signals should correspond to confidence < {:.2}, got {:.6}",
+                SIGNAL_MIN_CONFIDENCE, result.confidence),
+            _ => panic!("unexpected decision for mixed entry scenario: {:?}", result.decision),
+        }
     }
 
     #[test]
