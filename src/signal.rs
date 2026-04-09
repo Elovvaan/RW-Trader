@@ -745,10 +745,10 @@ mod tests {
 
     fn build_bullish_feed() -> FeedState {
         let mut feed = good_feed(50000.0, 50001.0); // 2 bps spread
-        // Upward mid trend over 6 seconds: 49990 → 50000 (current mid=50000.5)
-        add_mid_trend(&mut feed, 10, 6.0, 49990.0, 50000.5);
-        // Strong buy aggression (recent-window safe for dynamic thresholds)
-        add_trades(&mut feed, 10, 5.0, 1.0, 1.0);
+        // Strong upward trend over 5 seconds so 1s/3s/5s momentum all clear threshold.
+        add_mid_trend(&mut feed, 12, 5.0, 49850.0, 50000.5);
+        // Strong buy aggression across the full 5s history.
+        add_trades(&mut feed, 12, 5.0, 1.0, 1.0);
         feed
     }
 
@@ -759,6 +759,33 @@ mod tests {
         let truth = clean_truth("BTCUSDT");
 
         let result = engine.evaluate(&feed, &truth);
+
+        // Explicitly verify sample prerequisites are satisfied.
+        assert_eq!(result.metrics.mid_samples, 12);
+        assert_eq!(result.metrics.trade_samples, 12);
+        assert!(result.metrics.mid_samples >= engine.config.min_mid_samples);
+        assert!(result.metrics.trade_samples >= engine.config.min_trade_samples);
+
+        // Explicitly verify high-confidence setup under modern thresholds.
+        let expected_confidence = {
+            let m = &result.metrics;
+            let momentum_score = (m.momentum_5s / engine.config.momentum_threshold).clamp(0.0, 1.0);
+            let imbalance_score = m.imbalance_5s.clamp(0.0, 1.0);
+            let spread_score = (1.0 - (m.spread_bps / engine.config.max_entry_spread_bps)).clamp(0.0, 1.0);
+            (momentum_score + imbalance_score + spread_score) / 3.0
+        };
+        assert!(approx(result.confidence, expected_confidence),
+            "confidence mismatch: expected {:.6}, got {:.6}", expected_confidence, result.confidence);
+        const SIGNAL_MIN_CONFIDENCE: f64 = 0.72;
+        assert!(result.confidence >= SIGNAL_MIN_CONFIDENCE,
+            "expected high-confidence scenario (>= {:.2}), got {:.6}", SIGNAL_MIN_CONFIDENCE, result.confidence);
+
+        // Regime alignment equivalent to strategy-layer detection (fast vs medium agree).
+        let short_fast = (result.metrics.momentum_1s * 0.7) + (result.metrics.imbalance_1s * 0.3);
+        let medium_stable = (result.metrics.momentum_5s * 0.8) + (result.metrics.imbalance_5s * 0.2);
+        assert_eq!(short_fast.signum(), medium_stable.signum(),
+            "expected aligned regime, got short_fast={:+.6}, medium_stable={:+.6}", short_fast, medium_stable);
+
         assert_eq!(result.decision, SignalDecision::Buy,
             "Expected Buy, got {:?}: {}", result.decision, result.reason);
     }
