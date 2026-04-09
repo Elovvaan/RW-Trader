@@ -113,6 +113,19 @@ pub struct TickerPrice {
     pub price: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct BookTickerData {
+    pub symbol: String,
+    #[serde(rename = "bidPrice")]
+    pub bid_price: String,
+    #[serde(rename = "bidQty")]
+    pub bid_qty: String,
+    #[serde(rename = "askPrice")]
+    pub ask_price: String,
+    #[serde(rename = "askQty")]
+    pub ask_qty: String,
+}
+
 // Binance returns this shape on errors
 #[derive(Debug, Deserialize)]
 struct BinanceError {
@@ -268,6 +281,15 @@ impl BinanceClient {
         debug!(url = %url, "GET ticker price");
         let resp = self.http.get(&url).send().await?;
         Self::parse_response(resp, "ticker/price").await
+    }
+
+    /// Fetch the best bid and ask price for a symbol via REST.
+    /// Used by the REST polling feed when WebSocket is disabled.
+    pub async fn fetch_book_ticker(&self, symbol: &str) -> Result<BookTickerData> {
+        let url = format!("{}/api/v3/ticker/bookTicker?symbol={}", self.base_url, symbol);
+        debug!(url = %url, "GET bookTicker");
+        let resp = self.http.get(&url).send().await?;
+        Self::parse_response(resp, "ticker/bookTicker").await
     }
 
     /// Fetch exchange filters for a single symbol.
