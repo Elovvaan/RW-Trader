@@ -89,7 +89,7 @@ async fn handle(mut stream: TcpStream, state: Arc<AppState>) -> Result<()> {
     } else if path == "/" {
         redirect("/events")
     } else if path == "/events" {
-        page_events(&state).await
+        page_events(&state, query).await
     } else if let Some(corr_id) = path.strip_prefix("/trade/") {
         page_trade(&state, corr_id).await
     } else if path == "/trade" {
@@ -100,13 +100,15 @@ async fn handle(mut stream: TcpStream, state: Arc<AppState>) -> Result<()> {
             redirect(&format!("/trade/{}", url_encode(corr_id)))
         }
     } else if path == "/status" {
-        page_status(&state).await
+        page_status(&state, query).await
+    } else if path == "/status/export.csv" {
+        export_positions_csv(&state).await
     } else if path == "/assistant" {
-        page_assistant(&state).await
+        page_assistant(&state, query).await
     } else if path == "/suggestions" {
-        page_suggestions(&state).await
+        page_suggestions(&state, query).await
     } else if path == "/authority" {
-        page_authority(&state).await
+        page_authority(&state, query).await
     } else if path == "/health" {
         plain("OK")
     } else {
@@ -118,6 +120,47 @@ async fn handle(mut stream: TcpStream, state: Arc<AppState>) -> Result<()> {
 }
 
 async fn handle_post(path: &str, _query: &str, state: &AppState) -> String {
+    if path == "/events/quick/buy" {
+        log_ui_action(&*state.store, "ui_quick_execute_buy", "manual quick execute from /events");
+        return redirect_with_ok("/events", "Queued quick BUY market simulation.");
+    }
+    if path == "/events/quick/sell" {
+        log_ui_action(&*state.store, "ui_quick_execute_sell", "manual quick execute from /events");
+        return redirect_with_ok("/events", "Queued quick SELL market simulation.");
+    }
+
+    if let Some(order_id) = path.strip_prefix("/status/cancel/") {
+        log_ui_action(
+            &*state.store,
+            &format!("ui_cancel_order:{order_id}"),
+            "cancel requested from /status",
+        );
+        return redirect_with_ok("/status", &format!("Cancel requested for order {order_id}."));
+    }
+    if path == "/status/close-all" {
+        log_ui_action(&*state.store, "ui_close_all_positions", "close-all requested from /status");
+        return redirect_with_ok("/status", "Close-all request queued.");
+    }
+    if path == "/status/update-strategy" {
+        log_ui_action(&*state.store, "ui_update_strategy", "strategy config update requested from /status");
+        return redirect_with_ok("/status", "Strategy config saved (UI simulation).");
+    }
+
+    if path == "/assistant/system-restart" {
+        log_ui_action(&*state.store, "ui_system_restart", "system restart requested from /assistant");
+        return redirect_with_ok("/assistant", "Restart request recorded.");
+    }
+    if path == "/assistant/kill-switch/on" {
+        state.risk.lock().await.set_kill_switch(true);
+        log_ui_action(&*state.store, "ui_kill_switch_engaged", "kill switch engaged from /assistant");
+        return redirect_with_ok("/assistant", "Kill switch engaged.");
+    }
+    if path == "/assistant/kill-switch/off" {
+        state.risk.lock().await.set_kill_switch(false);
+        log_ui_action(&*state.store, "ui_kill_switch_cleared", "kill switch cleared from /assistant");
+        return redirect_with_ok("/assistant", "Kill switch cleared.");
+    }
+
     // POST /strategy/enable/{id} or /strategy/disable/{id}
     if let Some(rest) = path.strip_prefix("/strategy/") {
         if let Some((verb, id_str)) = rest.split_once('/') {
@@ -125,7 +168,8 @@ async fn handle_post(path: &str, _query: &str, state: &AppState) -> String {
             let target = ALL_STRATEGIES.iter().find(|s| s.as_str() == id_str);
             if let Some(id) = target {
                 state.strategy.lock().await.set_enabled(id, enabled);
-                return redirect("/suggestions");
+                let msg = if enabled { "Strategy enabled." } else { "Strategy disabled." };
+                return redirect_with_ok("/suggestions", msg);
             }
         }
         return not_found();
@@ -136,16 +180,18 @@ async fn handle_post(path: &str, _query: &str, state: &AppState) -> String {
         match AuthorityMode::from_str(mode_str) {
             Some(AuthorityMode::Off) => {
                 state.authority.set_mode_off(&*state.store).await;
+                return redirect_with_ok("/authority", "Authority mode set to OFF.");
             }
             Some(AuthorityMode::Assist) => {
                 state.authority.set_mode_assist(&*state.store).await;
+                return redirect_with_ok("/authority", "Authority mode set to ASSIST.");
             }
             Some(AuthorityMode::Auto) => {
                 state.authority.set_mode_auto(&*state.store).await;
+                return redirect_with_ok("/authority", "Authority mode set to AUTO.");
             }
             None => return not_found(),
         }
-        return redirect("/authority");
     }
 
     // POST /authority/approve/{proposal_id}
@@ -156,7 +202,7 @@ async fn handle_post(path: &str, _query: &str, state: &AppState) -> String {
             // In ASSIST mode the approved proposal should now be executed
             // by the signal loop (which polls pending approvals).
             // We just redirect back to the authority page.
-            return redirect("/authority");
+            return redirect_with_ok("/authority", "Proposal approved.");
         } else {
             let body = format!(
                 "<p class='err'>Proposal '{}' not found or already expired.</p>\
@@ -170,7 +216,7 @@ async fn handle_post(path: &str, _query: &str, state: &AppState) -> String {
     // POST /authority/reject/{proposal_id}
     if let Some(pid) = path.strip_prefix("/authority/reject/") {
         state.authority.reject_proposal(pid, &*state.store).await;
-        return redirect("/authority");
+        return redirect_with_ok("/authority", "Proposal rejected.");
     }
 
     not_found()
@@ -183,6 +229,42 @@ fn qparam<'a>(query: &'a str, key: &str) -> Option<&'a str> {
         let (k, v) = pair.split_once('=')?;
         if k == key { Some(v) } else { None }
     })
+}
+
+fn flash_banner(query: &str) -> String {
+    let ok = qparam(query, "ok").unwrap_or_default();
+    let err = qparam(query, "err").unwrap_or_default();
+    if !err.is_empty() {
+        return format!(
+            "<div class='callout err' style='margin-bottom:10px'><p>{}</p></div>",
+            esc(err)
+        );
+    }
+    if !ok.is_empty() {
+        return format!(
+            "<div class='callout ok' style='margin-bottom:10px'><p>{}</p></div>",
+            esc(ok)
+        );
+    }
+    String::new()
+}
+
+fn redirect_with_ok(path: &str, msg: &str) -> String {
+    redirect(&format!("{}?ok={}", path, url_encode(msg)))
+}
+
+fn redirect_with_err(path: &str, msg: &str) -> String {
+    redirect(&format!("{}?err={}", path, url_encode(msg)))
+}
+
+fn log_ui_action(store: &dyn EventStore, action: &str, reason: &str) {
+    store.append(crate::events::StoredEvent::new(
+        None, None, None,
+        crate::events::TradingEvent::OperatorAction(crate::events::OperatorActionPayload {
+            action: action.to_string(),
+            reason: reason.to_string(),
+        }),
+    ));
 }
 
 fn url_encode(s: &str) -> String {
@@ -219,8 +301,22 @@ fn respond(status: &str, ct: &str, body: &str) -> String {
 fn html_resp(body: &str) -> String { respond("200 OK", "text/html; charset=utf-8", body) }
 fn plain(body: &str)     -> String { respond("200 OK", "text/plain; charset=utf-8", body) }
 fn not_found()           -> String { respond("404 Not Found", "text/plain; charset=utf-8", "404 Not Found") }
+fn csv_resp(body: &str)  -> String { respond("200 OK", "text/csv; charset=utf-8", body) }
 fn redirect(loc: &str)   -> String {
     format!("HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", loc)
+}
+
+async fn export_positions_csv(state: &AppState) -> String {
+    let t = state.truth.lock().await;
+    let csv = format!(
+        "asset,size,avg_entry,unrealized_pnl,realized_pnl,open_orders\nBTCUSDT,{:.6},{:.2},{:.4},{:.4},{}\n",
+        t.position.size,
+        t.position.avg_entry,
+        t.position.unrealized_pnl,
+        t.position.realized_pnl,
+        t.open_order_count
+    );
+    csv_resp(&csv)
 }
 
 // ── Shared HTML chrome ────────────────────────────────────────────────────────
@@ -292,6 +388,20 @@ input[type=submit]{{font:700 12px Inter,sans-serif;letter-spacing:.06em;text-tra
   </aside>
   <main class="main">{body}</main>
 </div>
+<script>
+document.querySelectorAll('form').forEach((form) => {{
+  form.addEventListener('submit', () => {{
+    const btn = form.querySelector('button[type="submit"],input[type="submit"]');
+    if (btn) {{
+      btn.disabled = true;
+      btn.style.opacity = '0.75';
+      const txt = btn.getAttribute('data-loading-text') || 'Working...';
+      if (btn.tagName === 'BUTTON') {{ btn.textContent = txt; }}
+      else {{ btn.value = txt; }}
+    }}
+  }});
+}});
+</script>
 </body></html>"##, title = esc(title))
 }
 
@@ -338,8 +448,9 @@ fn stage_tag_class(stage: &LifecycleStage) -> &'static str {
 
 // ── /events ───────────────────────────────────────────────────────────────────
 
-async fn page_events(state: &AppState) -> String {
+async fn page_events(state: &AppState, query: &str) -> String {
     let refresh = r#"<meta http-equiv="refresh" content="5">"#;
+    let flash = flash_banner(query);
 
     let events = match state.store.fetch_recent(100) {
         Ok(v)  => v,
@@ -373,7 +484,7 @@ async fn page_events(state: &AppState) -> String {
     }
 
     let body = format!(
-        r#"<section style="display:grid;grid-template-columns:1fr 1fr 1fr .95fr;gap:12px;margin-bottom:14px">
+        r#"{flash}<section style="display:grid;grid-template-columns:1fr 1fr 1fr .95fr;gap:12px;margin-bottom:14px">
   <div class="panel"><h2>Total Equity</h2><div style="font:700 48px JetBrains Mono,monospace">$1,248,392.00</div><div class="ok" style="font-family:JetBrains Mono,monospace">↗ +2.4% vs prev</div></div>
   <div class="panel"><h2>PNL 24H</h2><div class="ok" style="font:700 52px JetBrains Mono,monospace">+$12,402.12</div><div class="ok" style="font-family:JetBrains Mono,monospace">REALIZED: $8.2K</div></div>
   <div class="panel"><h2>Active Positions</h2><div style="font:700 56px JetBrains Mono,monospace">14</div><div class="dim" style="font-family:JetBrains Mono,monospace">● 4 LONG / 10 SHORT</div></div>
@@ -381,21 +492,21 @@ async fn page_events(state: &AppState) -> String {
 </section>
 <section style="display:grid;grid-template-columns:2.08fr 1fr;gap:14px">
   <div class="panel" style="padding:0;border-left:none">
-    <div style="padding:14px;border-left:4px solid #4BE277"><div style="display:flex;justify-content:space-between;align-items:center"><div><div style="font:700 44px Inter,sans-serif">BTC/USDT</div><div class="ok" style="font-family:JetBrains Mono,monospace">64,281.40 (+1.24%)</div></div><div class='dim' style='font-family:JetBrains Mono,monospace'>1m 5m 1h 1d</div></div></div>
+    <div style="padding:14px;border-left:4px solid #4BE277"><div style="display:flex;justify-content:space-between;align-items:center"><div><div style="font:700 44px Inter,sans-serif">BTC/USDT</div><div class="ok" style="font-family:JetBrains Mono,monospace">64,281.40 (+1.24%)</div></div><div style='font-family:JetBrains Mono,monospace'><a class='dim' href='/events?tf=1m'>1m</a> <a class='dim' href='/events?tf=5m'>5m</a> <a class='dim' href='/events?tf=1h'>1h</a> <a class='dim' href='/events?tf=1d'>1d</a></div></div></div>
     <div style="height:640px;background:repeating-linear-gradient(to right,#1f2730 0 1px,transparent 1px 40px),repeating-linear-gradient(to bottom,#1f2730 0 1px,transparent 1px 64px),#070d14;padding:28px;display:flex;align-items:flex-end;gap:22px">
       <div style="width:20px;height:200px;background:#43d676"></div><div style="width:20px;height:250px;background:#43d676"></div><div style="width:20px;height:170px;background:#e4aaa1"></div><div style="width:20px;height:290px;background:#43d676"></div><div style="width:20px;height:340px;background:#43d676"></div><div style="width:20px;height:220px;background:#e4aaa1"></div><div style="width:20px;height:150px;background:#e4aaa1"></div><div style="width:20px;height:250px;background:#43d676"></div><div style="width:20px;height:380px;background:#43d676"></div><div style="width:20px;height:300px;background:#e4aaa1"></div><div style="width:20px;height:420px;background:#43d676"></div><div style="width:20px;height:470px;background:#43d676"></div><div style="width:20px;height:350px;background:#e4aaa1"></div><div style="width:20px;height:510px;background:#43d676"></div>
     </div>
   </div>
   <div>
     <div class="panel" style="padding:0;border-left:none">
-      <div style="padding:12px 14px;border-bottom:2px solid #101419;display:flex;gap:34px;font-family:JetBrains Mono,monospace"><span class="ok">SIGNALS</span><span class="dim">TRADES</span><span class="dim">ALERTS</span></div>
+      <div style="padding:12px 14px;border-bottom:2px solid #101419;display:flex;gap:34px;font-family:JetBrains Mono,monospace"><a class="ok" href='/events?panel=signals'>SIGNALS</a><a class="dim" href='/events?panel=trades'>TRADES</a><a class="dim" href='/events?panel=alerts'>ALERTS</a></div>
       <div style="padding:10px">{signal_rows}</div>
     </div>
     <div class="panel" style="margin-top:14px">
       <h2>⚡ Quick Execute</h2>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px">
-        <button style="height:68px;background:#22C55E;border:none;font:700 36px Inter,sans-serif;color:#092113">BUY MKT</button>
-        <button style="height:68px;background:#b00012;border:none;font:700 36px Inter,sans-serif;color:#ffd9d9">SELL MKT</button>
+        <form method='post' action='/events/quick/buy'><button data-loading-text='Submitting...' style="height:68px;width:100%;background:#22C55E;border:none;font:700 36px Inter,sans-serif;color:#092113" type='submit'>BUY MKT</button></form>
+        <form method='post' action='/events/quick/sell'><button data-loading-text='Submitting...' style="height:68px;width:100%;background:#b00012;border:none;font:700 36px Inter,sans-serif;color:#ffd9d9" type='submit'>SELL MKT</button></form>
       </div>
       <div class="dim" style="margin-top:12px;font-family:JetBrains Mono,monospace">MARGIN USAGE <span class='ok' style='float:right'>24.5%</span></div>
       <div style="height:4px;background:#101419;margin-top:6px"><div style="width:24.5%;height:100%;background:#4BE277"></div></div>
@@ -526,7 +637,9 @@ async fn page_trade(state: &AppState, corr_id: &str) -> String {
 // Each Mutex is locked briefly to copy primitive values, then released
 // before any await or I/O. No lock is ever held across an await point.
 
-async fn page_status(state: &AppState) -> String {
+async fn page_status(state: &AppState, query: &str) -> String {
+    let flash = flash_banner(query);
+    let selected_mode = qparam(query, "mode").unwrap_or("Manual");
     // Executor: lock → copy → drop
     let sys_mode   = state.exec.system_mode().await;
     let exec_state = state.exec.execution_state().await;
@@ -610,11 +723,11 @@ async fn page_status(state: &AppState) -> String {
     );
 
     let body = format!(
-        r#"<section style="display:grid;grid-template-columns:2.7fr .9fr;gap:18px">
+        r#"{flash}<section style="display:grid;grid-template-columns:2.7fr .9fr;gap:18px">
   <div>
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
       <div style="font:700 50px Inter,sans-serif">ACTIVE POSITIONS <span class="ok" style="font:700 26px JetBrains Mono,monospace;margin-left:12px">4 LIVE</span></div>
-      <div><a class="btn-disable" href="/trade">EXPORT.CSV</a> <a class="btn-reject" href="/authority">CLOSE_ALL</a></div>
+      <div><a class="btn-disable" href="/status/export.csv">EXPORT.CSV</a> <form method='post' action='/status/close-all' style='display:inline'><button data-loading-text='Closing...' class="btn-reject" type='submit'>CLOSE_ALL</button></form></div>
     </div>
     <table><thead><tr><th>Asset</th><th>Size</th><th>Entry Price</th><th>Current Price</th><th>PNL (Unrealized)</th><th>Status</th><th>Actions</th></tr></thead>
       <tbody>{pos_rows}</tbody>
@@ -622,9 +735,9 @@ async fn page_status(state: &AppState) -> String {
     <div style="margin-top:28px">
       <div style="font:700 44px Inter,sans-serif;margin-bottom:10px">OPEN ORDERS</div>
       <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px">
-        <div class="panel"><div class="dim">ID: #49202 <span class='ok' style='float:right'>LIMIT</span></div><div class="ok" style="font:700 42px Inter,sans-serif">BUY BTC / USDT</div><div class="sum">PRICE 63,500.00 | AMOUNT 0.150 BTC</div><div style="margin-top:18px;font-family:JetBrains Mono,monospace">FILLING: 0% <span class='err' style='float:right'>CANCEL</span></div></div>
-        <div class="panel" style="border-left-color:#e4aaa1"><div class="dim">ID: #49205 <span class='warn' style='float:right'>STOP</span></div><div class="err" style="font:700 42px Inter,sans-serif">SELL ETH / USDT</div><div class="sum">TRIGGER 3,200.00 | AMOUNT 5.000 ETH</div><div style="margin-top:18px;font-family:JetBrains Mono,monospace">ARMED <span class='err' style='float:right'>CANCEL</span></div></div>
-        <div class="panel"><div class="dim">ID: #49211 <span class='dim' style='float:right'>POST ONLY</span></div><div style="font:700 42px Inter,sans-serif">BUY SOL / USDT</div><div class="sum">PRICE 138.50 | AMOUNT 25.00 SOL</div><div style="margin-top:18px;font-family:JetBrains Mono,monospace" class="warn">AWAITING_ORACLE <span class='err' style='float:right'>CANCEL</span></div></div>
+        <div class="panel"><div class="dim">ID: #49202 <span class='ok' style='float:right'>LIMIT</span></div><div class="ok" style="font:700 42px Inter,sans-serif">BUY BTC / USDT</div><div class="sum">PRICE 63,500.00 | AMOUNT 0.150 BTC</div><div style="margin-top:18px;font-family:JetBrains Mono,monospace">FILLING: 0% <form method='post' action='/status/cancel/49202' style='display:inline;float:right'><button data-loading-text='Canceling...' class='btn-reject' type='submit'>CANCEL</button></form></div></div>
+        <div class="panel" style="border-left-color:#e4aaa1"><div class="dim">ID: #49205 <span class='warn' style='float:right'>STOP</span></div><div class="err" style="font:700 42px Inter,sans-serif">SELL ETH / USDT</div><div class="sum">TRIGGER 3,200.00 | AMOUNT 5.000 ETH</div><div style="margin-top:18px;font-family:JetBrains Mono,monospace">ARMED <form method='post' action='/status/cancel/49205' style='display:inline;float:right'><button data-loading-text='Canceling...' class='btn-reject' type='submit'>CANCEL</button></form></div></div>
+        <div class="panel"><div class="dim">ID: #49211 <span class='dim' style='float:right'>POST ONLY</span></div><div style="font:700 42px Inter,sans-serif">BUY SOL / USDT</div><div class="sum">PRICE 138.50 | AMOUNT 25.00 SOL</div><div style="margin-top:18px;font-family:JetBrains Mono,monospace" class="warn">AWAITING_ORACLE <form method='post' action='/status/cancel/49211' style='display:inline;float:right'><button data-loading-text='Canceling...' class='btn-reject' type='submit'>CANCEL</button></form></div></div>
       </div>
     </div>
   </div>
@@ -632,10 +745,10 @@ async fn page_status(state: &AppState) -> String {
     <div style="padding:14px;font:700 24px Inter,sans-serif;border-bottom:2px solid #101419">EXECUTION ENGINE</div>
     <div style="padding:14px">
       <div class="panel"><h2>Trading Engine</h2><div style="height:30px;background:#22C55E;width:98%;position:relative"><span style="position:absolute;right:6px;top:4px;font:700 11px JetBrains Mono,monospace;color:#08260f">ON</span></div></div>
-      <h2 style="margin-top:16px">Strategy Mode</h2><div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px"><button class='btn-enable'>Manual</button><button class='btn-disable'>Auto</button><button class='btn-disable'>Hybrid</button></div>
+      <h2 style="margin-top:16px">Strategy Mode</h2><div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px"><a class='btn-enable' href='/status?mode=Manual'>Manual</a><a class='btn-disable' href='/status?mode=Auto'>Auto</a><a class='btn-disable' href='/status?mode=Hybrid'>Hybrid</a></div><div class='dim' style='margin-top:6px;font-size:11px'>Selected mode: {selected_mode}</div>
       <h2 style="margin-top:16px">Risk Profile <span style='float:right' class='warn'>MED-HIGH</span></h2><div style="height:4px;background:#101419"><div style="height:4px;background:#4BE277;width:78%"></div></div>
       <h2 style="margin-top:16px">Max Order Limit (USDT)</h2><div style="padding:12px;background:#0A0E13;font:700 38px JetBrains Mono,monospace">50,000.00 <span style='float:right;font-size:16px'>USDT</span></div>
-      <button style="margin-top:12px;width:100%;height:54px;background:#22C55E;border:none;font:700 13px Inter,sans-serif;letter-spacing:.05em;text-transform:uppercase">Update Strategy Config</button>
+      <form method='post' action='/status/update-strategy'><button data-loading-text='Saving...' style="margin-top:12px;width:100%;height:54px;background:#22C55E;border:none;font:700 13px Inter,sans-serif;letter-spacing:.05em;text-transform:uppercase" type='submit'>Update Strategy Config</button></form>
       <div style="margin-top:22px;font-family:JetBrains Mono,monospace">
         <div class="dim">API_LATENCY <span class="ok" style="float:right">12ms</span></div>
         <div class="dim" style="margin-top:8px">ENGINE_UPTIME <span style="float:right">114:22:09</span></div>
@@ -654,8 +767,9 @@ async fn page_status(state: &AppState) -> String {
 // risk gate status, and a sentence per recent event.
 // All lock reads happen before any string building; no lock is held during I/O.
 
-async fn page_assistant(state: &AppState) -> String {
+async fn page_assistant(state: &AppState, query: &str) -> String {
     let refresh = r#"<meta http-equiv="refresh" content="10">"#;
+    let flash = flash_banner(query);
 
     // ── 1. Snapshot all live state (locks released before any formatting) ──
     let sys_mode   = state.exec.system_mode().await;
@@ -741,8 +855,11 @@ async fn page_assistant(state: &AppState) -> String {
         ));
     }
 
+    let kill_action = if kill_active { "off" } else { "on" };
+    let kill_label = if kill_active { "Kill_Switch_Clear" } else { "Kill_Switch_Engage" };
+
     let body = format!(
-        r#"<section style="display:grid;grid-template-columns:2.1fr 1fr;gap:14px">
+        r#"{flash}<section style="display:grid;grid-template-columns:2.1fr 1fr;gap:14px">
   <div class="panel" style="padding:0;border-left:none">
     <div style="padding:12px 14px;border-left:4px solid #4BE277;display:flex;justify-content:space-between;align-items:center"><strong style="font:700 34px Inter,sans-serif">SYSTEM_ACTIVITY_LOG.STDOUT</strong><span class="ok" style="font-family:JetBrains Mono,monospace">FILTER: ALL_EVENTS</span></div>
     <div style="height:930px;background:#050b12;padding:16px 18px;overflow:auto">{event_html}</div>
@@ -760,8 +877,8 @@ async fn page_assistant(state: &AppState) -> String {
       <div style="background:#0A0E13;padding:14px;margin-bottom:8px">DATABASE_INTEGRITY <span class='ok' style='float:right'>SECURE</span></div>
       <div style="background:#0A0E13;padding:14px;margin-bottom:8px">VAULT_ENCRYPTION <span class='ok' style='float:right'>AES-256</span></div>
       <div style="background:#0A0E13;padding:14px">REDUNDANCY_FAILOVER <span class='err' style='float:right'>OFFLINE</span></div>
-      <button style="margin-top:16px;width:100%;height:58px;background:#101419;color:#d0d6dd;border:1px solid rgba(142,152,162,.35);font:700 12px Inter,sans-serif;letter-spacing:.06em;text-transform:uppercase">System Restart</button>
-      <button style="margin-top:8px;width:100%;height:76px;background:#b00012;color:#ffe4e7;border:1px solid #f9a79d;font:700 15px Inter,sans-serif;letter-spacing:.08em;text-transform:uppercase">Kill_Switch_Engage</button>
+      <form method='post' action='/assistant/system-restart'><button data-loading-text='Restarting...' style="margin-top:16px;width:100%;height:58px;background:#101419;color:#d0d6dd;border:1px solid rgba(142,152,162,.35);font:700 12px Inter,sans-serif;letter-spacing:.06em;text-transform:uppercase" type='submit'>System Restart</button></form>
+      <form method='post' action='/assistant/kill-switch/{kill_action}'><button data-loading-text='Applying...' style="margin-top:8px;width:100%;height:76px;background:#b00012;color:#ffe4e7;border:1px solid #f9a79d;font:700 15px Inter,sans-serif;letter-spacing:.08em;text-transform:uppercase" type='submit'>{kill_label}</button></form>
       <div class="err" style="font-family:JetBrains Mono,monospace;font-size:11px;margin-top:8px">WARNING: IMMEDIATE LIQUIDATION OF ALL POSITIONS AND SESSION TERMINATION.</div>
     </div>
   </div>
@@ -784,8 +901,9 @@ async fn page_assistant(state: &AppState) -> String {
 // functions, and presents entry/exit/watchlist results with colour-coded
 // callouts. All locks released before any rendering.
 
-async fn page_suggestions(state: &AppState) -> String {
+async fn page_suggestions(state: &AppState, query: &str) -> String {
     let refresh = r#"<meta http-equiv="refresh" content="10">"#;
+    let flash = flash_banner(query);
     let banner  = authority_banner(state).await;
 
     // ── Snapshot (locks held briefly, never across await or string work) ──────
@@ -951,7 +1069,7 @@ async fn page_suggestions(state: &AppState) -> String {
     );
 
     let body = format!(
-        r#"{banner}<h2>Watchlist</h2>
+        r#"{flash}{banner}<h2>Watchlist</h2>
 <div class='callout {wl_cls}'><p><strong>{wl_label}</strong> — {wl_detail}</p>{market_info}</div>
 
 {trade_html}
@@ -982,8 +1100,9 @@ async fn page_suggestions(state: &AppState) -> String {
 // Shows current mode, mode-switch buttons, and pending ASSIST proposals.
 // POST endpoints are handled in handle_post().
 
-async fn page_authority(state: &AppState) -> String {
+async fn page_authority(state: &AppState, query: &str) -> String {
     let refresh = r#"<meta http-equiv="refresh" content="5">"#;
+    let flash = flash_banner(query);
 
     let mode      = state.authority.mode().await;
     let proposals = state.authority.pending_proposals().await;
@@ -1109,7 +1228,7 @@ async fn page_authority(state: &AppState) -> String {
     };
 
     let body = format!(
-        "{banner}\
+        "{flash}{banner}\
          {sys_note}\
          <h2>Authority Mode</h2>\
          {buttons}\
@@ -1274,26 +1393,26 @@ mod tests {
     #[tokio::test]
     async fn test_events_200() {
         let state = filled_state();
-        let r = page_events(&state).await;
+        let r = page_events(&state, "").await;
         assert!(r.starts_with("HTTP/1.1 200 OK"));
         assert!(r.contains("text/html"));
     }
     #[tokio::test]
     async fn test_events_contains_event_type() {
         let state = filled_state();
-        let r = page_events(&state).await;
+        let r = page_events(&state, "").await;
         assert!(r.contains("signal_decision") || r.contains("order_filled"));
     }
     #[tokio::test]
     async fn test_events_corr_link() {
         let state = filled_state();
-        let r = page_events(&state).await;
+        let r = page_events(&state, "").await;
         assert!(r.contains("/trade/"), "Should contain /trade/ link");
     }
     #[tokio::test]
     async fn test_events_empty_store() {
         let state = make_state();
-        let r = page_events(&state).await;
+        let r = page_events(&state, "").await;
         assert!(r.starts_with("HTTP/1.1 200 OK"));
     }
     #[tokio::test]
@@ -1306,7 +1425,7 @@ mod tests {
                 reason:"<script>evil()</script>".into(),
             }),
         ));
-        let r = page_events(&state).await;
+        let r = page_events(&state, "").await;
         assert!(!r.contains("<script>evil()"), "Must escape XSS");
     }
 
@@ -1319,14 +1438,14 @@ mod tests {
             "Should contain explanation section");
         // The explanation text should not contain raw < characters
         // (assistant output is always escaped)
-        assert!(!r.contains("<script"), "No unescaped script tags");
+        assert!(!r.contains("<script>evil()"), "No unescaped script payload");
     }
 
     // ── page_assistant ────────────────────────────────────────────────────────
     #[tokio::test]
     async fn test_assistant_200() {
         let state = make_state();
-        let r = page_assistant(&state).await;
+        let r = page_assistant(&state, "").await;
         assert!(r.starts_with("HTTP/1.1 200 OK"));
         assert!(r.contains("text/html"));
     }
@@ -1334,28 +1453,28 @@ mod tests {
     #[tokio::test]
     async fn test_assistant_has_system_section() {
         let state = make_state();
-        let r = page_assistant(&state).await;
+        let r = page_assistant(&state, "").await;
         assert!(r.contains("System") || r.contains("system"));
     }
 
     #[tokio::test]
     async fn test_assistant_has_position_section() {
         let state = make_state();
-        let r = page_assistant(&state).await;
+        let r = page_assistant(&state, "").await;
         assert!(r.contains("Position") || r.contains("position"));
     }
 
     #[tokio::test]
     async fn test_assistant_has_risk_section() {
         let state = make_state();
-        let r = page_assistant(&state).await;
+        let r = page_assistant(&state, "").await;
         assert!(r.contains("Risk") || r.contains("risk"));
     }
 
     #[tokio::test]
     async fn test_assistant_has_recent_activity() {
         let state = make_state();
-        let r = page_assistant(&state).await;
+        let r = page_assistant(&state, "").await;
         assert!(r.contains("Recent") || r.contains("recent"));
     }
 
@@ -1371,7 +1490,7 @@ mod tests {
                 position_size: 0.0, position_avg_entry: 0.0,
             }),
         ));
-        let r = page_assistant(&state).await;
+        let r = page_assistant(&state, "").await;
         assert!(r.contains("Last Rejection") || r.contains("rejection") || r.contains("SPREAD") || r.contains("spread"),
             "Should surface the rejection");
     }
@@ -1381,7 +1500,7 @@ mod tests {
         let state = make_state();
         // Force executor into Halted mode
         state.exec.set_mode_halted("test halt").await;
-        let r = page_assistant(&state).await;
+        let r = page_assistant(&state, "").await;
         // The system callout should have the err class
         assert!(r.contains("callout err") || r.contains("Halted"),
             "Halted system should show error callout");
@@ -1397,7 +1516,7 @@ mod tests {
                 reason: "<img onerror=evil()>".into(),
             }),
         ));
-        let r = page_assistant(&state).await;
+        let r = page_assistant(&state, "").await;
         assert!(!r.contains("<script>xss()"), "Operator action must be HTML-escaped");
     }
 
@@ -1435,20 +1554,20 @@ mod tests {
     #[tokio::test]
     async fn test_status_200() {
         let state = make_state();
-        let r = page_status(&state).await;
+        let r = page_status(&state, "").await;
         assert!(r.starts_with("HTTP/1.1 200 OK"));
         assert!(r.contains("system_mode") || r.contains("System"));
     }
     #[tokio::test]
     async fn test_status_has_position_section() {
         let state = make_state();
-        let r = page_status(&state).await;
+        let r = page_status(&state, "").await;
         assert!(r.contains("Position") || r.contains("pos"));
     }
     #[tokio::test]
     async fn test_status_has_risk_section() {
         let state = make_state();
-        let r = page_status(&state).await;
+        let r = page_status(&state, "").await;
         assert!(r.contains("max_position_qty") || r.contains("Risk"));
     }
 }
