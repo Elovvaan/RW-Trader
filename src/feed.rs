@@ -164,6 +164,38 @@ impl FeedState {
 
 // ── Feed entry points ─────────────────────────────────────────────────────────
 
+/// Poll the Binance REST API for best bid/ask, writing results into `feed_state`.
+/// Runs forever at the given `poll_interval`. Used when WebSocket is disabled.
+///
+/// This is the primary feed path: WebSocket is disabled to avoid runtime crashes
+/// caused by incorrect endpoints or missing listenKey configuration.
+pub async fn run_rest_polling(
+    client: Arc<crate::client::BinanceClient>,
+    symbol: &str,
+    feed_state: Arc<Mutex<FeedState>>,
+    poll_interval: Duration,
+) -> Result<()> {
+    info!("WebSocket disabled — using REST polling mode");
+    let mut interval = tokio::time::interval(poll_interval);
+    loop {
+        interval.tick().await;
+        match client.fetch_book_ticker(symbol).await {
+            Ok(bt) => {
+                let bid: f64 = bt.bid_price.parse().unwrap_or(0.0);
+                let ask: f64 = bt.ask_price.parse().unwrap_or(0.0);
+                if bid > 0.0 && ask > 0.0 {
+                    let mut state = feed_state.lock().await;
+                    state.push_book_ticker(bid, ask);
+                    debug!(bid, ask, spread_bps = format!("{:.2}", state.spread_bps()), "[REST bookTicker]");
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "REST book ticker poll failed");
+            }
+        }
+    }
+}
+
 /// Start the WebSocket feed, writing all market data into `feed_state`.
 /// Reconnects automatically. Runs until the process exits.
 ///

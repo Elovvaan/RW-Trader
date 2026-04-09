@@ -159,7 +159,6 @@ async fn main() -> Result<()> {
     let api_key    = require_env("BINANCE_API_KEY")?;
     let api_secret = require_env("BINANCE_API_SECRET")?;
     let rest_url   = require_env("BINANCE_REST_URL")?;
-    let ws_url     = require_env("BINANCE_WS_STREAM_URL")?;
     let symbol     = std::env::var("SYMBOL").unwrap_or_else(|_| "BTCUSDT".into());
     let live_trade = std::env::var("LIVE_TRADE")
         .map(|v| v.eq_ignore_ascii_case("true"))
@@ -329,15 +328,17 @@ async fn main() -> Result<()> {
         Some(Arc::clone(&event_store)),
     );
 
-    // ── 8. Spawn WebSocket feed ───────────────────────────────────────────────
-    info!("=== Starting WebSocket feed ===");
+    // ── 8. REST polling feed (WebSocket disabled) ────────────────────────────
+    // WebSocket is disabled to avoid runtime crashes from incorrect endpoints
+    // or missing listenKey configuration. REST polling keeps feed_state fresh.
+    info!("WebSocket disabled — using REST polling mode");
     {
-        let fs = Arc::clone(&feed_state);
-        let ws = ws_url.clone();
+        let fs  = Arc::clone(&feed_state);
+        let cl  = Arc::clone(&client);
         let sym = symbol.clone();
         tokio::spawn(async move {
-            if let Err(e) = feed::run_feed_with_state(&ws, &sym, fs).await {
-                tracing::error!("Feed task exited: {:#}", e);
+            if let Err(e) = feed::run_rest_polling(cl, &sym, fs, Duration::from_secs(1)).await {
+                tracing::error!("REST polling task exited: {:#}", e);
             }
         });
     }
@@ -348,7 +349,8 @@ async fn main() -> Result<()> {
 
     if !live_trade {
         info!("LIVE_TRADE=false — monitor mode. Set LIVE_TRADE=true to enable signal loop.");
-        feed::run_feed(&ws_url, &symbol).await?;
+        // REST polling only — WebSocket is disabled
+        feed::run_rest_polling(Arc::clone(&client), &symbol, Arc::clone(&feed_state), Duration::from_secs(1)).await?;
         return Ok(());
     }
 
