@@ -33,6 +33,9 @@ pub struct RiskConfig {
     /// Max peak-to-trough drawdown in quote (USDT) since engine start.
     pub max_drawdown_usd: f64,
 
+    /// Max losing closes in a row before all new orders are blocked.
+    pub max_consecutive_losses: u32,
+
     /// How long to pause new BUY entries after a losing trade closes.
     pub cooldown_after_loss: Duration,
 
@@ -69,6 +72,7 @@ impl RiskConfig {
             max_position_qty:    0.01,
             max_daily_loss_usd:  50.0,
             max_drawdown_usd:    100.0,
+            max_consecutive_losses: 3,
             cooldown_after_loss: Duration::from_secs(300),
             max_spread_bps:      10.0,
             max_feed_staleness:  Duration::from_secs(5),
@@ -155,6 +159,7 @@ pub enum RejectionReason {
     InvalidMarketData { detail: String },
     DailyLossExceeded { loss_usd: f64, limit_usd: f64 },
     DrawdownExceeded { drawdown_usd: f64, limit_usd: f64 },
+    ConsecutiveLossLimitExceeded { losses: u32, limit: u32 },
     Cooldown { remaining_secs: f64 },
     PositionSizeExceeded { current_qty: f64, proposed_qty: f64, limit_qty: f64 },
 }
@@ -176,6 +181,8 @@ impl std::fmt::Display for RejectionReason {
                 write!(f, "DAILY_LOSS: -{:.2} USD exceeds limit -{:.2} USD", loss_usd, limit_usd),
             RejectionReason::DrawdownExceeded { drawdown_usd, limit_usd } =>
                 write!(f, "DRAWDOWN: {:.2} USD exceeds limit {:.2} USD", drawdown_usd, limit_usd),
+            RejectionReason::ConsecutiveLossLimitExceeded { losses, limit } =>
+                write!(f, "LOSS_STREAK: {} consecutive losses exceeds limit {}", losses, limit),
             RejectionReason::Cooldown { remaining_secs } =>
                 write!(f, "COOLDOWN: {:.0}s remaining after last losing trade", remaining_secs),
             RejectionReason::PositionSizeExceeded { current_qty, proposed_qty, limit_qty } =>
@@ -206,6 +213,9 @@ pub struct RiskEngine {
 
     /// Tracks the last known realized_pnl to detect when a fill closes at a loss.
     last_realized_pnl: f64,
+
+    /// Count of losing closes in a row.
+    consecutive_losses: u32,
 }
 
 impl RiskEngine {
@@ -220,6 +230,7 @@ impl RiskEngine {
             day_start_pnl: initial_pnl,
             cooldown_until: None,
             last_realized_pnl: current_pos.realized_pnl,
+            consecutive_losses: 0,
         }
     }
 
@@ -258,11 +269,15 @@ impl RiskEngine {
             // A losing trade was just closed (realized PnL decreased).
             let until = Instant::now() + self.config.cooldown_after_loss;
             self.cooldown_until = Some(until);
+            self.consecutive_losses = self.consecutive_losses.saturating_add(1);
             warn!(
-                "RISK: Losing fill detected (delta={:.4} USD). Cooldown active for {:.0}s.",
+                "RISK: Losing fill detected (delta={:.4} USD, streak={}). Cooldown active for {:.0}s.",
                 delta,
+                self.consecutive_losses,
                 self.config.cooldown_after_loss.as_secs_f64()
             );
+        } else if delta > 0.0 {
+            self.consecutive_losses = 0;
         }
     }
 
@@ -291,6 +306,11 @@ impl RiskEngine {
         // ── Rule 1: Kill switch ───────────────────────────────────────────────
         if self.kill_switch {
             return self.reject(RejectionReason::KillSwitch);
+        }
+
+        // ── Hard constraints: always before adaptive/market logic ────────────
+        if let RiskVerdict::Rejected(reason) = self.check_hard_constraints(pos) {
+            return self.reject(reason);
         }
 
         // ── Rule 2: Stale feed ────────────────────────────────────────────────
@@ -327,35 +347,8 @@ impl RiskEngine {
             });
         }
 
-        // ── Rule 4: Daily loss ────────────────────────────────────────────────
         let daily_pnl = current_total_pnl - self.day_start_pnl;
-        if daily_pnl < -self.config.max_daily_loss_usd {
-            // Trip the kill switch automatically — don't just reject this one order.
-            self.kill_switch = true;
-            warn!(
-                "RISK: Daily loss limit breached ({:.4} USD). Kill switch auto-activated.",
-                daily_pnl
-            );
-            return self.reject(RejectionReason::DailyLossExceeded {
-                loss_usd: -daily_pnl,
-                limit_usd: self.config.max_daily_loss_usd,
-            });
-        }
-
-        // ── Rule 5: Drawdown ──────────────────────────────────────────────────
         let drawdown = self.peak_equity - current_total_pnl;
-        if drawdown >= self.config.max_drawdown_usd {
-            // Also auto-trip kill switch on drawdown breach.
-            self.kill_switch = true;
-            warn!(
-                "RISK: Max drawdown breached ({:.4} USD from peak {:.4}). Kill switch auto-activated.",
-                drawdown, self.peak_equity
-            );
-            return self.reject(RejectionReason::DrawdownExceeded {
-                drawdown_usd: drawdown,
-                limit_usd: self.config.max_drawdown_usd,
-            });
-        }
 
         // ── Rule 6: Cooldown (BUY entries only) ───────────────────────────────
         // Sells are always allowed during cooldown — you must be able to exit.
@@ -441,6 +434,46 @@ impl RiskEngine {
         warn!("RISK REJECTED: {}", reason);
         RiskVerdict::Rejected(reason)
     }
+
+    /// Evaluate hard limits independent of strategy/adaptive sizing.
+    /// This is the non-overridable authority layer.
+    pub fn check_hard_constraints(&mut self, pos: &Position) -> RiskVerdict {
+        let current_total_pnl = pos.realized_pnl + pos.unrealized_pnl;
+        let daily_pnl = current_total_pnl - self.day_start_pnl;
+        if daily_pnl < -self.config.max_daily_loss_usd {
+            self.kill_switch = true;
+            warn!(
+                "RISK: Daily loss limit breached ({:.4} USD). Kill switch auto-activated.",
+                daily_pnl
+            );
+            return RiskVerdict::Rejected(RejectionReason::DailyLossExceeded {
+                loss_usd: -daily_pnl,
+                limit_usd: self.config.max_daily_loss_usd,
+            });
+        }
+
+        let drawdown = self.peak_equity - current_total_pnl;
+        if drawdown >= self.config.max_drawdown_usd {
+            self.kill_switch = true;
+            warn!(
+                "RISK: Max drawdown breached ({:.4} USD from peak {:.4}). Kill switch auto-activated.",
+                drawdown, self.peak_equity
+            );
+            return RiskVerdict::Rejected(RejectionReason::DrawdownExceeded {
+                drawdown_usd: drawdown,
+                limit_usd: self.config.max_drawdown_usd,
+            });
+        }
+
+        if self.consecutive_losses >= self.config.max_consecutive_losses {
+            return RiskVerdict::Rejected(RejectionReason::ConsecutiveLossLimitExceeded {
+                losses: self.consecutive_losses,
+                limit: self.config.max_consecutive_losses,
+            });
+        }
+
+        RiskVerdict::Approved
+    }
 }
 
 impl ProposedOrder {
@@ -466,6 +499,7 @@ mod tests {
                 max_position_qty:    0.1,
                 max_daily_loss_usd:  50.0,
                 max_drawdown_usd:    100.0,
+                max_consecutive_losses: 3,
                 cooldown_after_loss: Duration::from_secs(60),
                 max_spread_bps:      10.0,
                 max_feed_staleness:  Duration::from_secs(5),
@@ -574,15 +608,10 @@ mod tests {
     // ── Daily loss ────────────────────────────────────────────────────────────
     #[test]
     fn test_daily_loss_rejected() {
-        // Start with pos that has a -60 USD realized PnL
-        // Engine initializes day_start_pnl = -60, so daily_pnl = 0 initially.
-        // Then simulate a further -60 drop.
+        // Day starts flat, then we lose 60 USD intraday.
         let mut pos = flat_pos();
-        pos.realized_pnl = -60.0;
-        pos.unrealized_pnl = -60.0; // total = -120, but engine starts at -60
-        // Engine sets day_start_pnl = -60 (realized + unrealized at construction).
         let mut engine = make_engine(&pos);
-        // Now daily_pnl = (-120) - (-60) = -60, exceeds limit of -50.
+        pos.realized_pnl = -60.0;
         let v = engine.risk_check(&pos, &good_market(), &buy_order(0.001));
         assert!(matches!(v, RiskVerdict::Rejected(RejectionReason::DailyLossExceeded { .. })));
         // Should have also activated kill switch
@@ -593,9 +622,10 @@ mod tests {
     #[test]
     fn test_drawdown_rejected() {
         let mut pos = flat_pos();
-        // Peak was 200 (simulate by calling check when pnl=200 first)
+        let mut engine = make_engine(&pos);
+        // Simulate higher peak first.
         pos.realized_pnl = 200.0;
-        let mut engine = make_engine(&pos); // peak_equity = 200
+        engine.risk_check(&pos, &good_market(), &buy_order(0.001));
         // Now position tanks: pnl = 50 → drawdown = 150 > limit 100
         pos.realized_pnl = 50.0;
         let v = engine.risk_check(&pos, &good_market(), &buy_order(0.001));
@@ -631,6 +661,25 @@ mod tests {
         // Buy should go through (no cooldown)
         let v = engine.risk_check(&pos, &good_market(), &buy_order(0.001));
         assert_eq!(v, RiskVerdict::Approved);
+    }
+
+    #[test]
+    fn test_consecutive_loss_limit_rejected() {
+        let mut pos = flat_pos();
+        let mut engine = make_engine(&pos);
+
+        pos.realized_pnl = -10.0;
+        engine.notify_fill(&pos);
+        pos.realized_pnl = -20.0;
+        engine.notify_fill(&pos);
+        pos.realized_pnl = -30.0;
+        engine.notify_fill(&pos);
+
+        let v = engine.risk_check(&pos, &good_market(), &buy_order(0.001));
+        assert!(matches!(
+            v,
+            RiskVerdict::Rejected(RejectionReason::ConsecutiveLossLimitExceeded { .. })
+        ));
     }
 
     // ── Position size ─────────────────────────────────────────────────────────

@@ -1423,6 +1423,7 @@ mod tests {
             max_position_qty:    0.01,
             max_daily_loss_usd:  50.0,
             max_drawdown_usd:    100.0,
+            max_consecutive_losses: 3,
             cooldown_after_loss: Duration::from_secs(300),
             max_spread_bps:      10.0,
             max_feed_staleness:  Duration::from_secs(5),

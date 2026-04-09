@@ -82,6 +82,7 @@ async fn main() -> Result<()> {
                 max_position_qty:    0.0,
                 max_daily_loss_usd:  0.0,
                 max_drawdown_usd:    0.0,
+                max_consecutive_losses: 0,
                 cooldown_after_loss: Duration::from_secs(0),
                 max_spread_bps:      0.0,
                 max_feed_staleness:  Duration::from_secs(0),
@@ -252,6 +253,7 @@ async fn main() -> Result<()> {
         max_position_qty:    env_f64("RISK_MAX_QTY",          0.01),
         max_daily_loss_usd:  env_f64("RISK_MAX_DAILY_LOSS",   50.0),
         max_drawdown_usd:    env_f64("RISK_MAX_DRAWDOWN",      100.0),
+        max_consecutive_losses: env_u64("RISK_MAX_CONSECUTIVE_LOSSES", 3) as u32,
         max_spread_bps:      env_f64("RISK_MAX_SPREAD_BPS",    10.0),
         cooldown_after_loss: Duration::from_secs(env_u64("RISK_COOLDOWN_SECS", 300)),
         max_feed_staleness:  Duration::from_secs(env_u64("RISK_FEED_STALE_SECS", 5)),
@@ -516,6 +518,31 @@ async fn main() -> Result<()> {
             signal::SignalDecision::Hold       => unreachable!(),
         };
 
+        // Hard risk constraints are checked before adaptive sizing.
+        let hard_verdict = {
+            let mut risk = risk_engine.lock().await;
+            risk.check_hard_constraints(&position_snapshot)
+        };
+        if let risk::RiskVerdict::Rejected(r) = &hard_verdict {
+            info!(reason = %r, "[RISK] Hard constraint rejected before adaptive sizing");
+            if matches!(r, risk::RejectionReason::DailyLossExceeded { .. }
+                          | risk::RejectionReason::DrawdownExceeded { .. }
+                          | risk::RejectionReason::KillSwitch) {
+                exec.set_mode_halted(&r.to_string()).await;
+            }
+            // Log event with zero quantity because adaptive sizing was never applied.
+            let proposed = risk::ProposedOrder {
+                symbol:         symbol.clone(),
+                side:           order_side,
+                qty:            0.0,
+                expected_price: proposed_price,
+            };
+            event_store.append(events::risk_event(
+                &hard_verdict, &proposed, &position_snapshot, &symbol, &correlation_id,
+            ));
+            continue;
+        }
+
         let dynamic_qty = {
             let strat = strategy_engine.lock().await;
             match order_side {
@@ -528,6 +555,12 @@ async fn main() -> Result<()> {
                 risk::OrderSide::Sell => position_snapshot.size.max(0.0),
             }
         };
+        info!(
+            pre_risk_qty = order_qty,
+            post_risk_qty = dynamic_qty,
+            side = %match order_side { risk::OrderSide::Buy => "BUY", risk::OrderSide::Sell => "SELL" },
+            "[RISK] Pre-risk vs post-adaptive quantity"
+        );
 
         if dynamic_qty <= 0.0 {
             tracing::debug!("Dynamic quantity <= 0, skipping");
@@ -553,6 +586,12 @@ async fn main() -> Result<()> {
             risk::RiskVerdict::Rejected(r) => {
                 signal::log_decision(&signal_result, Some("REJECTED"), "NO_ORDER");
                 info!(reason = %r, "[RISK] Rejected");
+                info!(
+                    pre_risk_qty = order_qty,
+                    post_risk_qty = 0.0_f64,
+                    side = %match order_side { risk::OrderSide::Buy => "BUY", risk::OrderSide::Sell => "SELL" },
+                    "[RISK] Final quantity after rejection"
+                );
                 // If risk tripped due to halting condition, sync executor mode
                 if matches!(r, risk::RejectionReason::DailyLossExceeded { .. }
                               | risk::RejectionReason::DrawdownExceeded { .. }
