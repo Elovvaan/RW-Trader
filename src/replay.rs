@@ -504,6 +504,7 @@ mod tests {
             max_position_qty:    0.01,
             max_daily_loss_usd:  1000.0,
             max_drawdown_usd:    2000.0,
+            max_consecutive_losses: 100,
             cooldown_after_loss: Duration::from_secs(0), // no cooldown in tests
             max_spread_bps:      20.0,
             max_feed_staleness:  Duration::from_secs(30),

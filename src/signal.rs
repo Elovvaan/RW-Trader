@@ -747,8 +747,8 @@ mod tests {
         let mut feed = good_feed(50000.0, 50001.0); // 2 bps spread
         // Upward mid trend over 6 seconds: 49990 → 50000 (current mid=50000.5)
         add_mid_trend(&mut feed, 10, 6.0, 49990.0, 50000.5);
-        // Mostly buy aggression
-        add_trades(&mut feed, 10, 5.0, 1.0, 0.8); // 80% buy
+        // Strong buy aggression (recent-window safe for dynamic thresholds)
+        add_trades(&mut feed, 10, 5.0, 1.0, 1.0);
         feed
     }
 
