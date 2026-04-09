@@ -177,6 +177,7 @@ pub async fn run_rest_polling(
 ) -> Result<()> {
     info!("WebSocket disabled — using REST polling mode");
     let mut interval = tokio::time::interval(poll_interval);
+    let mut last_trade_id: Option<i64> = None;
     loop {
         interval.tick().await;
         match client.fetch_book_ticker(symbol).await {
@@ -197,6 +198,37 @@ pub async fn run_rest_polling(
             }
             Err(e) => {
                 warn!(error = %e, "REST book ticker poll failed");
+            }
+        }
+
+        match client.fetch_recent_trades(symbol, 1).await {
+            Ok(trades) => {
+                if let Some(t) = trades.first() {
+                    let is_new_trade = last_trade_id.map(|id| id != t.id).unwrap_or(true);
+                    if is_new_trade {
+                        let qty: f64 = t.qty.parse().unwrap_or_else(|_| {
+                            warn!(raw = %t.qty, "Failed to parse trade qty from REST trades");
+                            0.0
+                        });
+                        if qty > 0.0 {
+                            // Binance: isBuyerMaker=false => buyer is taker => aggressor buy.
+                            let is_aggressor_buy = !t.is_buyer_maker;
+                            let mut state = feed_state.lock().await;
+                            state.push_trade(qty, is_aggressor_buy);
+                            debug!(
+                                trade_id = t.id,
+                                qty,
+                                price = %t.price,
+                                aggressor = if is_aggressor_buy { "BUY" } else { "SELL" },
+                                "[REST trades]"
+                            );
+                        }
+                        last_trade_id = Some(t.id);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "REST recent trades poll failed");
             }
         }
     }

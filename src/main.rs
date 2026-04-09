@@ -343,6 +343,43 @@ async fn main() -> Result<()> {
         });
     }
 
+    // ── 8b. Snapshot recorder (continuous market snapshots) ──────────────────
+    // Persist market snapshots every second even when no entry/exit signal fires.
+    // This keeps the snapshot store warm for watchlists, suggestions, and replay.
+    {
+        let fs = Arc::clone(&feed_state);
+        let sig = Arc::clone(&signal_engine);
+        let store = Arc::clone(&event_store);
+        let sym = symbol.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+
+                let metrics = {
+                    let feed = fs.lock().await;
+                    if feed.last_seen.is_none() {
+                        continue;
+                    }
+                    let signal = sig.lock().await;
+                    signal.compute_metrics_pub(&feed)
+                };
+
+                let correlation_id = Uuid::new_v4().to_string();
+                store.append(events::market_snapshot_event(&metrics, &sym, &correlation_id));
+                info!(
+                    symbol = %sym,
+                    bid = metrics.bid,
+                    ask = metrics.ask,
+                    spread_bps = metrics.spread_bps,
+                    feed_age_ms = metrics.feed_age_ms,
+                    "Market snapshot updated"
+                );
+            }
+        });
+    }
+
     // ── 9. Spawn timeout watchdog ─────────────────────────────────────────────
     info!("=== Starting execution watchdog ===");
     let _wd_handle = exec.spawn_watchdog(Arc::clone(&client), Arc::clone(&truth));

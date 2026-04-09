@@ -126,6 +126,17 @@ pub struct BookTickerData {
     pub ask_qty: String,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct PublicTrade {
+    pub id: i64,
+    pub price: String,
+    pub qty: String,
+    #[serde(rename = "time")]
+    pub trade_time: u64,
+    #[serde(rename = "isBuyerMaker")]
+    pub is_buyer_maker: bool,
+}
+
 // Binance returns this shape on errors
 #[derive(Debug, Deserialize)]
 struct BinanceError {
@@ -290,6 +301,20 @@ impl BinanceClient {
         debug!(url = %url, "GET bookTicker");
         let resp = self.http.get(&url).send().await?;
         Self::parse_response(resp, "ticker/bookTicker").await
+    }
+
+    /// Fetch recent public trades for a symbol.
+    /// Used by REST polling mode to keep trade imbalance metrics alive.
+    pub async fn fetch_recent_trades(&self, symbol: &str, limit: u32) -> Result<Vec<PublicTrade>> {
+        let url = format!(
+            "{}/api/v3/trades?symbol={}&limit={}",
+            self.base_url,
+            symbol,
+            limit.clamp(1, 1000),
+        );
+        debug!(url = %url, "GET recent trades");
+        let resp = self.http.get(&url).send().await?;
+        Self::parse_response(resp, "trades").await
     }
 
     /// Fetch exchange filters for a single symbol.
