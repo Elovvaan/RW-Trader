@@ -181,12 +181,18 @@ pub async fn run_rest_polling(
         interval.tick().await;
         match client.fetch_book_ticker(symbol).await {
             Ok(bt) => {
-                let bid: f64 = bt.bid_price.parse().unwrap_or(0.0);
-                let ask: f64 = bt.ask_price.parse().unwrap_or(0.0);
+                let bid: f64 = bt.bid_price.parse().unwrap_or_else(|_| {
+                    warn!(raw = %bt.bid_price, "Failed to parse bid price from bookTicker");
+                    0.0
+                });
+                let ask: f64 = bt.ask_price.parse().unwrap_or_else(|_| {
+                    warn!(raw = %bt.ask_price, "Failed to parse ask price from bookTicker");
+                    0.0
+                });
                 if bid > 0.0 && ask > 0.0 {
                     let mut state = feed_state.lock().await;
                     state.push_book_ticker(bid, ask);
-                    debug!(bid, ask, spread_bps = format!("{:.2}", state.spread_bps()), "[REST bookTicker]");
+                    debug!(bid, ask, spread_bps = state.spread_bps(), "[REST bookTicker]");
                 }
             }
             Err(e) => {
