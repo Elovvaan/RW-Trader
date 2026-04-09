@@ -493,6 +493,43 @@ struct StrategyState {
     entry_time:       Option<Instant>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RegimeBucket {
+    Aligned,
+    Divergent,
+}
+
+impl RegimeBucket {
+    fn as_str(&self) -> &'static str {
+        match self {
+            RegimeBucket::Aligned => "aligned",
+            RegimeBucket::Divergent => "divergent",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StrategyPerf {
+    wins: u32,
+    losses: u32,
+}
+
+impl StrategyPerf {
+    fn win_rate(self) -> f64 {
+        let total = self.wins + self.losses;
+        if total == 0 { 0.5 } else { self.wins as f64 / total as f64 }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RegimeView {
+    short_fast: f64,
+    medium_stable: f64,
+    aligned: bool,
+    weight: f64,
+    bucket: RegimeBucket,
+}
+
 // ── StrategyEngine ────────────────────────────────────────────────────────────
 
 /// Holds all strategies, their enable flags, and per-strategy entry state.
@@ -501,6 +538,19 @@ pub struct StrategyEngine {
     strategies:  Vec<Box<dyn Strategy>>,
     enabled:     HashMap<StrategyId, bool>,
     entry_state: HashMap<StrategyId, StrategyState>,
+    base_confidence_threshold: f64,
+    no_trade_lowering_after: Duration,
+    no_trade_lowering_step: f64,
+    loss_streak_threshold_step: f64,
+    rapid_edge_decay_per_sec: f64,
+    min_trade_samples: usize,
+    min_abs_imbalance_1s: f64,
+    perf: HashMap<(StrategyId, RegimeBucket), StrategyPerf>,
+    active_strategy_hint: Option<StrategyId>,
+    active_regime_bucket: RegimeBucket,
+    last_trade_at: Option<Instant>,
+    loss_streak: u32,
+    last_edge_confidence: Option<(f64, Instant)>,
 }
 
 impl StrategyEngine {
@@ -517,7 +567,24 @@ impl StrategyEngine {
             enabled.insert(s.id().clone(), true);
             entry_state.insert(s.id().clone(), StrategyState::default());
         }
-        Self { strategies, enabled, entry_state }
+        Self {
+            strategies,
+            enabled,
+            entry_state,
+            base_confidence_threshold: 0.72,
+            no_trade_lowering_after: Duration::from_secs(120),
+            no_trade_lowering_step: 0.04,
+            loss_streak_threshold_step: 0.04,
+            rapid_edge_decay_per_sec: 0.35,
+            min_trade_samples: 3,
+            min_abs_imbalance_1s: 0.06,
+            perf: HashMap::new(),
+            active_strategy_hint: None,
+            active_regime_bucket: RegimeBucket::Aligned,
+            last_trade_at: None,
+            loss_streak: 0,
+            last_edge_confidence: None,
+        }
     }
 
     // ── Enable/disable ────────────────────────────────────────────────────────
@@ -547,14 +614,33 @@ impl StrategyEngine {
             state.entry_price_hint = Some(price);
             state.entry_time       = Some(Instant::now());
         }
+        self.last_trade_at = Some(Instant::now());
+        self.active_strategy_hint = Some(id.clone());
     }
 
     /// Called when position is closed (sell executed).
-    pub fn on_exit_submitted(&mut self, id: &StrategyId) {
+    pub fn on_exit_submitted(&mut self, id: &StrategyId, exit_price: f64) {
+        let mut was_win = None;
         if let Some(state) = self.entry_state.get_mut(id) {
+            if let Some(entry) = state.entry_price_hint {
+                was_win = Some(exit_price > entry);
+            }
             state.entry_price_hint = None;
             state.entry_time       = None;
         }
+        if let Some(win) = was_win {
+            let key = (id.clone(), self.active_regime_bucket);
+            let row = self.perf.entry(key).or_insert(StrategyPerf { wins: 0, losses: 0 });
+            if win {
+                row.wins += 1;
+                self.loss_streak = 0;
+            } else {
+                row.losses += 1;
+                self.loss_streak = self.loss_streak.saturating_add(1);
+            }
+        }
+        self.last_trade_at = Some(Instant::now());
+        self.active_strategy_hint = None;
     }
 
     /// Clear entry state for all strategies (e.g. on position reconcile).
@@ -563,6 +649,7 @@ impl StrategyEngine {
             state.entry_price_hint = None;
             state.entry_time       = None;
         }
+        self.active_strategy_hint = None;
     }
 
     /// Which strategy ID is currently "active" (has an open entry hint).
@@ -586,12 +673,15 @@ impl StrategyEngine {
     /// Returns (selected: StrategyDecision, all: Vec<StrategyDecision>).
     /// `all` is the full per-strategy breakdown for the comparison view.
     pub fn evaluate(
-        &self,
+        &mut self,
         metrics: &SignalMetrics,
         truth:   &TruthState,
     ) -> (StrategyDecision, Vec<StrategyDecision>) {
         let mut all_decisions: Vec<StrategyDecision> = Vec::new();
         let mut candidates: Vec<StrategyDecision>    = Vec::new();
+        let regime = self.regime_view(metrics);
+        let dynamic_threshold = self.dynamic_confidence_threshold();
+        let participation_ok = self.participation_ok(metrics);
 
         for strategy in &self.strategies {
             if !self.is_enabled(strategy.id()) {
@@ -608,7 +698,31 @@ impl StrategyEngine {
             let state   = self.entry_state.get(strategy.id())
                               .map(|s| (s.entry_price_hint, s.entry_time))
                               .unwrap_or((None, None));
-            let decision = strategy.evaluate(metrics, truth, state.0, state.1);
+            let mut decision = strategy.evaluate(metrics, truth, state.0, state.1);
+            decision.confidence *= regime.weight;
+            let perf_weight = self.strategy_performance_weight(&decision.strategy_id, regime.bucket);
+            decision.confidence *= perf_weight;
+            decision.confidence = decision.confidence.clamp(0.0, 1.0);
+
+            if decision.action.is_actionable() && !participation_ok {
+                decision.action = StrategyAction::Wait;
+                decision.reason = format!(
+                    "{} | blocked: low participation (trades={} imb1={:+.3})",
+                    decision.reason, metrics.trade_samples, metrics.imbalance_1s
+                );
+                decision.confidence = 0.0;
+            } else if decision.action.is_actionable() && decision.confidence < dynamic_threshold {
+                decision.action = StrategyAction::Wait;
+                decision.reason = format!(
+                    "{} | below dynamic threshold {:.2}",
+                    decision.reason, dynamic_threshold
+                );
+            } else if decision.action.is_actionable() && !regime.aligned {
+                decision.reason = format!(
+                    "{} | regimes diverged fast={:+.4} medium={:+.4} weight={:.2}",
+                    decision.reason, regime.short_fast, regime.medium_stable, regime.weight
+                );
+            }
 
             debug!(
                 strategy = %decision.strategy_id,
@@ -637,7 +751,7 @@ impl StrategyEngine {
             }
         });
 
-        let chosen = match selected {
+        let mut chosen = match selected {
             Some(d) => {
                 info!(
                     strategy   = %d.strategy_id,
@@ -656,7 +770,98 @@ impl StrategyEngine {
             }
         };
 
+        if self.should_force_exit_for_edge_decay(metrics, truth, &chosen) {
+            chosen = StrategyDecision {
+                strategy_id: self.active_strategy_hint.clone().unwrap_or(StrategyId::MomentumMicro),
+                action: StrategyAction::ExitCandidate { reason: "EDGE_DECAY".into() },
+                confidence: 1.0,
+                reason: "Edge velocity decayed rapidly; forcing immediate exit".into(),
+            };
+        }
+
         (chosen, all_decisions)
+    }
+
+    pub fn compute_position_size(
+        &self,
+        base_qty: f64,
+        confidence: f64,
+        regime_weight: f64,
+        metrics: &SignalMetrics,
+    ) -> f64 {
+        let confidence_weight = confidence.clamp(0.0, 1.0);
+        let volatility = metrics.momentum_1s.abs() + metrics.momentum_3s.abs() + metrics.momentum_5s.abs();
+        let volatility_adjustment = (1.0 / (1.0 + (volatility * 200.0))).clamp(0.5, 1.2);
+        (base_qty * confidence_weight * regime_weight * volatility_adjustment).max(0.0)
+    }
+
+    pub fn regime_weight(&self, metrics: &SignalMetrics) -> f64 {
+        self.regime_view(metrics).weight
+    }
+
+    fn participation_ok(&self, metrics: &SignalMetrics) -> bool {
+        metrics.trade_samples >= self.min_trade_samples
+            && metrics.imbalance_1s.abs() >= self.min_abs_imbalance_1s
+    }
+
+    fn dynamic_confidence_threshold(&self) -> f64 {
+        let mut t = self.base_confidence_threshold;
+        if let Some(last) = self.last_trade_at {
+            if last.elapsed() >= self.no_trade_lowering_after {
+                t -= self.no_trade_lowering_step;
+            }
+        }
+        t += self.loss_streak as f64 * self.loss_streak_threshold_step;
+        t.clamp(0.55, 0.90)
+    }
+
+    fn strategy_performance_weight(&self, id: &StrategyId, bucket: RegimeBucket) -> f64 {
+        self.perf
+            .get(&(id.clone(), bucket))
+            .map(|p| (0.7 + (p.win_rate() * 0.6)).clamp(0.7, 1.3))
+            .unwrap_or(1.0)
+    }
+
+    fn regime_view(&self, metrics: &SignalMetrics) -> RegimeView {
+        let short_fast = (metrics.momentum_1s * 0.7) + (metrics.imbalance_1s * 0.3);
+        let medium_stable = (metrics.momentum_5s * 0.8) + (metrics.imbalance_5s * 0.2);
+        let aligned = short_fast.signum() == medium_stable.signum();
+        let weight = if aligned { 1.0 } else { 0.72 };
+        let bucket = if aligned { RegimeBucket::Aligned } else { RegimeBucket::Divergent };
+        RegimeView { short_fast, medium_stable, aligned, weight, bucket }
+    }
+
+    fn should_force_exit_for_edge_decay(
+        &mut self,
+        metrics: &SignalMetrics,
+        truth: &TruthState,
+        chosen: &StrategyDecision,
+    ) -> bool {
+        let edge_confidence = self.compute_edge_confidence(metrics);
+        let now = Instant::now();
+        let mut force_exit = false;
+        if !truth.position.is_flat() {
+            if let Some((prev, ts)) = self.last_edge_confidence {
+                let dt = now.duration_since(ts).as_secs_f64().max(0.001);
+                let velocity = (edge_confidence - prev) / dt;
+                if velocity <= -self.rapid_edge_decay_per_sec
+                    && !matches!(chosen.action, StrategyAction::ExitCandidate { .. })
+                {
+                    force_exit = true;
+                }
+            }
+        }
+        self.last_edge_confidence = Some((edge_confidence, now));
+        self.active_regime_bucket = self.regime_view(metrics).bucket;
+        force_exit
+    }
+
+    fn compute_edge_confidence(&self, metrics: &SignalMetrics) -> f64 {
+        let momentum = ((metrics.momentum_1s + metrics.momentum_3s + metrics.momentum_5s) / 3.0).max(0.0);
+        let imbalance = ((metrics.imbalance_1s + metrics.imbalance_3s + metrics.imbalance_5s) / 3.0).max(0.0);
+        let spread = (1.0 - (metrics.spread_bps / 8.0)).clamp(0.0, 1.0);
+        ((momentum * 2000.0).clamp(0.0, 1.0) * 0.45 + imbalance.clamp(0.0, 1.0) * 0.35 + spread * 0.20)
+            .clamp(0.0, 1.0)
     }
 }
 
@@ -975,7 +1180,7 @@ mod tests {
 
     #[test]
     fn test_engine_returns_wait_when_no_candidates() {
-        let engine = StrategyEngine::new();
+        let mut engine = StrategyEngine::new();
         let mut m = base_metrics();
         // Conditions where nothing should fire
         m.momentum_1s  = -0.005;
@@ -1007,7 +1212,7 @@ mod tests {
         assert!(engine.active_strategy().is_none());
         engine.on_entry_submitted(&StrategyId::MomentumMicro, 50000.0);
         assert_eq!(engine.active_strategy(), Some(StrategyId::MomentumMicro));
-        engine.on_exit_submitted(&StrategyId::MomentumMicro);
+        engine.on_exit_submitted(&StrategyId::MomentumMicro, 50010.0);
         assert!(engine.active_strategy().is_none());
     }
 

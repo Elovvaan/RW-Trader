@@ -448,16 +448,17 @@ async fn main() -> Result<()> {
         // ── Evaluate strategies ───────────────────────────────────────────────
         // Compute SignalMetrics from feed (shared by all strategies).
         // Then ask the StrategyEngine which strategy fires and at what confidence.
-        let (strategy_decision, strategy_all, signal_result) = {
+        let (strategy_decision, strategy_all, signal_result, regime_weight) = {
             let feed  = feed_state.lock().await;
             let truth = truth.lock().await;
             let sig   = signal_engine.lock().await;
-            let strat = strategy_engine.lock().await;
+            let mut strat = strategy_engine.lock().await;
             // compute_metrics is a method on SignalEngine
             let metrics = sig.compute_metrics_pub(&feed);
+            let regime_weight = strat.regime_weight(&metrics);
             let (chosen, all) = strat.evaluate(&metrics, &truth);
             let sr = chosen.to_signal_result(&metrics);
-            (chosen, all, sr)
+            (chosen, all, sr, regime_weight)
         };
 
         match &signal_result.decision {
@@ -515,10 +516,28 @@ async fn main() -> Result<()> {
             signal::SignalDecision::Hold       => unreachable!(),
         };
 
+        let dynamic_qty = {
+            let strat = strategy_engine.lock().await;
+            match order_side {
+                risk::OrderSide::Buy => strat.compute_position_size(
+                    order_qty,
+                    signal_result.confidence,
+                    regime_weight,
+                    &signal_result.metrics,
+                ),
+                risk::OrderSide::Sell => position_snapshot.size.max(0.0),
+            }
+        };
+
+        if dynamic_qty <= 0.0 {
+            tracing::debug!("Dynamic quantity <= 0, skipping");
+            continue;
+        }
+
         let proposed = risk::ProposedOrder {
             symbol:         symbol.clone(),
             side:           order_side,
-            qty:            order_qty,
+            qty:            dynamic_qty,
             expected_price: proposed_price,
         };
 
@@ -570,7 +589,7 @@ async fn main() -> Result<()> {
             let auth_result = authority.check(
                 &symbol,
                 side_str,
-                order_qty,
+                dynamic_qty,
                 &signal_result.reason,
                 signal_result.confidence,
                 sys_mode,
@@ -610,7 +629,7 @@ async fn main() -> Result<()> {
         // Incremented once per signal, not per retry. Retries reuse the same coid.
         order_seq += 1;
         let client_order_id = executor::make_client_order_id(order_seq);
-        let qty_str  = format!("{:.5}", order_qty);
+        let qty_str  = format!("{:.5}", dynamic_qty);
 
         // Persist order submission intent
         event_store.append(events::order_submitted_event(
@@ -677,7 +696,7 @@ async fn main() -> Result<()> {
                             sig.on_entry_submitted(avg_price.max(proposed_price));
                         }
                         risk::OrderSide::Sell => {
-                            strat.on_exit_submitted(&strategy_decision.strategy_id);
+                            strat.on_exit_submitted(&strategy_decision.strategy_id, avg_price.max(proposed_price));
                             sig.on_exit_submitted();
                         }
                     }
