@@ -40,6 +40,13 @@ pub struct PortfolioConfig {
     pub min_confidence_defensive: f64,
     pub max_concurrent_positions_normal: usize,
     pub max_concurrent_positions_defensive: usize,
+    pub hard_cap_active_positions: usize,
+    pub min_expected_value: f64,
+    pub max_signal_age_secs: f64,
+    pub max_spread_bps_gate: f64,
+    pub min_execution_quality: f64,
+    pub defensive_size_multiplier: f64,
+    pub recovery_size_multiplier: f64,
 }
 
 impl Default for PortfolioConfig {
@@ -62,6 +69,13 @@ impl Default for PortfolioConfig {
             min_confidence_defensive: 0.82,
             max_concurrent_positions_normal: 6,
             max_concurrent_positions_defensive: 3,
+            hard_cap_active_positions: 8,
+            min_expected_value: 0.03,
+            max_signal_age_secs: 2.0,
+            max_spread_bps_gate: 8.0,
+            min_execution_quality: 0.45,
+            defensive_size_multiplier: 0.55,
+            recovery_size_multiplier: 0.80,
         }
     }
 }
@@ -215,6 +229,10 @@ pub struct OpportunityCandidate {
     pub volatility: f64,
     pub current_price: f64,
     pub reason: String,
+    pub signal_age_secs: f64,
+    pub spread_bps: f64,
+    pub expected_value: f64,
+    pub execution_path: String,
 }
 
 #[derive(Debug, Clone)]
@@ -223,6 +241,8 @@ pub struct RankedOpportunity {
     pub rank_score: f64,
     pub diversification_benefit: f64,
     pub correlation_penalty: f64,
+    pub execution_penalty: f64,
+    pub strategy_score: f64,
     pub allocated_notional_usd: f64,
 }
 
@@ -335,6 +355,11 @@ pub enum PortfolioRejection {
     MaxStrategyCap,
     MaxConcurrency,
     BelowConfidence,
+    StaleSignal,
+    WideSpread,
+    LowExpectedValue,
+    PoorExecutionQuality,
+    HardCapActivePositions,
 }
 
 impl std::fmt::Display for PortfolioRejection {
@@ -372,6 +397,18 @@ impl PortfolioRiskEngine {
         if state.turnover_hourly > self.config.max_turnover_per_hour {
             return Err(PortfolioRejection::MaxTurnover);
         }
+        if ranked.candidate.signal_age_secs > self.config.max_signal_age_secs {
+            return Err(PortfolioRejection::StaleSignal);
+        }
+        if ranked.candidate.spread_bps > self.config.max_spread_bps_gate {
+            return Err(PortfolioRejection::WideSpread);
+        }
+        if ranked.candidate.expected_value < self.config.min_expected_value {
+            return Err(PortfolioRejection::LowExpectedValue);
+        }
+        if (1.0 - ranked.execution_penalty) < self.config.min_execution_quality {
+            return Err(PortfolioRejection::PoorExecutionQuality);
+        }
 
         let symbol_expo = state.symbol_exposure.get(&ranked.candidate.symbol).copied().unwrap_or(0.0);
         if ((symbol_expo + ranked.allocated_notional_usd) / cap) > self.config.max_symbol_exposure {
@@ -390,6 +427,9 @@ impl PortfolioRiskEngine {
         };
         if concurrency >= limit {
             return Err(PortfolioRejection::MaxConcurrency);
+        }
+        if concurrency >= self.config.hard_cap_active_positions {
+            return Err(PortfolioRejection::HardCapActivePositions);
         }
 
         let min_conf = match state.mode {
@@ -424,29 +464,33 @@ impl PortfolioAllocator {
         let mut ranked = Vec::with_capacity(candidates.len());
         for c in candidates {
             let strategy_weight = scoreboard.score_weight(&c.strategy);
+            let strategy_score = (strategy_weight / 1.45).clamp(0.0, 1.0);
             let diversification_benefit = self.diversification_benefit(state, &c.symbol);
             let correlation_penalty = self.correlation_penalty(state, &c.symbol);
-            let exec_penalty = execution_quality.penalty("binance:market");
-            let rank_score = (c.confidence * 0.30)
-                + (c.regime_fit * 0.20)
-                + (c.expected_reward_risk.clamp(0.0, 2.0) / 2.0 * 0.20)
-                + ((strategy_weight / 1.45).clamp(0.0, 1.0) * 0.15)
-                + (diversification_benefit * 0.15);
+            let execution_quality_weight = execution_quality.penalty(&c.execution_path);
+            let execution_penalty = (1.0 - execution_quality_weight).clamp(0.0, 1.0);
+            let expected_rr_score = (c.expected_reward_risk.clamp(0.0, 2.0) / 2.0).clamp(0.0, 1.0);
+            let rank_score = c.confidence
+                + c.regime_fit
+                + expected_rr_score
+                + strategy_score
+                - correlation_penalty
+                - execution_penalty;
 
             let capital_budget = (state.equity_usd - state.reserve_cash_usd).max(0.0);
             let volatility_adjustment = (1.0 / (1.0 + (c.volatility * 120.0))).clamp(0.20, 1.0);
             let mode_adjustment = match state.mode {
                 OperatingMode::Normal => 1.0,
-                OperatingMode::Recovery => 0.75,
-                OperatingMode::Defensive => 0.45,
+                OperatingMode::Recovery => self.config.recovery_size_multiplier,
+                OperatingMode::Defensive => self.config.defensive_size_multiplier,
             };
             let allocated_notional_usd = capital_budget
                 * strategy_weight
                 * c.regime_fit.clamp(0.0, 1.2)
                 * c.confidence.clamp(0.0, 1.0)
                 * volatility_adjustment
-                * correlation_penalty
-                * exec_penalty
+                * (1.0 - correlation_penalty).clamp(0.20, 1.0)
+                * execution_quality_weight
                 * mode_adjustment
                 * 0.05;
 
@@ -455,6 +499,8 @@ impl PortfolioAllocator {
                 rank_score,
                 diversification_benefit,
                 correlation_penalty,
+                execution_penalty,
+                strategy_score,
                 allocated_notional_usd,
             });
         }
@@ -478,7 +524,7 @@ impl PortfolioAllocator {
             let corr = rolling_corr(state, symbol, other);
             worst_corr = worst_corr.max(corr.abs());
         }
-        (1.0 - worst_corr).clamp(0.20, 1.0)
+        worst_corr.clamp(0.0, 1.0)
     }
 }
 

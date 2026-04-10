@@ -311,6 +311,13 @@ async fn main() -> Result<()> {
         min_confidence_defensive: env_f64("PORTFOLIO_MIN_CONF_DEFENSIVE", 0.82),
         max_concurrent_positions_normal: env_u64("PORTFOLIO_MAX_CONCURRENT_NORMAL", 6) as usize,
         max_concurrent_positions_defensive: env_u64("PORTFOLIO_MAX_CONCURRENT_DEFENSIVE", 3) as usize,
+        hard_cap_active_positions: env_u64("PORTFOLIO_HARD_CAP_ACTIVE_POSITIONS", 8) as usize,
+        min_expected_value: env_f64("PORTFOLIO_MIN_EXPECTED_VALUE", 0.03),
+        max_signal_age_secs: env_f64("PORTFOLIO_MAX_SIGNAL_AGE_SECS", 2.0),
+        max_spread_bps_gate: env_f64("PORTFOLIO_MAX_SPREAD_BPS_GATE", 8.0),
+        min_execution_quality: env_f64("PORTFOLIO_MIN_EXEC_QUALITY", 0.45),
+        defensive_size_multiplier: env_f64("PORTFOLIO_DEFENSIVE_SIZE_MULT", 0.55),
+        recovery_size_multiplier: env_f64("PORTFOLIO_RECOVERY_SIZE_MULT", 0.80),
     };
     let portfolio_allocator = Arc::new(portfolio::PortfolioAllocator::new(portfolio_config.clone()));
     let portfolio_risk = Arc::new(portfolio::PortfolioRiskEngine::new(portfolio_config.clone()));
@@ -481,7 +488,7 @@ async fn main() -> Result<()> {
         // ── Evaluate strategies ───────────────────────────────────────────────
         // Compute SignalMetrics from feed (shared by all strategies).
         // Then ask the StrategyEngine which strategy fires and at what confidence.
-        let (strategy_decision, strategy_all, signal_result, regime_weight) = {
+        let (strategy_decision, strategy_all, metrics, regime_weight) = {
             let feed  = feed_state.lock().await;
             let truth = truth.lock().await;
             let sig   = signal_engine.lock().await;
@@ -490,9 +497,9 @@ async fn main() -> Result<()> {
             let metrics = sig.compute_metrics_pub(&feed);
             let regime_weight = strat.regime_weight(&metrics);
             let (chosen, all) = strat.evaluate(&metrics, &truth);
-            let sr = chosen.to_signal_result(&metrics);
-            (chosen, all, sr, regime_weight)
+            (chosen, all, metrics, regime_weight)
         };
+        let mut signal_result = strategy_decision.to_signal_result(&metrics);
 
         match &signal_result.decision {
             signal::SignalDecision::Hold => {
@@ -527,7 +534,7 @@ async fn main() -> Result<()> {
 
         // Persist market snapshot and signal decision.
         event_store.append(events::market_snapshot_event(
-            &signal_result.metrics, &symbol, &correlation_id,
+            &metrics, &symbol, &correlation_id,
         ));
         event_store.append(events::signal_event(
             &signal_result, &symbol, &correlation_id,
@@ -543,33 +550,53 @@ async fn main() -> Result<()> {
         }
 
         // ── Portfolio ranking + allocation (signal -> ranking -> allocation) ─
-        let opportunity = portfolio::OpportunityCandidate {
-            symbol: symbol.clone(),
-            strategy: strategy_decision.strategy_id.clone(),
-            side: match &signal_result.decision {
-                signal::SignalDecision::Buy => risk::OrderSide::Buy,
-                signal::SignalDecision::Exit { .. } => risk::OrderSide::Sell,
-                signal::SignalDecision::Hold => unreachable!(),
-            },
-            confidence: signal_result.confidence,
-            regime_fit: regime_weight,
-            expected_reward_risk: ((signal_result.metrics.momentum_3s.abs() * 15_000.0)
-                / (signal_result.metrics.spread_bps.max(0.1))).clamp(0.0, 2.0),
-            volatility: signal_result.metrics.momentum_1s.abs()
-                + signal_result.metrics.momentum_3s.abs()
-                + signal_result.metrics.momentum_5s.abs(),
-            current_price: signal_result.metrics.mid,
-            reason: signal_result.reason.clone(),
-        };
+        let candidates: Vec<portfolio::OpportunityCandidate> = strategy_all.iter()
+            .filter(|d| d.action.is_actionable())
+            .map(|d| {
+                let local_signal = d.to_signal_result(&metrics);
+                let side = match &local_signal.decision {
+                    signal::SignalDecision::Buy => risk::OrderSide::Buy,
+                    signal::SignalDecision::Exit { .. } => risk::OrderSide::Sell,
+                    signal::SignalDecision::Hold => risk::OrderSide::Buy,
+                };
+                let expected_reward_risk = ((metrics.momentum_3s.abs() * 15_000.0)
+                    / (metrics.spread_bps.max(0.1))).clamp(0.0, 2.0);
+                let expected_value = d.confidence * regime_weight * expected_reward_risk
+                    - (metrics.spread_bps / 10_000.0);
+                portfolio::OpportunityCandidate {
+                    symbol: symbol.clone(),
+                    strategy: d.strategy_id.clone(),
+                    side,
+                    confidence: d.confidence,
+                    regime_fit: regime_weight,
+                    expected_reward_risk,
+                    volatility: metrics.momentum_1s.abs() + metrics.momentum_3s.abs() + metrics.momentum_5s.abs(),
+                    current_price: metrics.mid,
+                    reason: local_signal.reason,
+                    signal_age_secs: (metrics.feed_age_ms / 1_000.0).max(0.0),
+                    spread_bps: metrics.spread_bps,
+                    expected_value,
+                    execution_path: "binance:market".into(),
+                }
+            })
+            .collect();
+        if candidates.is_empty() {
+            continue;
+        }
 
         let ranked = {
             let mut pstate = portfolio_state.lock().await;
             pstate.update_mode(&portfolio_config);
             let scores = strategy_scoreboard.lock().await;
             let eq = execution_quality.lock().await;
-            portfolio_allocator.rank_opportunities(&pstate, &scores, &eq, vec![opportunity])
+            portfolio_allocator.rank_opportunities(&pstate, &scores, &eq, candidates)
         };
         let Some(top_opp) = ranked.first().cloned() else { continue; };
+        let selected_strategy_id = top_opp.candidate.strategy.clone();
+        signal_result = strategy_all.iter()
+            .find(|d| d.strategy_id == selected_strategy_id)
+            .map(|d| d.to_signal_result(&metrics))
+            .unwrap_or_else(|| strategy_decision.to_signal_result(&metrics));
         let portfolio_gate = {
             let pstate = portfolio_state.lock().await;
             portfolio_risk.check(&pstate, &top_opp)
@@ -598,11 +625,13 @@ async fn main() -> Result<()> {
             events::TradingEvent::OperatorAction(events::OperatorActionPayload {
                 action: "portfolio_ranked_opportunity".into(),
                 reason: format!(
-                    "rank={:.3} alloc_usd={:.2} div={:.2} corr_penalty={:.2} mode={}",
+                    "rank={:.3} alloc_usd={:.2} div={:.2} strat_score={:.2} corr_penalty={:.2} exec_penalty={:.2} mode={}",
                     top_opp.rank_score,
                     top_opp.allocated_notional_usd,
                     top_opp.diversification_benefit,
+                    top_opp.strategy_score,
                     top_opp.correlation_penalty,
+                    top_opp.execution_penalty,
                     { let p = portfolio_state.lock().await; p.mode.as_str().to_string() }
                 ),
             }),
@@ -830,20 +859,24 @@ async fn main() -> Result<()> {
                 }
 
                 // Update strategy engine entry/exit tracking
+                let holding_secs = {
+                    let strat = strategy_engine.lock().await;
+                    strat.entry_age_secs(&selected_strategy_id).unwrap_or(0.0)
+                };
                 {
                     let mut strat = strategy_engine.lock().await;
                     let mut sig   = signal_engine.lock().await;
                     let mut pstate = portfolio_state.lock().await;
                     match order_side {
                         risk::OrderSide::Buy  => {
-                            strat.on_entry_submitted(&strategy_decision.strategy_id, avg_price.max(proposed_price));
+                            strat.on_entry_submitted(&selected_strategy_id, avg_price.max(proposed_price));
                             sig.on_entry_submitted(avg_price.max(proposed_price));
-                            pstate.record_fill(&symbol, &strategy_decision.strategy_id, dynamic_qty * avg_price.max(proposed_price), true);
+                            pstate.record_fill(&symbol, &selected_strategy_id, dynamic_qty * avg_price.max(proposed_price), true);
                         }
                         risk::OrderSide::Sell => {
-                            strat.on_exit_submitted(&strategy_decision.strategy_id, avg_price.max(proposed_price));
+                            strat.on_exit_submitted(&selected_strategy_id, avg_price.max(proposed_price));
                             sig.on_exit_submitted();
-                            pstate.record_fill(&symbol, &strategy_decision.strategy_id, dynamic_qty * avg_price.max(proposed_price), false);
+                            pstate.record_fill(&symbol, &selected_strategy_id, dynamic_qty * avg_price.max(proposed_price), false);
                         }
                     }
                 }
@@ -855,7 +888,7 @@ async fn main() -> Result<()> {
                         (avg_price - proposed_price) / proposed_price
                     } else { 0.0 };
                     pstate.record_trade_result(dynamic_qty * (avg_price - proposed_price));
-                    scores.update(&strategy_decision.strategy_id, realized, pstate.drawdown());
+                    scores.update(&selected_strategy_id, realized, pstate.drawdown());
                     event_store.append(events::StoredEvent::new(
                         Some(symbol.clone()),
                         Some(correlation_id.clone()),
@@ -863,8 +896,8 @@ async fn main() -> Result<()> {
                         events::TradingEvent::OperatorAction(events::OperatorActionPayload {
                             action: "trade_lifecycle_analytics".into(),
                             reason: format!(
-                                "strategy={} symbol={} regime_weight={:.3} confidence={:.3} entry_reason={} exit_reason={} edge_decay={:.4} slippage_bps={:.2} holding_secs=0.0 pnl_usd={:.4}",
-                                strategy_decision.strategy_id,
+                                "strategy={} symbol={} regime_weight={:.3} confidence={:.3} entry_reason={} exit_reason={} edge_decay={:.4} slippage_bps={:.2} holding_secs={:.2} realized_edge={:.5} pnl_usd={:.4}",
+                                selected_strategy_id,
                                 symbol,
                                 regime_weight,
                                 signal_result.confidence,
@@ -872,6 +905,8 @@ async fn main() -> Result<()> {
                                 match &signal_result.decision { signal::SignalDecision::Exit { reason } => reason.to_string(), _ => "N/A".into() },
                                 signal_result.metrics.momentum_1s - signal_result.metrics.momentum_5s,
                                 if proposed_price > 0.0 { ((avg_price - proposed_price).abs() / proposed_price) * 10_000.0 } else { 0.0 },
+                                holding_secs,
+                                realized,
                                 dynamic_qty * (avg_price - proposed_price),
                             ),
                         }),
