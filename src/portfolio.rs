@@ -388,7 +388,7 @@ impl PortfolioRiskEngine {
         if (next_total / cap) > self.config.max_total_exposure {
             return Err(PortfolioRejection::MaxTotalExposure);
         }
-        if ranked.correlation_penalty < 0.45 {
+        if ranked.correlation_penalty > self.config.max_correlated_exposure {
             return Err(PortfolioRejection::MaxCorrelatedExposure);
         }
         if state.drawdown() > self.config.max_intraday_drawdown {
@@ -554,4 +554,98 @@ fn rolling_corr(state: &PortfolioState, a: &str, b: &str) -> f64 {
         return 0.0;
     }
     (cov / (va.sqrt() * vb.sqrt())).clamp(-1.0, 1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::risk::OrderSide;
+
+    fn candidate(symbol: &str) -> OpportunityCandidate {
+        OpportunityCandidate {
+            symbol: symbol.to_string(),
+            strategy: StrategyId::MomentumMicro,
+            side: OrderSide::Buy,
+            confidence: 0.95,
+            regime_fit: 1.0,
+            expected_reward_risk: 1.5,
+            volatility: 0.01,
+            current_price: 100.0,
+            reason: "test".to_string(),
+            signal_age_secs: 0.1,
+            spread_bps: 1.0,
+            expected_value: 0.20,
+            execution_path: "test:path".to_string(),
+        }
+    }
+
+    fn push_returns(state: &mut PortfolioState, symbol: &str, returns: &[f64]) {
+        for ret in returns {
+            state.update_symbol_return(symbol, *ret);
+        }
+    }
+
+    #[test]
+    fn low_correlation_penalty_passes_risk_check() {
+        let config = PortfolioConfig::default();
+        let allocator = PortfolioAllocator::new(config.clone());
+        let risk = PortfolioRiskEngine::new(config.clone());
+        let mut state = PortfolioState::new(&config);
+
+        push_returns(&mut state, "BTCUSDT", &[0.01, -0.01, 0.01, -0.01, 0.01, -0.01, 0.01, -0.01, 0.01, -0.01]);
+        push_returns(&mut state, "ETHUSDT", &[0.01, 0.01, -0.01, -0.01, 0.01, 0.01, -0.01, -0.01, 0.01, 0.01]);
+
+        let ranked = allocator.rank_opportunities(
+            &state,
+            &StrategyScoreboard::default(),
+            &ExecutionQualityTracker::default(),
+            vec![candidate("BTCUSDT")],
+        );
+        let top = ranked.first().expect("expected ranked opportunity");
+        assert!(top.correlation_penalty <= config.max_correlated_exposure);
+        assert!(risk.check(&state, top).is_ok());
+    }
+
+    #[test]
+    fn high_correlation_penalty_rejects_risk_check() {
+        let config = PortfolioConfig::default();
+        let allocator = PortfolioAllocator::new(config.clone());
+        let risk = PortfolioRiskEngine::new(config.clone());
+        let mut state = PortfolioState::new(&config);
+
+        let aligned = [0.01, 0.02, -0.01, 0.03, -0.02, 0.01, 0.02, -0.01, 0.03, -0.02];
+        push_returns(&mut state, "BTCUSDT", &aligned);
+        push_returns(&mut state, "ETHUSDT", &aligned);
+
+        let ranked = allocator.rank_opportunities(
+            &state,
+            &StrategyScoreboard::default(),
+            &ExecutionQualityTracker::default(),
+            vec![candidate("BTCUSDT")],
+        );
+        let top = ranked.first().expect("expected ranked opportunity");
+        assert!(top.correlation_penalty > config.max_correlated_exposure);
+        assert!(matches!(
+            risk.check(&state, top),
+            Err(PortfolioRejection::MaxCorrelatedExposure)
+        ));
+    }
+
+    #[test]
+    fn empty_history_does_not_block_startup() {
+        let config = PortfolioConfig::default();
+        let allocator = PortfolioAllocator::new(config.clone());
+        let risk = PortfolioRiskEngine::new(config.clone());
+        let state = PortfolioState::new(&config);
+
+        let ranked = allocator.rank_opportunities(
+            &state,
+            &StrategyScoreboard::default(),
+            &ExecutionQualityTracker::default(),
+            vec![candidate("BTCUSDT")],
+        );
+        let top = ranked.first().expect("expected ranked opportunity");
+        assert_eq!(top.correlation_penalty, 0.0);
+        assert!(risk.check(&state, top).is_ok());
+    }
 }
