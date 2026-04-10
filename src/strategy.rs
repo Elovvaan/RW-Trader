@@ -12,7 +12,7 @@
 //   - All strategies share the same risk/authority/execution pipeline.
 //   - Priority order (for tie-breaking) is defined by the order in ALL_STRATEGIES.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use tracing::{debug, info};
@@ -557,6 +557,10 @@ pub struct StrategyEngine {
     last_trade_at: Option<Instant>,
     loss_streak: u32,
     last_edge_confidence: Option<(f64, Instant)>,
+    recent_edge: HashMap<StrategyId, VecDeque<f64>>,
+    paused_until: HashMap<StrategyId, Instant>,
+    pause_duration: Duration,
+    edge_decay_pause_threshold: f64,
 }
 
 impl StrategyEngine {
@@ -590,6 +594,10 @@ impl StrategyEngine {
             last_trade_at: None,
             loss_streak: 0,
             last_edge_confidence: None,
+            recent_edge: HashMap::new(),
+            paused_until: HashMap::new(),
+            pause_duration: Duration::from_secs(300),
+            edge_decay_pause_threshold: 0.08,
         }
     }
 
@@ -627,9 +635,13 @@ impl StrategyEngine {
     /// Called when position is closed (sell executed).
     pub fn on_exit_submitted(&mut self, id: &StrategyId, exit_price: f64) {
         let mut was_win = None;
+        let mut realized_edge = None;
         if let Some(state) = self.entry_state.get_mut(id) {
             if let Some(entry) = state.entry_price_hint {
                 was_win = Some(exit_price > entry);
+                if entry > 0.0 {
+                    realized_edge = Some((exit_price - entry) / entry);
+                }
             }
             state.entry_price_hint = None;
             state.entry_time       = None;
@@ -645,8 +657,44 @@ impl StrategyEngine {
                 self.loss_streak = self.loss_streak.saturating_add(1);
             }
         }
+        if let Some(edge) = realized_edge {
+            self.record_realized_edge(id, edge);
+            self.auto_adjust_strategy(id);
+        }
         self.last_trade_at = Some(Instant::now());
         self.active_strategy_hint = None;
+    }
+
+    fn record_realized_edge(&mut self, id: &StrategyId, edge: f64) {
+        let row = self.recent_edge.entry(id.clone()).or_insert_with(|| VecDeque::with_capacity(30));
+        row.push_back(edge);
+        while row.len() > 30 {
+            row.pop_front();
+        }
+    }
+
+    fn auto_adjust_strategy(&mut self, id: &StrategyId) {
+        let Some(row) = self.recent_edge.get(id) else { return; };
+        if row.len() < 6 {
+            return;
+        }
+        let recent = row.iter().rev().take(6).sum::<f64>() / 6.0;
+        let long = row.iter().sum::<f64>() / row.len() as f64;
+        if (long - recent) >= self.edge_decay_pause_threshold {
+            self.paused_until.insert(id.clone(), Instant::now() + self.pause_duration);
+            info!(
+                strategy = %id,
+                recent_edge = recent,
+                long_edge = long,
+                pause_secs = self.pause_duration.as_secs(),
+                "[STRATEGY] Auto-paused due to edge decay"
+            );
+        }
+    }
+
+    fn prune_pauses(&mut self) {
+        let now = Instant::now();
+        self.paused_until.retain(|_, until| *until > now);
     }
 
     /// Clear entry state for all strategies (e.g. on position reconcile).
@@ -663,6 +711,13 @@ impl StrategyEngine {
         self.entry_state.iter()
             .find(|(_, s)| s.entry_price_hint.is_some())
             .map(|(id, _)| id.clone())
+    }
+
+    pub fn entry_age_secs(&self, id: &StrategyId) -> Option<f64> {
+        self.entry_state
+            .get(id)
+            .and_then(|s| s.entry_time)
+            .map(|t| t.elapsed().as_secs_f64())
     }
 
     // ── Core evaluation ───────────────────────────────────────────────────────
@@ -683,6 +738,7 @@ impl StrategyEngine {
         metrics: &SignalMetrics,
         truth:   &TruthState,
     ) -> (StrategyDecision, Vec<StrategyDecision>) {
+        self.prune_pauses();
         let mut all_decisions: Vec<StrategyDecision> = Vec::new();
         let mut candidates: Vec<StrategyDecision>    = Vec::new();
         let regime = self.regime_view(metrics);
@@ -697,6 +753,18 @@ impl StrategyEngine {
                     action:      StrategyAction::StandDown,
                     confidence:  0.0,
                     reason:      "disabled".into(),
+                });
+                continue;
+            }
+            if let Some(until) = self.paused_until.get(strategy.id()) {
+                all_decisions.push(StrategyDecision {
+                    strategy_id: strategy.id().clone(),
+                    action:      StrategyAction::StandDown,
+                    confidence:  0.0,
+                    reason:      format!(
+                        "paused_for_edge_decay {}s",
+                        until.saturating_duration_since(Instant::now()).as_secs()
+                    ),
                 });
                 continue;
             }
