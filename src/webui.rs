@@ -51,7 +51,7 @@ pub struct AppState {
 
 #[cfg(test)]
 fn test_app_state_extras() -> (Option<Arc<BinanceClient>>, Arc<WithdrawalManager>) {
-    (None, Arc::new(WithdrawalManager::new()))
+    (None, Arc::new(WithdrawalManager::new(crate::withdrawal::WithdrawalConfig::default())))
 }
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -129,6 +129,7 @@ async fn handle(mut stream: TcpStream, state: Arc<AppState>) -> Result<()> {
 }
 
 async fn handle_post(path: &str, _query: &str, body: &str, state: &AppState) -> String {
+    const LARGE_WITHDRAWAL_THRESHOLD: f64 = 500.0;
     if path == "/events/quick/buy" {
         log_ui_action(&*state.store, "ui_quick_execute_buy", "manual quick execute from /events");
         return redirect_with_ok("/events", "Queued quick BUY market simulation.");
@@ -178,7 +179,7 @@ async fn handle_post(path: &str, _query: &str, body: &str, state: &AppState) -> 
             "ui_withdrawal_confirmed_simulation",
             "withdrawal confirmation requested from /authority",
         );
-        return redirect_with_ok("/authority", "Withdrawal confirmation recorded (simulation). No real funds moved.");
+        return redirect_with_ok("/authority", "Simulation confirmation recorded. No real funds moved.");
     }
 
     if path == "/withdraw/request" {
@@ -194,6 +195,18 @@ async fn handle_post(path: &str, _query: &str, body: &str, state: &AppState) -> 
         if !confirmed {
             return redirect_with_err("/authority", "Explicit reconfirmation required. Tick confirmation and type CONFIRM.");
         }
+        if amount >= LARGE_WITHDRAWAL_THRESHOLD {
+            let large_confirmed = form
+                .get("confirm_large_text")
+                .map(|v| v == "WITHDRAW LARGE")
+                .unwrap_or(false);
+            if !large_confirmed {
+                return redirect_with_err(
+                    "/authority",
+                    "Large withdrawal requires extra confirmation. Type WITHDRAW LARGE.",
+                );
+            }
+        }
 
         let req = NewWithdrawalRequest { amount, asset, destination, network, reason, estimated_fee: fee };
         let kill = state.risk.lock().await.kill_switch_active();
@@ -206,14 +219,28 @@ async fn handle_post(path: &str, _query: &str, body: &str, state: &AppState) -> 
         let mode = state.authority.mode().await;
         if mode == AuthorityMode::Auto {
             match state.withdrawals.execute(&proposal.id, mode, kill, client_ref, &*state.store).await {
-                Ok(_) => return redirect_with_ok("/authority", "Withdrawal auto-executed under AUTO policy."),
+                Ok(_) => {
+                    return redirect(&format!(
+                        "/authority?ok={}&wd_id={}&wd_step=status",
+                        url_encode("Withdrawal auto-executed under AUTO policy."),
+                        url_encode(&proposal.id)
+                    ));
+                }
                 Err(e) => {
                     state.withdrawals.mark_failed(&proposal.id, &e, &*state.store).await;
-                    return redirect_with_err("/authority", &e);
+                    return redirect(&format!(
+                        "/authority?err={}&wd_id={}&wd_step=status",
+                        url_encode(&e),
+                        url_encode(&proposal.id)
+                    ));
                 }
             }
         }
-        return redirect_with_ok("/authority", &format!("Withdrawal proposal {} created and awaiting authority approval.", proposal.id));
+        return redirect(&format!(
+            "/authority?ok={}&wd_id={}&wd_step=status",
+            url_encode(&format!("Withdrawal proposal {} submitted.", proposal.id)),
+            url_encode(&proposal.id)
+        ));
     }
 
     // POST /strategy/enable/{id} or /strategy/disable/{id}
@@ -278,16 +305,16 @@ async fn handle_post(path: &str, _query: &str, body: &str, state: &AppState) -> 
     // POST /withdraw/proposal/approve/{proposal_id}
     if let Some(pid) = path.strip_prefix("/withdraw/proposal/approve/") {
         match state.withdrawals.approve(pid, &*state.store).await {
-            Ok(_) => return redirect_with_ok("/authority", "Withdrawal proposal approved."),
-            Err(e) => return redirect_with_err("/authority", &e),
+            Ok(_) => return redirect(&format!("/authority?ok={}&wd_id={}&wd_step=status", url_encode("Withdrawal proposal approved."), url_encode(pid))),
+            Err(e) => return redirect(&format!("/authority?err={}&wd_id={}&wd_step=status", url_encode(&e), url_encode(pid))),
         }
     }
 
     // POST /withdraw/proposal/reject/{proposal_id}
     if let Some(pid) = path.strip_prefix("/withdraw/proposal/reject/") {
         match state.withdrawals.reject(pid, &*state.store).await {
-            Ok(_) => return redirect_with_ok("/authority", "Withdrawal proposal rejected."),
-            Err(e) => return redirect_with_err("/authority", &e),
+            Ok(_) => return redirect(&format!("/authority?ok={}&wd_id={}&wd_step=status", url_encode("Withdrawal proposal rejected."), url_encode(pid))),
+            Err(e) => return redirect(&format!("/authority?err={}&wd_id={}&wd_step=status", url_encode(&e), url_encode(pid))),
         }
     }
 
@@ -297,10 +324,10 @@ async fn handle_post(path: &str, _query: &str, body: &str, state: &AppState) -> 
         let mode = state.authority.mode().await;
         let client_ref = state.client.as_ref().map(|c| c.as_ref());
         match state.withdrawals.execute(pid, mode, kill, client_ref, &*state.store).await {
-            Ok(_) => return redirect_with_ok("/authority", "Withdrawal executed."),
+            Ok(_) => return redirect(&format!("/authority?ok={}&wd_id={}&wd_step=status", url_encode("Withdrawal completed."), url_encode(pid))),
             Err(e) => {
                 state.withdrawals.mark_failed(pid, &e, &*state.store).await;
-                return redirect_with_err("/authority", &e);
+                return redirect(&format!("/authority?err={}&wd_id={}&wd_step=status", url_encode(&e), url_encode(pid)));
             }
         }
     }
@@ -967,12 +994,15 @@ async fn page_suggestions(state: &AppState, query: &str) -> String {
 // POST endpoints are handled in handle_post().
 
 async fn page_authority(state: &AppState, query: &str) -> String {
-    let refresh = r#"<meta http-equiv="refresh" content="5">"#;
+    let refresh = r#"<meta http-equiv="refresh" content="3">"#;
     let flash = flash_banner(query);
 
     let mode = state.authority.mode().await;
-    let proposals = state.authority.pending_proposals().await;
     let withdrawals = state.withdrawals.proposals().await;
+    let wd_id = qparam(query, "wd_id").unwrap_or_default();
+    let wd_step = qparam(query, "wd_step").unwrap_or("details");
+    let selected = withdrawals.iter().find(|w| w.id == wd_id).cloned().or_else(|| withdrawals.first().cloned());
+
     let (pos_size, pos_pnl_u) = {
         let t = state.truth.lock().await;
         (t.position.size, t.position.unrealized_pnl)
@@ -985,133 +1015,174 @@ async fn page_authority(state: &AppState, query: &str) -> String {
             <div>Pending Approvals: <strong>{}</strong></div>\
          </div>",
         esc(&mode.to_string()),
-        proposals.len(),
+        withdrawals
+            .iter()
+            .filter(|w| w.status == WithdrawalStatus::Requested)
+            .count(),
     );
 
     let mode_controls = "\
         <div class='label'>Authority Mode Controls</div>\
-        <div class='sum'>Switch between OFF, ASSIST, and AUTO without leaving this page.</div>\
+        <div class='sum'>Backend guardrails stay unchanged: request → approve/reject → execute → audit.</div>\
         <div style='display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:8px'>\
           <form method='post' action='/authority/mode/off'><button class='btn-off' style='width:100%' type='submit'>Set OFF</button></form>\
           <form method='post' action='/authority/mode/assist'><button class='btn-assist' style='width:100%' type='submit'>Set ASSIST</button></form>\
           <form method='post' action='/authority/mode/auto'><button class='btn-auto' style='width:100%' type='submit'>Set AUTO</button></form>\
         </div>";
 
-    let proposal_rows = if proposals.is_empty() {
-        "<tr><td colspan='8' class='dim'>No pending proposals.</td></tr>".to_string()
+    let (status_label, status_class, status_detail, status_action, status_banner) = if let Some(w) = &selected {
+        match w.status {
+            WithdrawalStatus::Requested => (
+                "Pending Approval".to_string(),
+                "warn".to_string(),
+                "Waiting for authority decision.".to_string(),
+                format!("<div style='display:flex;gap:8px;margin-top:8px'><form method='post' action='/withdraw/proposal/approve/{id}'><button class='btn-approve' type='submit'>Approve</button></form><form method='post' action='/withdraw/proposal/reject/{id}'><button class='btn-reject' type='submit'>Reject</button></form></div>", id=esc(&w.id)),
+                "".to_string(),
+            ),
+            WithdrawalStatus::Approved => (
+                "Approved".to_string(),
+                "ok".to_string(),
+                "Proposal approved and ready to execute.".to_string(),
+                format!("<form method='post' action='/withdraw/proposal/execute/{id}' style='margin-top:8px'><button class='btn' type='submit'>Execute Withdrawal</button></form>", id=esc(&w.id)),
+                "".to_string(),
+            ),
+            WithdrawalStatus::Executing => (
+                "Executing".to_string(),
+                "warn".to_string(),
+                "Execution in progress. Keep this screen open for live status refresh.".to_string(),
+                "".to_string(),
+                "".to_string(),
+            ),
+            WithdrawalStatus::Completed => (
+                "Completed".to_string(),
+                "ok".to_string(),
+                "Withdrawal finished successfully.".to_string(),
+                "".to_string(),
+                "<div style='margin-top:10px;padding:12px;background:rgba(34,197,94,.18);border-left:6px solid #22C55E'><strong>✅ Withdrawal Completed</strong><div class='sum'>Transaction id / proposal id: review audit trail entry for this proposal.</div></div>".to_string(),
+            ),
+            WithdrawalStatus::Failed => (
+                "Failed".to_string(),
+                "warn".to_string(),
+                "Execution failed. See failure reason below.".to_string(),
+                "".to_string(),
+                format!("<div style='margin-top:10px;padding:12px;background:rgba(239,68,68,.16);border-left:6px solid #ef4444'><strong>❌ Withdrawal Failed</strong><div class='sum'>Reason: {}</div></div>", esc(w.failure_reason.as_deref().unwrap_or("unknown"))),
+            ),
+            WithdrawalStatus::Rejected => (
+                "Rejected".to_string(),
+                "warn".to_string(),
+                "Proposal was rejected before execution.".to_string(),
+                "".to_string(),
+                format!("<div style='margin-top:10px;padding:12px;background:rgba(239,68,68,.16);border-left:6px solid #ef4444'><strong>⛔ Withdrawal Rejected</strong><div class='sum'>Reason: {}</div></div>", esc(w.failure_reason.as_deref().unwrap_or("rejected by authority"))),
+            ),
+        }
     } else {
-        proposals.iter().map(|p| {
-            format!(
-                "<tr>\
-                   <td style='font-size:11px'>{}</td>\
-                   <td>{}</td>\
-                   <td>{}</td>\
-                   <td>{:.6}</td>\
-                   <td>{:.2}</td>\
-                   <td>{:.1}s</td>\
-                   <td style='font-size:11px'>{}</td>\
-                   <td>\
-                     <div style='display:flex;gap:6px'>\
-                       <form method='post' action='/authority/approve/{}'><button class='btn-approve' type='submit'>Approve</button></form>\
-                       <form method='post' action='/authority/reject/{}'><button class='btn-reject' type='submit'>Reject</button></form>\
-                     </div>\
-                   </td>\
-                 </tr>",
-                esc(&p.id),
-                esc(&p.symbol),
-                esc(&p.side),
-                p.qty,
-                p.confidence,
-                p.ttl_remaining_secs(),
-                esc(&p.reason),
-                esc(&p.id),
-                esc(&p.id),
-            )
-        }).collect::<Vec<_>>().join("")
+        (
+            "Draft".to_string(),
+            "".to_string(),
+            "No submitted withdrawal yet. Complete Step 1 to create a draft request.".to_string(),
+            "".to_string(),
+            "".to_string(),
+        )
     };
 
-    let withdrawal_rows = if withdrawals.is_empty() {
-        "<tr><td colspan='10' class='dim'>No withdrawal proposals.</td></tr>".to_string()
+    let selected_info = if let Some(w) = &selected {
+        format!(
+            "<table class='kv'><tbody>\
+                <tr><td>Proposal ID</td><td style='font-size:11px'>{}</td></tr>\
+                <tr><td>Asset</td><td>{}</td></tr>\
+                <tr><td>Amount</td><td>{:.8}</td></tr>\
+                <tr><td>Fee estimate</td><td>{:.8}</td></tr>\
+                <tr><td>Final received</td><td>{:.8}</td></tr>\
+                <tr><td>Destination</td><td style='font-size:11px'>{}</td></tr>\
+                <tr><td>Network</td><td>{}</td></tr>\
+                <tr><td>Reason</td><td>{}</td></tr>\
+            </tbody></table>",
+            esc(&w.id), esc(&w.asset), w.amount, w.estimated_fee, w.final_received_amount(), esc(&w.destination), esc(&w.network), esc(&w.reason)
+        )
     } else {
-        withdrawals
-            .iter()
-            .map(|w| {
-                let status = match w.status {
-                    WithdrawalStatus::Requested => "REQUESTED",
-                    WithdrawalStatus::Approved => "APPROVED",
-                    WithdrawalStatus::Rejected => "REJECTED",
-                    WithdrawalStatus::Executed => "EXECUTED",
-                    WithdrawalStatus::Failed => "FAILED",
-                };
-                format!(
-                    "<tr><td style='font-size:11px'>{}</td><td>{}</td><td>{:.8}</td><td style='font-size:11px'>{}</td><td>{}</td><td>{:.8}</td><td>{:.8}</td><td>{}</td><td>{}</td><td><div style='display:flex;gap:6px'>\
-                    <form method='post' action='/withdraw/proposal/approve/{}'><button class='btn-approve' type='submit'>Approve</button></form>\
-                    <form method='post' action='/withdraw/proposal/reject/{}'><button class='btn-reject' type='submit'>Reject</button></form>\
-                    <form method='post' action='/withdraw/proposal/execute/{}'><button class='btn' type='submit'>Execute</button></form>\
-                    </div></td></tr>",
-                    esc(&w.id),
-                    esc(&w.asset),
-                    w.amount,
-                    esc(&w.destination),
-                    esc(&w.network),
-                    w.estimated_fee,
-                    w.final_received_amount(),
-                    esc(&w.reason),
-                    status,
-                    esc(&w.id),
-                    esc(&w.id),
-                    esc(&w.id),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("")
+        "<div class='dim'>No withdrawal proposal selected yet.</div>".to_string()
     };
+
+    let assist_inline = if mode == AuthorityMode::Assist {
+        if let Some(w) = &selected {
+            if w.status == WithdrawalStatus::Requested {
+                format!("<div style='margin-top:10px;padding:10px;background:#0A0E13;border:1px solid rgba(239,176,103,.35)'><div class='label'>ASSIST Inline Approval</div><div class='sum'>Approve or reject the pending withdrawal without leaving this screen.</div><div style='display:flex;gap:8px;margin-top:8px'><form method='post' action='/withdraw/proposal/approve/{id}'><button class='btn-approve' type='submit'>Approve</button></form><form method='post' action='/withdraw/proposal/reject/{id}'><button class='btn-reject' type='submit'>Reject</button></form></div></div>", id=esc(&w.id))
+            } else {
+                "<div class='dim' style='margin-top:10px'>ASSIST inline approval appears when a withdrawal is in Pending Approval.</div>".to_string()
+            }
+        } else {
+            "<div class='dim' style='margin-top:10px'>ASSIST inline approval will appear after request submission.</div>".to_string()
+        }
+    } else {
+        "".to_string()
+    };
+
+    let review_step = format!(
+        "<div class='label'>Step 2 — Review & Confirm</div>\
+         <div class='sum'>Status: <strong class='{status_class}'>{status_label}</strong> — {status_detail}</div>\
+         {selected_info}\
+         {assist_inline}\
+         {status_action}\
+         {status_banner}",
+    );
 
     let allowed_destinations = state.withdrawals.allowed_destinations().join(", ");
+    let step = match wd_step {
+        "review" => 2,
+        "status" => 3,
+        _ => 1,
+    };
+    let flow_header = format!(
+        "<div class='label'>Guided Withdrawal</div><div class='sum'>Step {step}/3 • Enter Details → Review & Confirm → Status</div>"
+    );
+
     let primary_body = format!(
-        "{}\
-         <div class='label' style='margin-top:12px'>Pending Trade Proposal Review</div>\
-         <table><thead><tr><th>ID</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Confidence</th><th>TTL</th><th>Reason</th><th>Actions</th></tr></thead><tbody>{}</tbody></table>\
-         <div class='label' style='margin-top:12px'>Create Real Withdrawal Request (POST /withdraw/request)</div>\
-         <div class='sum'>Allowed destination whitelist: <code>{}</code></div>\
-         <form method='post' action='/withdraw/request' style='display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px'>\
-            <input name='asset' placeholder='Asset (USDT)' required />\
-            <input name='network' placeholder='Network (ETH/TRX/...)' required />\
-            <input name='amount' placeholder='Amount' required />\
-            <input name='fee_estimate' placeholder='Fee estimate' value='0' required />\
-            <input name='destination' placeholder='Destination address / label' style='grid-column:1/3' required />\
-            <input name='reason' placeholder='Business reason for withdrawal' style='grid-column:1/3' required />\
-            <label style='grid-column:1/3'><input type='checkbox' name='confirm_checkbox' /> I confirm destination, network, amount, fee, and final received amount.</label>\
-            <input name='confirm_text' placeholder='Type CONFIRM to continue' style='grid-column:1/3' required />\
-            <button class='btn' type='submit' style='grid-column:1/3'>Submit Withdrawal Proposal</button>\
-         </form>\
-         <div style='background:#0A0E13;padding:10px;margin-top:8px'>Final received amount is calculated as Amount - Fee estimate and displayed in the proposal table below for re-check before approval/execution.</div>\
-         <div class='label' style='margin-top:12px'>Withdrawal Proposal Review</div>\
-         <table><thead><tr><th>ID</th><th>Asset</th><th>Amount</th><th>Destination</th><th>Network</th><th>Fee</th><th>Final</th><th>Reason</th><th>Status</th><th>Actions</th></tr></thead><tbody>{}</tbody></table>\
-         <div style='margin-top:8px'><form method='post' action='/withdraw/confirm/simulation'><button class='btn' type='submit'>Confirm Withdrawal (Simulation)</button></form></div>",
+        "{}{}\
+         <div style='margin-top:12px;padding:10px;background:rgba(239,68,68,.10);border:1px solid rgba(239,68,68,.35)'><strong>Simulation (Safe / Visual Only)</strong><div class='sum'>Simulation confirmation logs an audit event only. It cannot execute real withdrawals.</div><div style='margin-top:8px'><form method='post' action='/withdraw/confirm/simulation'><button class='btn' type='submit'>Record Simulation Confirmation</button></form></div></div>\
+         <div style='margin-top:12px;padding:10px;background:rgba(34,197,94,.10);border:1px solid rgba(34,197,94,.35)'>\
+            <div class='label'>Step 1 — Enter Details (Real Withdrawal)</div>\
+            <div class='sum'>Allowed destination whitelist: <code>{}</code></div>\
+            <form method='post' action='/withdraw/request' style='display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px'>\
+                <input name='asset' placeholder='Asset (USDT)' required />\
+                <input name='network' placeholder='Network (ETH/TRX/...)' required />\
+                <input name='amount' placeholder='Amount' required />\
+                <input name='fee_estimate' placeholder='Fee estimate' value='0' required />\
+                <input name='destination' placeholder='Destination address / label' style='grid-column:1/3' required />\
+                <input name='reason' placeholder='Business reason for withdrawal' style='grid-column:1/3' required />\
+                <label style='grid-column:1/3'><input type='checkbox' name='confirm_checkbox' /> I confirm destination, network, amount, fee, and final received amount.</label>\
+                <input name='confirm_text' placeholder='Type CONFIRM to continue' style='grid-column:1/3' required />\
+                <input name='confirm_large_text' placeholder='For large amounts, type: WITHDRAW LARGE' style='grid-column:1/3' />\
+                <button class='btn' type='submit' style='grid-column:1/3'>Submit Withdrawal Proposal</button>\
+            </form>\
+            <div class='sum' style='margin-top:8px'>Amount-tiered confirmation: normal confirmation for standard withdrawals, plus WITHDRAW LARGE for higher amounts.</div>\
+         </div>\
+         <div style='margin-top:12px;padding:10px;background:#0A0E13'>{}</div>",
+        flow_header,
         mode_controls,
-        proposal_rows,
         esc(&allowed_destinations),
-        withdrawal_rows,
+        review_step,
     );
 
     let context_body = format!(
         "<table class='kv'><tbody>\
             <tr><td>Current Position</td><td>{:.6}</td></tr>\
             <tr><td>Unrealized PnL</td><td>{:+.2}</td></tr>\
-            <tr><td>Network Warning</td><td class='warn'>Use exact destination chain</td></tr>\
+            <tr><td>Whitelist Check</td><td>Destination must match configured allow-list</td></tr>\
+            <tr><td>Balance Confirmation</td><td>Checked before request creation (if live client connected)</td></tr>\
+            <tr><td>Cooldown</td><td>Enforced between executed withdrawals</td></tr>\
+            <tr><td>Audit Trail</td><td>Every stage is logged: requested, approved/rejected, executed/failed</td></tr>\
           </tbody></table>",
         pos_size,
         pos_pnl_u,
     );
 
-    let details_body = "<div class='sum'>Real withdrawals require request → authority review → execute, with simulation endpoint kept separate.</div>";
+    let details_body = "<div class='sum'>Status states shown in this flow: Draft, Pending Approval, Approved, Executing, Completed, Failed, Rejected.</div>";
     let body = system_layout(
         "Funds Workspace",
         &status_body,
-        "Withdraw: Step-by-Step",
+        "Withdraw: Guided 3-Step",
         &primary_body,
-        "Withdrawal Context",
+        "Withdrawal Safety Context",
         &context_body,
         Some(("Process Notes", details_body)),
     );
