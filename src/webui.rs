@@ -161,6 +161,17 @@ async fn handle_post(path: &str, _query: &str, state: &AppState) -> String {
         return redirect_with_ok("/assistant", "Kill switch cleared.");
     }
 
+    // Dedicated withdrawal confirmation endpoint (simulation UI action).
+    // Must never route through proposal rejection logic.
+    if path == "/withdraw/confirm/simulation" {
+        log_ui_action(
+            &*state.store,
+            "ui_withdrawal_confirmed_simulation",
+            "withdrawal confirmation requested from /authority",
+        );
+        return redirect_with_ok("/authority", "Withdrawal confirmation recorded (simulation).");
+    }
+
     // POST /strategy/enable/{id} or /strategy/disable/{id}
     if let Some(rest) = path.strip_prefix("/strategy/") {
         if let Some((verb, id_str)) = rest.split_once('/') {
@@ -745,7 +756,26 @@ async fn page_assistant(state: &AppState, query: &str) -> String {
         if kill_active { "ACTIVE" } else { "OFF" },
     );
 
-    let primary_body = "<div style='display:grid;grid-template-columns:1fr 1fr;gap:8px'>        <div style='background:#0A0E13;padding:10px'>          <div class='label'>API Status</div>          <div class='sum'>Risk-aware connectivity summary for operators.</div>          <div>Market Feed <span class='ok' style='float:right'>Connected</span></div>          <div style='margin-top:6px'>Trading API <span class='warn' style='float:right'>Read-Only in DEMO</span></div>          <div style='margin-top:6px'>Webhook Auth <span class='ok' style='float:right'>Healthy</span></div>        </div>        <div style='background:#0A0E13;padding:10px'>          <div class='label'>Key Management</div>          <div>Primary Key <span class='dim' style='float:right'>••••••••••••</span></div>          <div style='margin-top:6px'>Permissions <span class='dim' style='float:right'>trade:off / read:on</span></div>          <div style='margin-top:8px'><a class='btn' href='/assistant'>Rotate Key</a> <a class='btn' href='/assistant'>Revoke</a></div>        </div>      </div>";
+    let primary_body = "<div style='display:grid;grid-template-columns:1fr 1fr;gap:8px'>\
+        <div style='background:#0A0E13;padding:10px'>\
+          <div class='label'>API Status</div>\
+          <div class='sum'>Risk-aware connectivity summary for operators.</div>\
+          <div>Market Feed <span class='ok' style='float:right'>Connected</span></div>\
+          <div style='margin-top:6px'>Trading API <span class='warn' style='float:right'>Read-Only in DEMO</span></div>\
+          <div style='margin-top:6px'>Webhook Auth <span class='ok' style='float:right'>Healthy</span></div>\
+        </div>\
+        <div style='background:#0A0E13;padding:10px'>\
+          <div class='label'>Operational Safety Actions</div>\
+          <div class='sum' style='margin-bottom:8px'>Immediate operator controls for emergency response and controlled restart.</div>\
+          <div style='display:grid;grid-template-columns:1fr 1fr;gap:8px'>\
+            <form method='post' action='/assistant/kill-switch/on'><button class='btn-reject' style='width:100%' type='submit'>Engage Kill Switch</button></form>\
+            <form method='post' action='/assistant/kill-switch/off'><button class='btn-approve' style='width:100%' type='submit'>Clear Kill Switch</button></form>\
+          </div>\
+          <form method='post' action='/assistant/system-restart' style='margin-top:8px'>\
+            <button class='btn' style='width:100%' type='submit'>System Restart</button>\
+          </form>\
+        </div>\
+      </div>";
 
     let context_rows = recent_events.iter().take(5)
         .map(|e| format!("<tr><td>{}</td><td>{}</td></tr>", e.occurred_at.format("%H:%M:%S"), esc(&summarise_event(e))))
@@ -851,21 +881,62 @@ async fn page_authority(state: &AppState, query: &str) -> String {
         proposals.len(),
     );
 
+    let mode_controls = "\
+        <div class='label'>Authority Mode Controls</div>\
+        <div class='sum'>Switch between OFF, ASSIST, and AUTO without leaving this page.</div>\
+        <div style='display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:8px'>\
+          <form method='post' action='/authority/mode/off'><button class='btn-off' style='width:100%' type='submit'>Set OFF</button></form>\
+          <form method='post' action='/authority/mode/assist'><button class='btn-assist' style='width:100%' type='submit'>Set ASSIST</button></form>\
+          <form method='post' action='/authority/mode/auto'><button class='btn-auto' style='width:100%' type='submit'>Set AUTO</button></form>\
+        </div>";
+
+    let proposal_rows = if proposals.is_empty() {
+        "<tr><td colspan='8' class='dim'>No pending proposals.</td></tr>".to_string()
+    } else {
+        proposals.iter().map(|p| {
+            format!(
+                "<tr>\
+                   <td style='font-size:11px'>{}</td>\
+                   <td>{}</td>\
+                   <td>{}</td>\
+                   <td>{:.6}</td>\
+                   <td>{:.2}</td>\
+                   <td>{:.1}s</td>\
+                   <td style='font-size:11px'>{}</td>\
+                   <td>\
+                     <div style='display:flex;gap:6px'>\
+                       <form method='post' action='/authority/approve/{}'><button class='btn-approve' type='submit'>Approve</button></form>\
+                       <form method='post' action='/authority/reject/{}'><button class='btn-reject' type='submit'>Reject</button></form>\
+                     </div>\
+                   </td>\
+                 </tr>",
+                esc(&p.id),
+                esc(&p.symbol),
+                esc(&p.side),
+                p.qty,
+                p.confidence,
+                p.ttl_remaining_secs(),
+                esc(&p.reason),
+                esc(&p.id),
+                esc(&p.id),
+            )
+        }).collect::<Vec<_>>().join("")
+    };
+
     let primary_body = format!(
-        "<div class='label'>Step 1</div><div>Choose withdrawal method</div>\
-         <div style='display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px'>\
-           <a class='btn-approve' href='/authority?method=onchain'>On-chain Wallet</a>\
-           <a class='btn' href='/authority?method=internal'>Internal Account</a>\
-         </div>\
-         <div class='label' style='margin-top:12px'>Step 2</div>\
+        "{}\
+         <div class='label' style='margin-top:12px'>Pending Proposal Review</div>\
+         <table><thead><tr><th>ID</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Confidence</th><th>TTL</th><th>Reason</th><th>Actions</th></tr></thead><tbody>{}</tbody></table>\
+         <div class='label' style='margin-top:12px'>Withdrawal Confirmation (Simulation)</div>\
          <table class='kv'><tbody>\
            <tr><td>Requested Amount</td><td>${:.2}</td></tr>\
            <tr><td>Estimated Fee</td><td>${:.2}</td></tr>\
            <tr><td>Final Amount Received</td><td><strong>${:.2}</strong></td></tr>\
          </tbody></table>\
-         <div class='label' style='margin-top:12px'>Step 3</div>\
-         <div style='background:#0A0E13;padding:10px'>Confirmation required: verify destination network and address before submitting.</div>\
-         <div style='margin-top:8px'><form method='post' action='/authority/reject/demo-confirm'><button class='btn' type='submit'>Confirm Withdrawal (Simulation)</button></form></div>",
+         <div style='background:#0A0E13;padding:10px;margin-top:8px'>Confirmation required: verify destination network and address before submitting.</div>\
+         <div style='margin-top:8px'><form method='post' action='/withdraw/confirm/simulation'><button class='btn' type='submit'>Confirm Withdrawal (Simulation)</button></form></div>",
+        mode_controls,
+        proposal_rows,
         requested_amount,
         fee,
         final_amount,
