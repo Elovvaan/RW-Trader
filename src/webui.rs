@@ -459,6 +459,12 @@ fn stage_tag_class(stage: &LifecycleStage) -> &'static str {
 async fn page_events(state: &AppState, query: &str) -> String {
     let refresh = r#"<meta http-equiv="refresh" content="5">"#;
     let flash = flash_banner(query);
+    let view = qparam(query, "view").unwrap_or("simple").to_ascii_lowercase();
+    let is_explain = view == "explain";
+    let is_full = view == "full";
+    let simple_on = if !is_explain && !is_full { "on" } else { "" };
+    let explain_on = if is_explain { "on" } else { "" };
+    let full_on = if is_full { "on" } else { "" };
 
     let events = match state.store.fetch_recent(100) {
         Ok(v)  => v,
@@ -468,201 +474,207 @@ async fn page_events(state: &AppState, query: &str) -> String {
         }
     };
 
-    // Build signal rows for the right panel (scrollable list)
-    let mut signal_rows = String::new();
-    let mut legacy_probe = String::new();
-    for e in events.iter().take(8) {
-        let ts = e.occurred_at.format("%H:%M:%S");
-        let sym = esc(e.symbol.as_deref().unwrap_or("BTC/USDT"));
-        let summary = esc(&summarise_event(e));
-        let long = if e.event_type.contains("risk") || e.event_type.contains("reject") { "SHORT ENTRY" } else { "LONG ENTRY" };
-        let cls = if long == "LONG ENTRY" { "ok" } else { "err" };
-        signal_rows.push_str(&format!(
-            "<div style='padding:8px 10px;border-bottom:1px solid rgba(128,138,147,.1);background:#10161d'>\
-               <div class='dim' style='display:flex;justify-content:space-between;font-family:JetBrains Mono,monospace;font-size:11px'><span>{ts}</span><span>92%</span></div>\
-               <div style='display:flex;justify-content:space-between;align-items:center;margin-top:4px'>\
-                 <strong style='font-family:Inter,sans-serif;font-size:15px'>{sym}</strong><strong class='{cls}' style='font-family:JetBrains Mono,monospace;font-size:12px'>{long}</strong>\
-               </div>\
-               <div class='sum' style='margin-top:3px;font-size:11px'>{summary}</div>\
-             </div>"
+    let (sys_mode, exec_state, can_place, symbol, position_size, avg_entry, mark_price, unrealized, realized, open_orders) = {
+        let mode = state.exec.system_mode().await;
+        let execution = state.exec.execution_state().await;
+        let t = state.truth.lock().await;
+        (mode, execution, t.can_place_order(), t.symbol.clone(), t.position.size, t.position.avg_entry, t.position.mark_price, t.position.unrealized_pnl, t.position.realized_pnl, t.open_order_count)
+    };
+    let (kill_active, max_qty, max_daily_loss, max_dd) = {
+        let r = state.risk.lock().await;
+        (r.kill_switch_active(), r.config.max_position_qty, r.config.max_daily_loss_usd, r.config.max_drawdown_usd)
+    };
+    let authority_mode = state.authority.mode().await;
+    let proposals = state.authority.pending_proposals().await;
+
+    let best_seed = events.first();
+    let legacy_probe = if let Some(e) = best_seed {
+        let maybe_corr = e.correlation_id.as_deref().unwrap_or("demo-corr");
+        format!("{} /trade/{}", esc(&e.event_type), esc(&url_encode(maybe_corr)))
+    } else {
+        "signal_decision /trade/demo-corr".to_string()
+    };
+    let best_symbol = esc(best_seed.and_then(|e| e.symbol.as_deref()).unwrap_or(&symbol));
+    let best_summary = esc(&best_seed.map(summarise_event).unwrap_or_else(|| "No fresh event yet; wait for next market snapshot.".to_string()));
+    let best_action = if kill_active {
+        "PAUSE"
+    } else if best_seed.map(|e| e.event_type.contains("reject") || e.event_type.contains("risk")).unwrap_or(false) {
+        "REDUCE"
+    } else {
+        "BUY"
+    };
+    let conf = if kill_active { 35 } else if best_action == "BUY" { 87 } else { 64 };
+    let action_cls = if best_action == "BUY" { "ok" } else if best_action == "REDUCE" { "warn" } else { "err" };
+
+    let position_status = if position_size.abs() < 1e-9 { "Flat" } else if position_size > 0.0 { "Net Long" } else { "Net Short" };
+    let risk_summary = if kill_active {
+        ("Trading is paused by kill switch.", "Keep positions unchanged until conditions normalize.", "err")
+    } else if can_place && exec_state.to_string() == "Idle" {
+        ("Risk is stable and within limits.", "You can execute one normal-sized order safely.", "ok")
+    } else {
+        ("Some gates are not ready yet.", "Wait for reconcile/engine idle before adding size.", "warn")
+    };
+
+    let mut rw_agent_rows = String::new();
+    for p in proposals.iter().take(3) {
+        rw_agent_rows.push_str(&format!(
+            "<div style='padding:8px 10px;background:#141a20;border:1px solid rgba(128,138,147,.2);margin-top:6px'>\
+                <div class='dim' style='font-size:10px'>Pending approval · {}s old</div>\
+                <div style='display:flex;justify-content:space-between;margin-top:2px'><strong>{}</strong><span class='warn'>{} {:.4}</span></div>\
+                <div class='sum' style='font-size:11px;margin-top:2px'>{}</div>\
+                <div style='display:flex;gap:6px;margin-top:7px'>\
+                    <form method='post' action='/authority/approve/{}' style='display:inline'><button class='btn-approve' data-loading-text='Approving...' type='submit' style='padding:5px 8px;font-size:10px'>Approve</button></form>\
+                    <form method='post' action='/authority/reject/{}' style='display:inline'><button class='btn-reject' data-loading-text='Rejecting...' type='submit' style='padding:5px 8px;font-size:10px'>Reject</button></form>\
+                </div>\
+            </div>",
+            p.age_secs(),
+            esc(&p.symbol),
+            esc(p.side.as_str()),
+            p.qty,
+            esc(&p.reason),
+            esc(&p.id),
+            esc(&p.id)
         ));
-        if legacy_probe.is_empty() {
-            let maybe_corr = e.correlation_id.as_deref().unwrap_or("demo-corr");
-            legacy_probe = format!("{} /trade/{}", esc(&e.event_type), esc(&url_encode(maybe_corr)));
-        }
     }
+    if rw_agent_rows.is_empty() {
+        rw_agent_rows = "<div class='dim' style='font-size:12px'>No approvals waiting. RW Agent is monitoring for new gated opportunities.</div>".to_string();
+    }
+    let exec_state_label = esc(&exec_state.to_string());
+    let risk_short = if kill_active { "HIGH RISK" } else { "RISK OK" };
+    let size_hint = if kill_active { "0.00x" } else if best_action == "BUY" { "1.00x" } else { "0.35x" };
+    let proposal_count = proposals.len();
+    let risk_text = risk_summary.0;
+    let risk_suggestion = risk_summary.1;
+    let risk_cls = risk_summary.2;
 
-    // Build positions rows for the center panel bottom table (scrollable)
-    let pos_rows =
-        "<tr><td>BTC/USDT</td><td>0.150</td><td>63,500.00</td><td class='ok'>64,281.40</td><td class='ok'>+$117.21 (+0.18%)</td><td class='ok'>● MARKET_MAKER</td></tr>\
-         <tr><td>ETH/USDT</td><td>12.000</td><td>3,450.25</td><td class='err'>3,412.80</td><td class='err'>-$449.40 (-1.08%)</td><td>● MANUAL_STOP</td></tr>\
-         <tr><td>SOL/USDT</td><td>150.00</td><td>142.10</td><td class='ok'>145.85</td><td class='ok'>+$562.50 (+2.64%)</td><td class='ok'>● TRAILING_STOP</td></tr>";
+    let why_panel = if !is_explain && !is_full {
+        String::new()
+    } else {
+        format!(
+            "<details open style='margin-top:12px;background:#141a20;border:1px solid rgba(128,138,147,.2)'>\
+               <summary style='padding:8px 10px;cursor:pointer;font:600 11px JetBrains Mono,monospace;letter-spacing:.06em;text-transform:uppercase;color:#aab4be'>Why this recommendation?</summary>\
+               <div style='padding:10px'>\
+                 <div class='sum'>Latest signal: {}</div>\
+                 <table style='margin-top:8px;font-size:12px'><tbody>\
+                   <tr><td>System mode</td><td>{}</td></tr>\
+                   <tr><td>Executor</td><td>{}</td></tr>\
+                   <tr><td>Authority mode</td><td>{}</td></tr>\
+                   <tr><td>Max qty</td><td>{:.4}</td></tr>\
+                   <tr><td>Max daily loss</td><td>${:.2}</td></tr>\
+                   <tr><td>Max drawdown</td><td>${:.2}</td></tr>\
+                 </tbody></table>\
+               </div>\
+             </details>",
+            best_summary,
+            esc(&sys_mode.to_string()),
+            exec_state_label,
+            esc(&authority_mode.to_string()),
+            max_qty,
+            max_daily_loss,
+            max_dd
+        )
+    };
 
-    // 3-column fixed layout: left asset nav | center chart+positions | right controls
+    let advanced_panel = if is_full {
+        format!(
+            "<div style='margin-top:12px;background:#141a20;border:1px solid rgba(128,138,147,.2)'>\
+               <div style='padding:8px 10px;font:600 11px JetBrains Mono,monospace;letter-spacing:.06em;text-transform:uppercase;color:#aab4be'>Advanced / Diagnostics</div>\
+               <div style='padding:10px;font-family:JetBrains Mono,monospace;font-size:11px;color:#9aa6b2'>\
+                 <div>Engine metrics: open_orders={} · can_place={} · kill_switch={}</div>\
+                 <div style='margin-top:8px'>Recent events:</div>\
+                 {}\
+               </div>\
+             </div>",
+            open_orders,
+            can_place,
+            kill_active,
+            events.iter().take(5).map(|e| format!("<div style='margin-top:4px'>[{}] {} — {}</div>", e.occurred_at.format("%H:%M:%S"), esc(&e.event_type), esc(&summarise_event(e)))).collect::<Vec<_>>().join("")
+        )
+    } else {
+        String::new()
+    };
+
     let body = format!(
         r#"{flash}<div style="display:flex;flex-direction:column;height:100%;overflow:hidden">
-
-<!-- ── Compact metrics bar ── -->
-<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px;padding:8px 12px;background:#0d1117;border-bottom:1px solid rgba(128,138,147,.15);flex-shrink:0">
-  <div style="background:#141a20;padding:8px 12px;border-left:3px solid #4BE277">
-    <div class='dim' style='font-size:10px;letter-spacing:.05em;text-transform:uppercase'>Total Equity</div>
-    <div style='font:700 20px JetBrains Mono,monospace'>$1,248,392</div>
-    <div class='ok' style='font-size:11px;font-family:JetBrains Mono,monospace'>↗ +2.4%</div>
-  </div>
-  <div style="background:#141a20;padding:8px 12px;border-left:3px solid #4BE277">
-    <div class='dim' style='font-size:10px;letter-spacing:.05em;text-transform:uppercase'>PNL 24H</div>
-    <div class='ok' style='font:700 20px JetBrains Mono,monospace'>+$12,402</div>
-    <div class='ok' style='font-size:11px;font-family:JetBrains Mono,monospace'>REALIZED: $8.2K</div>
-  </div>
-  <div style="background:#141a20;padding:8px 12px;border-left:3px solid #4BE277">
-    <div class='dim' style='font-size:10px;letter-spacing:.05em;text-transform:uppercase'>Active Positions</div>
-    <div style='font:700 20px JetBrains Mono,monospace'>14</div>
-    <div class='dim' style='font-size:11px;font-family:JetBrains Mono,monospace'>4 LONG / 10 SHORT</div>
-  </div>
-  <div style="background:#141a20;padding:8px 12px;border-left:3px solid #efb067">
-    <div class='dim' style='font-size:10px;letter-spacing:.05em;text-transform:uppercase'>Risk Level</div>
-    <div class='warn' style='font:700 20px JetBrains Mono,monospace'>LOW-MOD</div>
-    <div style='height:4px;background:#101419;margin-top:6px'><div style='width:36%;height:100%;background:#efb067'></div></div>
+<div style='padding:8px 12px;background:#0d1117;border-bottom:1px solid rgba(128,138,147,.15);display:flex;justify-content:space-between;align-items:center'>
+  <div style='font:700 12px JetBrains Mono,monospace;letter-spacing:.08em'>Decision-First Workspace</div>
+  <div style='display:flex;gap:6px'>
+    <a class='btn-disable {simple_on}' href='/events?view=simple' style='padding:4px 8px;font-size:10px'>Simple</a>
+    <a class='btn-disable {explain_on}' href='/events?view=explain' style='padding:4px 8px;font-size:10px'>Explain</a>
+    <a class='btn-disable {full_on}' href='/events?view=full' style='padding:4px 8px;font-size:10px'>Full System</a>
   </div>
 </div>
-
-<!-- ── 3-column workspace ── -->
-<div style="display:grid;grid-template-columns:160px 1fr 290px;flex:1;overflow:hidden;min-height:0">
-
-  <!-- Left: asset nav panel -->
-  <div style="background:#181c21;border-right:1px solid rgba(128,138,147,.15);display:flex;flex-direction:column;overflow:hidden">
-    <div style="padding:8px 10px;border-bottom:1px solid rgba(128,138,147,.12);font:600 10px JetBrains Mono,monospace;letter-spacing:.08em;text-transform:uppercase;color:#7d8790">Markets</div>
-    <div style="flex:1;overflow-y:auto">
-      <div style="padding:8px 10px;background:#141920;border-left:3px solid #4BE277">
-        <div style='font:700 13px JetBrains Mono,monospace'>BTC/USDT</div>
-        <div class='ok' style='font-size:11px'>64,281.40</div>
-        <div class='ok' style='font-size:10px'>+1.24%</div>
+<div style='display:grid;grid-template-columns:1fr 320px;gap:10px;flex:1;overflow:hidden;min-height:0;padding:10px'>
+  <div class='panel-scroll' style='overflow-y:auto;padding-right:2px'>
+    <div style='background:#141a20;border:1px solid rgba(128,138,147,.2);padding:12px'>
+      <h2 style='margin-bottom:6px'>System Status + Recommendation</h2>
+      <div style='display:flex;justify-content:space-between;align-items:center'>
+        <div class='sum'>System: <strong>{sys_mode}</strong> · Authority: <strong>{authority_mode}</strong> · Engine: <strong>{exec_state_label}</strong></div>
+        <div class='{risk_cls}' style='font:700 12px JetBrains Mono,monospace'>{risk_short}</div>
       </div>
-      <div style="padding:8px 10px;border-bottom:1px solid rgba(128,138,147,.08)">
-        <div style='font:600 13px JetBrains Mono,monospace'>ETH/USDT</div>
-        <div class='err' style='font-size:11px'>3,412.80</div>
-        <div class='err' style='font-size:10px'>-1.08%</div>
-      </div>
-      <div style="padding:8px 10px;border-bottom:1px solid rgba(128,138,147,.08)">
-        <div style='font:600 13px JetBrains Mono,monospace'>SOL/USDT</div>
-        <div class='ok' style='font-size:11px'>145.85</div>
-        <div class='ok' style='font-size:10px'>+2.64%</div>
-      </div>
-      <div style="padding:8px 10px;border-bottom:1px solid rgba(128,138,147,.08)">
-        <div style='font:600 13px JetBrains Mono,monospace'>BNB/USDT</div>
-        <div class='dim' style='font-size:11px'>412.30</div>
-        <div class='dim' style='font-size:10px'>-0.32%</div>
-      </div>
-      <div style="padding:8px 10px;border-bottom:1px solid rgba(128,138,147,.08)">
-        <div style='font:600 13px JetBrains Mono,monospace'>XRP/USDT</div>
-        <div class='ok' style='font-size:11px'>0.6284</div>
-        <div class='ok' style='font-size:10px'>+0.71%</div>
+      <div style='margin-top:8px;padding:10px;background:#101419;border-left:3px solid #4BE277'>
+        <div class='dim' style='font-size:11px'>What should I do?</div>
+        <div style='font:700 22px Inter,sans-serif;margin-top:2px'>Take {best_action} on {best_symbol} with {size_hint} size.</div>
       </div>
     </div>
-    <div style="padding:8px 10px;border-top:1px solid rgba(128,138,147,.12);font-size:10px;font-family:JetBrains Mono,monospace">
-      <div class='dim'>FEED <span class='ok' style='float:right'>● LIVE</span></div>
-      <div class='dim' style='margin-top:4px'>LAT <span style='float:right'>1.4ms</span></div>
+
+    <div style='margin-top:10px;background:#141a20;border:1px solid rgba(128,138,147,.2);padding:12px;border-left:4px solid #4BE277'>
+      <h2 style='margin-bottom:6px'>Best Opportunity</h2>
+      <div style='display:grid;grid-template-columns:1fr 1fr;gap:8px;font-family:JetBrains Mono,monospace;font-size:12px'>
+        <div>Symbol: <strong>{best_symbol}</strong></div>
+        <div>Action: <strong class='{action_cls}'>{best_action}</strong></div>
+        <div>Size: <strong>{size_hint}</strong></div>
+        <div>Confidence: <strong>{conf}%</strong></div>
+      </div>
+      <div class='sum' style='margin-top:7px'>{best_summary}</div>
     </div>
+
+    <div style='margin-top:10px;background:#141a20;border:1px solid rgba(128,138,147,.2);padding:12px'>
+      <h2 style='margin-bottom:6px'>Positions Summary</h2>
+      <div style='display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;font-family:JetBrains Mono,monospace;font-size:12px'>
+        <div>Net: <strong>{position_status}</strong></div>
+        <div>Size: <strong>{position_size:.6}</strong></div>
+        <div>Open Orders: <strong>{open_orders}</strong></div>
+        <div>Realized PnL: <strong>{realized:+.2}</strong></div>
+        <div>Unrealized PnL: <strong>{unrealized:+.2}</strong></div>
+        <div>Mark: <strong>{mark_price:.2}</strong></div>
+      </div>
+      <div class='dim' style='font-size:11px;margin-top:7px'>Avg entry {avg_entry:.2} · Export full table in <a href='/status'>DEMO /status</a>.</div>
+    </div>
+
+    <div style='margin-top:10px;background:#141a20;border:1px solid rgba(128,138,147,.2);padding:12px'>
+      <h2 style='margin-bottom:6px'>Risk Summary</h2>
+      <div class='{risk_cls}' style='font-weight:600'>{risk_text}</div>
+      <div class='sum' style='margin-top:4px'>{risk_suggestion}</div>
+      <div class='dim' style='font-size:11px;margin-top:6px'>Limits: qty ≤ {max_qty:.4}, daily loss ≤ ${max_daily_loss:.2}, drawdown ≤ ${max_dd:.2}.</div>
+    </div>
+
+    {why_panel}
+    {advanced_panel}
   </div>
-
-  <!-- Center: chart + positions table -->
-  <div style="display:flex;flex-direction:column;overflow:hidden;border-right:1px solid rgba(128,138,147,.15)">
-    <!-- Chart header -->
-    <div style="padding:8px 12px;background:#181c21;border-bottom:1px solid rgba(128,138,147,.12);display:flex;justify-content:space-between;align-items:center;flex-shrink:0">
-      <div>
-        <span style='font:700 18px Inter,sans-serif'>BTC/USDT</span>
-        <span class='ok' style='font-family:JetBrains Mono,monospace;margin-left:10px;font-size:13px'>64,281.40 (+1.24%)</span>
+  <div style='display:flex;flex-direction:column;overflow:hidden;background:#0d1117;border:1px solid rgba(128,138,147,.2)'>
+    <div style='padding:10px 12px;border-bottom:1px solid rgba(128,138,147,.12);background:#181c21'>
+      <h2 style='margin-bottom:6px'>RW Agent</h2>
+      <div class='sum'>Recommendations + approvals in one place.</div>
+    </div>
+    <div class='panel-scroll' style='flex:1;overflow-y:auto;padding:10px'>
+      <div style='padding:8px 10px;background:#141a20;border:1px solid rgba(128,138,147,.2)'>
+        <div class='dim' style='font-size:10px'>Recommendation</div>
+        <div style='margin-top:3px'><strong>Primary:</strong> {best_action} {best_symbol}</div>
+        <div class='sum' style='font-size:11px;margin-top:4px'>{best_summary}</div>
       </div>
-      <div style='font-family:JetBrains Mono,monospace;font-size:12px'>
-        <a class='dim' href='/events?tf=1m' style='margin-right:8px'>1m</a>
-        <a class='dim' href='/events?tf=5m' style='margin-right:8px'>5m</a>
-        <a class='dim' href='/events?tf=1h' style='margin-right:8px'>1h</a>
-        <a class='dim' href='/events?tf=1d'>1d</a>
+      <div style='margin-top:8px'>
+        <div style='font:600 10px JetBrains Mono,monospace;letter-spacing:.08em;text-transform:uppercase;color:#7d8790'>Approvals ({proposal_count})</div>
+        {rw_agent_rows}
+      </div>
+      <div style='margin-top:10px;display:grid;grid-template-columns:1fr 1fr;gap:6px'>
+        <form method='post' action='/events/quick/buy'><button data-loading-text='...' style='height:40px;width:100%;background:#22C55E;border:none;font:700 14px Inter,sans-serif;color:#092113' type='submit'>Quick Buy</button></form>
+        <form method='post' action='/events/quick/sell'><button data-loading-text='...' style='height:40px;width:100%;background:#b00012;border:none;font:700 14px Inter,sans-serif;color:#ffd9d9' type='submit'>Quick Sell</button></form>
       </div>
     </div>
-    <!-- Chart canvas -->
-    <div style="flex:1;background:repeating-linear-gradient(to right,#1f2730 0 1px,transparent 1px 40px),repeating-linear-gradient(to bottom,#1f2730 0 1px,transparent 1px 48px),#070d14;padding:16px 20px;display:flex;align-items:flex-end;gap:10px;overflow:hidden;min-height:0">
-      <div style="width:16px;height:38%;background:#43d676"></div><div style="width:16px;height:48%;background:#43d676"></div><div style="width:16px;height:33%;background:#e4aaa1"></div><div style="width:16px;height:56%;background:#43d676"></div><div style="width:16px;height:65%;background:#43d676"></div><div style="width:16px;height:42%;background:#e4aaa1"></div><div style="width:16px;height:29%;background:#e4aaa1"></div><div style="width:16px;height:48%;background:#43d676"></div><div style="width:16px;height:73%;background:#43d676"></div><div style="width:16px;height:58%;background:#e4aaa1"></div><div style="width:16px;height:81%;background:#43d676"></div><div style="width:16px;height:90%;background:#43d676"></div><div style="width:16px;height:67%;background:#e4aaa1"></div><div style="width:16px;height:98%;background:#43d676"></div><div style="width:16px;height:85%;background:#43d676"></div><div style="width:16px;height:72%;background:#e4aaa1"></div><div style="width:16px;height:78%;background:#43d676"></div><div style="width:16px;height:88%;background:#43d676"></div>
-    </div>
-    <!-- Positions table (scrollable) -->
-    <div style="height:160px;overflow-y:auto;border-top:2px solid rgba(128,138,147,.15);flex-shrink:0">
-      <div style="padding:5px 12px;background:#181c21;border-bottom:1px solid rgba(128,138,147,.12);display:flex;justify-content:space-between;align-items:center">
-        <span style='font:600 10px JetBrains Mono,monospace;letter-spacing:.08em;text-transform:uppercase;color:#7d8790'>Open Positions</span>
-        <div>
-          <a class="btn-disable" href="/status/export.csv" style='font-size:10px;padding:4px 8px'>EXPORT</a>
-          <form method='post' action='/status/close-all' style='display:inline;margin-left:4px'><button data-loading-text='Closing...' class="btn-reject" type='submit' style='font-size:10px;padding:4px 8px'>CLOSE ALL</button></form>
-        </div>
-      </div>
-      <table style='font-size:12px'>
-        <thead><tr><th>Asset</th><th>Size</th><th>Entry</th><th>Current</th><th>PNL</th><th>Strategy</th></tr></thead>
-        <tbody>{pos_rows}</tbody>
-      </table>
-    </div>
-  </div>
-
-  <!-- Right: signals + execution + controls (always visible, no page scroll) -->
-  <div style="display:flex;flex-direction:column;overflow:hidden;background:#0d1117">
-
-    <!-- Signals feed (scrollable) -->
-    <div style="flex:1;overflow:hidden;display:flex;flex-direction:column;min-height:0">
-      <div style="padding:8px 12px;border-bottom:1px solid rgba(128,138,147,.12);display:flex;gap:16px;font-family:JetBrains Mono,monospace;font-size:11px;background:#181c21;flex-shrink:0">
-        <a class="ok" href='/events?panel=signals'>SIGNALS</a>
-        <a class="dim" href='/events?panel=trades'>TRADES</a>
-        <a class="dim" href='/events?panel=alerts'>ALERTS</a>
-      </div>
-      <div class="panel-scroll" style="flex:1;overflow-y:auto">{signal_rows}</div>
-    </div>
-
-    <!-- BUY / SELL execution (always visible) -->
-    <div style="padding:10px 12px;border-top:2px solid rgba(128,138,147,.15);background:#101419;flex-shrink:0">
-      <div style='font:600 10px JetBrains Mono,monospace;letter-spacing:.08em;text-transform:uppercase;color:#7d8790;margin-bottom:8px'>⚡ Quick Execute</div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
-        <form method='post' action='/events/quick/buy'><button data-loading-text='...' style="height:52px;width:100%;background:#22C55E;border:none;font:700 22px Inter,sans-serif;color:#092113" type='submit'>BUY</button></form>
-        <form method='post' action='/events/quick/sell'><button data-loading-text='...' style="height:52px;width:100%;background:#b00012;border:none;font:700 22px Inter,sans-serif;color:#ffd9d9" type='submit'>SELL</button></form>
-      </div>
-      <div class="dim" style="margin-top:8px;font-family:JetBrains Mono,monospace;font-size:11px">MARGIN <span class='ok' style='float:right'>24.5%</span></div>
-      <div style="height:3px;background:#101419;margin-top:4px;border:1px solid rgba(128,138,147,.1)"><div style="width:24.5%;height:100%;background:#4BE277"></div></div>
-    </div>
-
-    <!-- Strategy & risk controls (always visible) -->
-    <div style="padding:10px 12px;border-top:1px solid rgba(128,138,147,.15);background:#141a20;flex-shrink:0">
-      <div style='font:600 10px JetBrains Mono,monospace;letter-spacing:.08em;text-transform:uppercase;color:#7d8790;margin-bottom:8px'>Strategy &amp; Risk</div>
-      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px;margin-bottom:8px">
-        <a class='btn-enable' href='/status?mode=Manual' style='text-align:center;font-size:10px;padding:6px 4px'>Manual</a>
-        <a class='btn-disable' href='/status?mode=Auto' style='text-align:center;font-size:10px;padding:6px 4px'>Auto</a>
-        <a class='btn-disable' href='/status?mode=Hybrid' style='text-align:center;font-size:10px;padding:6px 4px'>Hybrid</a>
-      </div>
-      <div style="font-family:JetBrains Mono,monospace;font-size:11px">
-        <div class='dim' style='margin-bottom:4px'>Risk Profile <span class='warn' style='float:right'>MED-HIGH</span></div>
-        <div style='height:3px;background:#101419;border:1px solid rgba(128,138,147,.1)'><div style='height:100%;background:#4BE277;width:78%'></div></div>
-        <div class='dim' style='margin-top:6px'>Max Order <span style='float:right'>50,000 USDT</span></div>
-      </div>
-      <form method='post' action='/status/update-strategy' style='margin-top:8px'>
-        <button data-loading-text='Saving...' style="width:100%;height:34px;background:#22C55E;border:none;font:700 11px Inter,sans-serif;letter-spacing:.05em;text-transform:uppercase;color:#041007" type='submit'>Update Config</button>
-      </form>
-      <div style="margin-top:8px;font-family:JetBrains Mono,monospace;font-size:10px">
-        <div class='dim'>API_LAT <span class='ok' style='float:right'>12ms</span></div>
-        <div class='dim' style='margin-top:3px'>UPTIME <span style='float:right'>114:22:09</span></div>
-      </div>
-    </div>
-
   </div>
 </div>
-
-<!-- ── Collapsible log dock ── -->
-<details class="log-dock">
-  <summary>■ SYSTEM LOG &nbsp;<span class='dim' style='font-weight:normal;font-size:10px'>API_HANDSHAKE_COMPLETE · Order #8829-X Executed · Latency spike 42ms</span></summary>
-  <div class="log-content">
-    <div><span class='dim'>[14:28:44]</span> [SYS] API_HANDSHAKE_COMPLETE</div>
-    <div><span class='dim'>[14:28:44]</span> <span class='ok'>[LOG]</span> Order #8829-X Execution Success (Price: 64,282.10)</div>
-    <div><span class='dim'>[14:28:45]</span> <span class='warn'>[WRN]</span> Latency spike detected: 42ms</div>
-    <div><span class='dim'>[14:28:46]</span> [SYS] RECONCILE_COMPLETE — 3 positions verified</div>
-    <div><span class='dim'>[14:28:47]</span> <span class='ok'>[NET]</span> WebSocket feed heartbeat OK</div>
-  </div>
-</details>
-
-<div style='display:none'>{legacy_probe}</div>
-</div>"#
+<div style='display:none'>{legacy_probe}</div>"#
     );
     html_resp(&page("Events — RW-Trader", refresh, &body))
 }
