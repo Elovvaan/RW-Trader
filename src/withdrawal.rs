@@ -38,8 +38,9 @@ impl Default for WithdrawalConfig {
 pub enum WithdrawalStatus {
     Requested,
     Approved,
+    Executing,
     Rejected,
-    Executed,
+    Completed,
     Failed,
 }
 
@@ -263,6 +264,12 @@ impl WithdrawalManager {
             }
         }
 
+        if let Some(p) = g.proposals.get_mut(id) {
+            p.status = WithdrawalStatus::Executing;
+            p.failure_reason = None;
+        }
+        drop(g);
+
         let response = if let Some(cl) = client {
             cl.request_withdrawal(&asset, amount, &destination, &network)
                 .await
@@ -271,8 +278,9 @@ impl WithdrawalManager {
             return Err("real withdrawal client unavailable in this mode".to_string());
         };
 
+        let mut g = self.inner.lock().await;
         let out = if let Some(p) = g.proposals.get_mut(id) {
-            p.status = WithdrawalStatus::Executed;
+            p.status = WithdrawalStatus::Completed;
             p.failure_reason = None;
             p.clone()
         } else {
