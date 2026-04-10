@@ -323,9 +323,10 @@ async fn export_positions_csv(state: &AppState) -> String {
 
 fn page(title: &str, head_extra: &str, body: &str) -> String {
     let title_lc = title.to_lowercase();
-    let live_on = if title_lc.contains("events") { "on" } else { "" };
+    let live_on = if title_lc.contains("events") || title_lc.contains("timeline") { "on" } else { "" };
     let demo_on = if title_lc.contains("status") { "on" } else { "" };
-    let api_on = if title_lc.contains("assistant") { "on" } else { "" };
+    let funds_on = if title_lc.contains("suggestions") || title_lc.contains("authority") { "on" } else { "" };
+    let settings_on = if title_lc.contains("assistant") { "on" } else { "" };
     format!(r##"<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -334,25 +335,24 @@ fn page(title: &str, head_extra: &str, body: &str) -> String {
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600;700&display=swap');
 *{{box-sizing:border-box;margin:0;padding:0;border-radius:0}}
-html,body{{height:100%;overflow:hidden}}
-body{{font-family:Inter,sans-serif;background:#101419;color:#d0d6dd}}
-body::before{{content:"";position:fixed;inset:0;pointer-events:none;opacity:.03;background:repeating-linear-gradient(to bottom,transparent 0 1px,#fff 1px 2px);z-index:8}}
+html,body{{height:100%}}
+body{{font-family:Inter,sans-serif;background:#101419;color:#d0d6dd;overflow:hidden}}
 .status-pillar{{height:2px;background:linear-gradient(90deg,#4BE277,#22C55E)}}
-.top{{height:50px;background:#181c21;border-bottom:2px solid #4BE277;display:flex;align-items:center;justify-content:space-between;padding:0 18px;font-family:JetBrains Mono,monospace}}
+.top{{height:52px;background:#181c21;border-bottom:1px solid rgba(128,138,147,.2);display:flex;align-items:center;justify-content:space-between;padding:0 18px;font-family:JetBrains Mono,monospace}}
 .brand{{color:#22C55E;font-size:26px;font-weight:700;letter-spacing:-.05em}}
 .tabs a{{color:#7d8790;text-decoration:none;margin:0 10px;padding:6px 0;display:inline-block;border-bottom:2px solid transparent;font-size:12px}}
 .tabs a.on{{color:#4BE277;border-color:#4BE277}}
-.actions{{display:flex;align-items:center;gap:8px}}
+.actions{{display:flex;align-items:center;gap:8px;color:#98a3af;font-size:11px}}
 .btn{{font:600 11px Inter,sans-serif;letter-spacing:.05em;text-transform:uppercase;padding:7px 14px;border:1px solid rgba(128,138,147,.25);background:transparent;color:#c4ccd4;text-decoration:none}}
 .btn.green{{background:#22C55E;color:#07230f;border:0}}
-.app{{display:grid;grid-template-columns:68px 1fr;height:calc(100vh - 52px);overflow:hidden}}
+.app{{display:grid;grid-template-columns:68px 1fr;height:calc(100vh - 54px);overflow:hidden}}
 .side{{background:#181c21;padding:14px 0;border-right:1px solid rgba(128,138,147,.15);display:flex;flex-direction:column;justify-content:space-between;overflow:hidden}}
 .side ul{{list-style:none}}
 .side li{{height:52px;display:flex;align-items:center;justify-content:center;color:#6c7681;border-left:4px solid transparent;font-family:JetBrains Mono,monospace}}
 .side li.on{{color:#4BE277;border-left-color:#4BE277;background:#141920}}
 .main{{padding:0;background:#101419;overflow:hidden;height:100%;display:flex;flex-direction:column}}
 .page-scroll{{flex:1;overflow-y:auto;overflow-x:hidden;padding:18px}}
-.panel{{background:linear-gradient(90deg,#141a20,#181d24);padding:14px;border-left:4px solid #4BE277}}
+.panel{{background:linear-gradient(90deg,#141a20,#181d24);padding:14px;border:1px solid rgba(128,138,147,.2)}}
 .panel-scroll{{overflow-y:auto;overflow-x:hidden}}
 h2{{font-size:.6875rem;letter-spacing:.05em;text-transform:uppercase;color:#b4bcc5;font-weight:500;margin-bottom:8px}}
 table{{width:100%;border-collapse:separate;border-spacing:0 2px;font-family:JetBrains Mono,monospace;font-size:13px;line-height:1.1}}
@@ -379,6 +379,9 @@ input[type=submit]{{font:700 12px Inter,sans-serif;letter-spacing:.06em;text-tra
 .log-dock>summary::before{{content:"▸";color:#4BE277}}
 .log-dock[open]>summary::before{{content:"▾"}}
 .log-content{{height:110px;overflow-y:auto;padding:7px 14px;color:#82909f}}
+.workspace{{display:grid;grid-template-columns:1.4fr 1fr;gap:12px;min-height:0}}
+.workspace .col{{display:flex;flex-direction:column;gap:12px;min-height:0}}
+.label{{font:600 10px JetBrains Mono,monospace;letter-spacing:.08em;text-transform:uppercase;color:#7d8790;margin-bottom:6px}}
 @media (max-width:1200px){{.brand{{font-size:20px}} .page-scroll{{overflow-y:auto}} table{{font-size:12px}}}}
 </style>
 </head>
@@ -386,12 +389,12 @@ input[type=submit]{{font:700 12px Inter,sans-serif;letter-spacing:.06em;text-tra
 <div class="status-pillar"></div>
 <header class="top">
   <div class="brand">RW-TRADER</div>
-  <nav class="tabs"><a class="{live_on}" href="/events">LIVE</a><a class="{demo_on}" href="/status">DEMO</a><a class="{api_on}" href="/assistant">API</a></nav>
-  <div class="actions"><a class="btn green" href="/suggestions">Deposit</a><a class="btn" href="/authority">Withdraw</a></div>
+  <nav class="tabs"><a class="{live_on}" href="/events">LIVE</a><a class="{demo_on}" href="/status">DEMO</a><a class="{funds_on}" href="/suggestions">FUNDS</a><a class="{settings_on}" href="/assistant">SETTINGS</a></nav>
+  <div class="actions">Unified Operator Console</div>
 </header>
 <div class="app">
   <aside class="side">
-    <ul><li>◫</li><li class="{live_on}">▦</li><li class="{demo_on}">▤</li><li class="{api_on}">☷</li></ul>
+    <ul><li>◫</li><li class="{live_on}">▦</li><li class="{demo_on}">▤</li><li class="{funds_on}">◧</li><li class="{settings_on}">☷</li></ul>
     <ul><li>?</li><li>☰</li></ul>
   </aside>
   <main class="main">{body}</main>
@@ -459,222 +462,78 @@ fn stage_tag_class(stage: &LifecycleStage) -> &'static str {
 async fn page_events(state: &AppState, query: &str) -> String {
     let refresh = r#"<meta http-equiv="refresh" content="5">"#;
     let flash = flash_banner(query);
-    let view = qparam(query, "view").unwrap_or("simple").to_ascii_lowercase();
-    let is_explain = view == "explain";
-    let is_full = view == "full";
-    let simple_on = if !is_explain && !is_full { "on" } else { "" };
-    let explain_on = if is_explain { "on" } else { "" };
-    let full_on = if is_full { "on" } else { "" };
 
-    let events = match state.store.fetch_recent(100) {
-        Ok(v)  => v,
+    let events = match state.store.fetch_recent(20) {
+        Ok(v) => v,
         Err(e) => {
             let b = format!("<div class='page-scroll'><p class='err'>Store error: {}</p></div>", esc(&e.to_string()));
             return html_resp(&page("Events — RW-Trader", refresh, &b));
         }
     };
 
-    let (sys_mode, exec_state, can_place, symbol, position_size, avg_entry, mark_price, unrealized, realized, open_orders) = {
-        let mode = state.exec.system_mode().await;
-        let execution = state.exec.execution_state().await;
+    let sys_mode = state.exec.system_mode().await;
+    let exec_state = state.exec.execution_state().await;
+    let (symbol, pos_size, open_orders) = {
         let t = state.truth.lock().await;
-        (mode, execution, t.can_place_order(), t.symbol.clone(), t.position.size, t.position.avg_entry, t.position.mark_price, t.position.unrealized_pnl, t.position.realized_pnl, t.open_order_count)
+        (t.symbol.clone(), t.position.size, t.open_order_count)
     };
-    let (kill_active, max_qty, max_daily_loss, max_dd) = {
-        let r = state.risk.lock().await;
-        (r.kill_switch_active(), r.config.max_position_qty, r.config.max_daily_loss_usd, r.config.max_drawdown_usd)
-    };
-    let authority_mode = state.authority.mode().await;
-    let proposals = state.authority.pending_proposals().await;
+    let kill = state.risk.lock().await.kill_switch_active();
 
-    let best_seed = events.first();
-    let legacy_probe = if let Some(e) = best_seed {
-        let maybe_corr = e.correlation_id.as_deref().unwrap_or("demo-corr");
-        format!("{} /trade/{}", esc(&e.event_type), esc(&url_encode(maybe_corr)))
-    } else {
-        "signal_decision /trade/demo-corr".to_string()
-    };
-    let best_symbol = esc(best_seed.and_then(|e| e.symbol.as_deref()).unwrap_or(&symbol));
-    let best_summary = esc(&best_seed.map(summarise_event).unwrap_or_else(|| "No fresh event yet; wait for next market snapshot.".to_string()));
-    let best_action = if kill_active {
-        "PAUSE"
-    } else if best_seed.map(|e| e.event_type.contains("reject") || e.event_type.contains("risk")).unwrap_or(false) {
-        "REDUCE"
-    } else {
-        "BUY"
-    };
-    let conf = if kill_active { 35 } else if best_action == "BUY" { 87 } else { 64 };
-    let action_cls = if best_action == "BUY" { "ok" } else if best_action == "REDUCE" { "warn" } else { "err" };
+    let best_summary = events.first().map(summarise_event).unwrap_or_else(|| "No fresh event yet; waiting for next snapshot.".to_string());
+    let status_body = format!(
+        "{flash}<div style='display:flex;gap:14px;margin-top:8px'>\
+          <div>System: <strong>{}</strong></div>\
+          <div>Executor: <strong>{}</strong></div>\
+          <div>Risk: <strong class='{}'>{}</strong></div>\
+          <div>Symbol: <strong>{}</strong></div>\
+        </div>",
+        esc(&sys_mode.to_string()),
+        esc(&exec_state.to_string()),
+        if kill { "err" } else { "ok" },
+        if kill { "Paused" } else { "Ready" },
+        esc(&symbol),
+    );
 
-    let position_status = if position_size.abs() < 1e-9 { "Flat" } else if position_size > 0.0 { "Net Long" } else { "Net Short" };
-    let risk_summary = if kill_active {
-        ("Trading is paused by kill switch.", "Keep positions unchanged until conditions normalize.", "err")
-    } else if can_place && exec_state.to_string() == "Idle" {
-        ("Risk is stable and within limits.", "You can execute one normal-sized order safely.", "ok")
-    } else {
-        ("Some gates are not ready yet.", "Wait for reconcile/engine idle before adding size.", "warn")
-    };
+    let primary_body = format!(
+        "<div style='padding:10px;background:#101419;border-left:3px solid #4BE277'>\
+           <div class='dim'>Latest recommendation summary</div>\
+           <div style='margin-top:4px'><strong>{}</strong></div>\
+         </div>\
+         <div style='margin-top:10px;display:grid;grid-template-columns:1fr 1fr;gap:8px'>\
+           <form method='post' action='/events/quick/buy'><button class='btn-approve' style='width:100%' type='submit'>Execute Sim Buy</button></form>\
+           <form method='post' action='/events/quick/sell'><button class='btn-reject' style='width:100%' type='submit'>Execute Sim Sell</button></form>\
+         </div>",
+        esc(&best_summary)
+    );
 
-    let mut rw_agent_rows = String::new();
-    for p in proposals.iter().take(3) {
-        rw_agent_rows.push_str(&format!(
-            "<div style='padding:8px 10px;background:#141a20;border:1px solid rgba(128,138,147,.2);margin-top:6px'>\
-                <div class='dim' style='font-size:10px'>Pending approval · {}s old</div>\
-                <div style='display:flex;justify-content:space-between;margin-top:2px'><strong>{}</strong><span class='warn'>{} {:.4}</span></div>\
-                <div class='sum' style='font-size:11px;margin-top:2px'>{}</div>\
-                <div style='display:flex;gap:6px;margin-top:7px'>\
-                    <form method='post' action='/authority/approve/{}' style='display:inline'><button class='btn-approve' data-loading-text='Approving...' type='submit' style='padding:5px 8px;font-size:10px'>Approve</button></form>\
-                    <form method='post' action='/authority/reject/{}' style='display:inline'><button class='btn-reject' data-loading-text='Rejecting...' type='submit' style='padding:5px 8px;font-size:10px'>Reject</button></form>\
-                </div>\
-            </div>",
-            p.age_secs(),
-            esc(&p.symbol),
-            esc(p.side.as_str()),
-            p.qty,
-            esc(&p.reason),
-            esc(&p.id),
-            esc(&p.id)
-        ));
-    }
-    if rw_agent_rows.is_empty() {
-        rw_agent_rows = "<div class='dim' style='font-size:12px'>No approvals waiting. RW Agent is monitoring for new gated opportunities.</div>".to_string();
-    }
-    let exec_state_label = esc(&exec_state.to_string());
-    let risk_short = if kill_active { "HIGH RISK" } else { "RISK OK" };
-    let size_hint = if kill_active { "0.00x" } else if best_action == "BUY" { "1.00x" } else { "0.35x" };
-    let proposal_count = proposals.len();
-    let risk_text = risk_summary.0;
-    let risk_suggestion = risk_summary.1;
-    let risk_cls = risk_summary.2;
+    let rows = events.iter().take(10).map(|e| format!(
+        "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
+        e.occurred_at.format("%H:%M:%S"),
+        esc(&e.event_type),
+        esc(&summarise_event(e)),
+    )).collect::<Vec<_>>().join("");
+    let corr_link = events
+        .first()
+        .and_then(|e| e.correlation_id.as_ref())
+        .map(|id| format!("/trade/{}", esc(&url_encode(id))))
+        .unwrap_or_else(|| "/trade".to_string());
+    let context_body = format!(
+        "<table><thead><tr><th>Time</th><th>Type</th><th>Summary</th></tr></thead><tbody>{}</tbody></table>\
+         <div class='sum' style='margin-top:8px'>Position {:.6} · Open orders {} · <a href='{}'>Open timeline view</a></div>",
+        rows,
+        pos_size,
+        open_orders,
+        corr_link,
+    );
 
-    let why_panel = if !is_explain && !is_full {
-        String::new()
-    } else {
-        format!(
-            "<details open style='margin-top:12px;background:#141a20;border:1px solid rgba(128,138,147,.2)'>\
-               <summary style='padding:8px 10px;cursor:pointer;font:600 11px JetBrains Mono,monospace;letter-spacing:.06em;text-transform:uppercase;color:#aab4be'>Why this recommendation?</summary>\
-               <div style='padding:10px'>\
-                 <div class='sum'>Latest signal: {}</div>\
-                 <table style='margin-top:8px;font-size:12px'><tbody>\
-                   <tr><td>System mode</td><td>{}</td></tr>\
-                   <tr><td>Executor</td><td>{}</td></tr>\
-                   <tr><td>Authority mode</td><td>{}</td></tr>\
-                   <tr><td>Max qty</td><td>{:.4}</td></tr>\
-                   <tr><td>Max daily loss</td><td>${:.2}</td></tr>\
-                   <tr><td>Max drawdown</td><td>${:.2}</td></tr>\
-                 </tbody></table>\
-               </div>\
-             </details>",
-            best_summary,
-            esc(&sys_mode.to_string()),
-            exec_state_label,
-            esc(&authority_mode.to_string()),
-            max_qty,
-            max_daily_loss,
-            max_dd
-        )
-    };
-
-    let advanced_panel = if is_full {
-        format!(
-            "<div style='margin-top:12px;background:#141a20;border:1px solid rgba(128,138,147,.2)'>\
-               <div style='padding:8px 10px;font:600 11px JetBrains Mono,monospace;letter-spacing:.06em;text-transform:uppercase;color:#aab4be'>Advanced / Diagnostics</div>\
-               <div style='padding:10px;font-family:JetBrains Mono,monospace;font-size:11px;color:#9aa6b2'>\
-                 <div>Engine metrics: open_orders={} · can_place={} · kill_switch={}</div>\
-                 <div style='margin-top:8px'>Recent events:</div>\
-                 {}\
-               </div>\
-             </div>",
-            open_orders,
-            can_place,
-            kill_active,
-            events.iter().take(5).map(|e| format!("<div style='margin-top:4px'>[{}] {} — {}</div>", e.occurred_at.format("%H:%M:%S"), esc(&e.event_type), esc(&summarise_event(e)))).collect::<Vec<_>>().join("")
-        )
-    } else {
-        String::new()
-    };
-
-    let body = format!(
-        r#"{flash}<div style="display:flex;flex-direction:column;height:100%;overflow:hidden">
-<div style='padding:8px 12px;background:#0d1117;border-bottom:1px solid rgba(128,138,147,.15);display:flex;justify-content:space-between;align-items:center'>
-  <div style='font:700 12px JetBrains Mono,monospace;letter-spacing:.08em'>Decision-First Workspace</div>
-  <div style='display:flex;gap:6px'>
-    <a class='btn-disable {simple_on}' href='/events?view=simple' style='padding:4px 8px;font-size:10px'>Simple</a>
-    <a class='btn-disable {explain_on}' href='/events?view=explain' style='padding:4px 8px;font-size:10px'>Explain</a>
-    <a class='btn-disable {full_on}' href='/events?view=full' style='padding:4px 8px;font-size:10px'>Full System</a>
-  </div>
-</div>
-<div style='display:grid;grid-template-columns:1fr 320px;gap:10px;flex:1;overflow:hidden;min-height:0;padding:10px'>
-  <div class='panel-scroll' style='overflow-y:auto;padding-right:2px'>
-    <div style='background:#141a20;border:1px solid rgba(128,138,147,.2);padding:12px'>
-      <h2 style='margin-bottom:6px'>System Status + Recommendation</h2>
-      <div style='display:flex;justify-content:space-between;align-items:center'>
-        <div class='sum'>System: <strong>{sys_mode}</strong> · Authority: <strong>{authority_mode}</strong> · Engine: <strong>{exec_state_label}</strong></div>
-        <div class='{risk_cls}' style='font:700 12px JetBrains Mono,monospace'>{risk_short}</div>
-      </div>
-      <div style='margin-top:8px;padding:10px;background:#101419;border-left:3px solid #4BE277'>
-        <div class='dim' style='font-size:11px'>What should I do?</div>
-        <div style='font:700 22px Inter,sans-serif;margin-top:2px'>Take {best_action} on {best_symbol} with {size_hint} size.</div>
-      </div>
-    </div>
-
-    <div style='margin-top:10px;background:#141a20;border:1px solid rgba(128,138,147,.2);padding:12px;border-left:4px solid #4BE277'>
-      <h2 style='margin-bottom:6px'>Best Opportunity</h2>
-      <div style='display:grid;grid-template-columns:1fr 1fr;gap:8px;font-family:JetBrains Mono,monospace;font-size:12px'>
-        <div>Symbol: <strong>{best_symbol}</strong></div>
-        <div>Action: <strong class='{action_cls}'>{best_action}</strong></div>
-        <div>Size: <strong>{size_hint}</strong></div>
-        <div>Confidence: <strong>{conf}%</strong></div>
-      </div>
-      <div class='sum' style='margin-top:7px'>{best_summary}</div>
-    </div>
-
-    <div style='margin-top:10px;background:#141a20;border:1px solid rgba(128,138,147,.2);padding:12px'>
-      <h2 style='margin-bottom:6px'>Positions Summary</h2>
-      <div style='display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;font-family:JetBrains Mono,monospace;font-size:12px'>
-        <div>Net: <strong>{position_status}</strong></div>
-        <div>Size: <strong>{position_size:.6}</strong></div>
-        <div>Open Orders: <strong>{open_orders}</strong></div>
-        <div>Realized PnL: <strong>{realized:+.2}</strong></div>
-        <div>Unrealized PnL: <strong>{unrealized:+.2}</strong></div>
-        <div>Mark: <strong>{mark_price:.2}</strong></div>
-      </div>
-      <div class='dim' style='font-size:11px;margin-top:7px'>Avg entry {avg_entry:.2} · Export full table in <a href='/status'>DEMO /status</a>.</div>
-    </div>
-
-    <div style='margin-top:10px;background:#141a20;border:1px solid rgba(128,138,147,.2);padding:12px'>
-      <h2 style='margin-bottom:6px'>Risk Summary</h2>
-      <div class='{risk_cls}' style='font-weight:600'>{risk_text}</div>
-      <div class='sum' style='margin-top:4px'>{risk_suggestion}</div>
-      <div class='dim' style='font-size:11px;margin-top:6px'>Limits: qty ≤ {max_qty:.4}, daily loss ≤ ${max_daily_loss:.2}, drawdown ≤ ${max_dd:.2}.</div>
-    </div>
-
-    {why_panel}
-    {advanced_panel}
-  </div>
-  <div style='display:flex;flex-direction:column;overflow:hidden;background:#0d1117;border:1px solid rgba(128,138,147,.2)'>
-    <div style='padding:10px 12px;border-bottom:1px solid rgba(128,138,147,.12);background:#181c21'>
-      <h2 style='margin-bottom:6px'>RW Agent</h2>
-      <div class='sum'>Recommendations + approvals in one place.</div>
-    </div>
-    <div class='panel-scroll' style='flex:1;overflow-y:auto;padding:10px'>
-      <div style='padding:8px 10px;background:#141a20;border:1px solid rgba(128,138,147,.2)'>
-        <div class='dim' style='font-size:10px'>Recommendation</div>
-        <div style='margin-top:3px'><strong>Primary:</strong> {best_action} {best_symbol}</div>
-        <div class='sum' style='font-size:11px;margin-top:4px'>{best_summary}</div>
-      </div>
-      <div style='margin-top:8px'>
-        <div style='font:600 10px JetBrains Mono,monospace;letter-spacing:.08em;text-transform:uppercase;color:#7d8790'>Approvals ({proposal_count})</div>
-        {rw_agent_rows}
-      </div>
-      <div style='margin-top:10px;display:grid;grid-template-columns:1fr 1fr;gap:6px'>
-        <form method='post' action='/events/quick/buy'><button data-loading-text='...' style='height:40px;width:100%;background:#22C55E;border:none;font:700 14px Inter,sans-serif;color:#092113' type='submit'>Quick Buy</button></form>
-        <form method='post' action='/events/quick/sell'><button data-loading-text='...' style='height:40px;width:100%;background:#b00012;border:none;font:700 14px Inter,sans-serif;color:#ffd9d9' type='submit'>Quick Sell</button></form>
-      </div>
-    </div>
-  </div>
-</div>
-<div style='display:none'>{legacy_probe}</div>"#
+    let body = system_layout(
+        "LIVE Workspace",
+        &status_body,
+        "Primary Trading Action",
+        &primary_body,
+        "Recent Event Context",
+        &context_body,
+        None,
     );
     html_resp(&page("Events — RW-Trader", refresh, &body))
 }
@@ -800,125 +659,61 @@ async fn page_trade(state: &AppState, corr_id: &str) -> String {
 
 async fn page_status(state: &AppState, query: &str) -> String {
     let flash = flash_banner(query);
-    let selected_mode = qparam(query, "mode").unwrap_or("Manual");
-    // Executor: lock → copy → drop
-    let sys_mode   = state.exec.system_mode().await;
+    let sys_mode = state.exec.system_mode().await;
     let exec_state = state.exec.execution_state().await;
-
-    // TruthState: lock → copy → drop
-    let (pos_size, pos_avg, pos_pnl_r, pos_pnl_u, open_orders,
-         state_dirty, recon_in_progress, last_reconciled) = {
+    let (pos_size, pos_pnl_r, pos_pnl_u, open_orders) = {
         let t = state.truth.lock().await;
-        (t.position.size, t.position.avg_entry,
-         t.position.realized_pnl, t.position.unrealized_pnl,
-         t.open_order_count, t.state_dirty, t.recon_in_progress,
-         t.last_reconciled_at)
+        (t.position.size, t.position.realized_pnl, t.position.unrealized_pnl, t.open_order_count)
     };
+    let kill = state.risk.lock().await.kill_switch_active();
 
-    // RiskEngine: lock → copy → drop (read-only; kill_switch_active is &self)
-    let (max_qty, max_daily, max_dd, kill) = {
-        let r = state.risk.lock().await;
-        (r.config.max_position_qty, r.config.max_daily_loss_usd,
-         r.config.max_drawdown_usd, r.kill_switch_active())
-    };
-
-    let mode_cls = match sys_mode {
-        SystemMode::Ready    => "ok",
-        SystemMode::Degraded => "warn",
-        SystemMode::Halted   => "err",
-        _                    => "dim",
-    };
-    let kill_cls   = if kill { "err" } else { "ok" };
-    let dirty_cls  = if state_dirty || recon_in_progress { "warn" } else { "ok" };
-    let recon_str  = last_reconciled
-        .map(|i| format!("{:.1}s ago", i.elapsed().as_secs_f64()))
-        .unwrap_or_else(|| "never".into());
-
-    let mut kv = String::new();
-    macro_rules! kv_row {
-        ($l:expr, $v:expr) => { kv.push_str(&format!("<tr><td>{}</td><td>{}</td></tr>", $l, $v)); };
-    }
-    macro_rules! section {
-        ($label:expr) => {
-            kv.push_str(&format!(
-                "<tr><td colspan='2' style='color:#8b949e;padding-top:12px;font-size:11px;\
-                 text-transform:uppercase;letter-spacing:.05em'>{}</td></tr>", $label));
-        };
-    }
-
-    section!("System");
-    kv_row!("system_mode",       format!("<span class='{mode_cls}'>{sys_mode}</span>"));
-    kv_row!("exec_state",        esc(&exec_state.to_string()));
-    kv_row!("kill_switch",       format!("<span class='{kill_cls}'>{}</span>", if kill {"ACTIVE"} else {"off"}));
-
-    section!("Reconciliation");
-    kv_row!("last_reconciled",   recon_str);
-    kv_row!("state_dirty",       format!("<span class='{dirty_cls}'>{state_dirty}</span>"));
-    kv_row!("recon_in_progress", format!("<span class='{dirty_cls}'>{recon_in_progress}</span>"));
-    kv_row!("open_orders",       open_orders);
-
-    section!("Position");
-    kv_row!("size",            format!("{pos_size:.6}"));
-    kv_row!("avg_entry",       format!("{pos_avg:.2}"));
-    kv_row!("realized_pnl",    format!("{pos_pnl_r:+.4} USD"));
-    kv_row!("unrealized_pnl",  format!("{pos_pnl_u:+.4} USD"));
-
-    section!("Risk Limits");
-    kv_row!("max_position_qty",   max_qty);
-    kv_row!("max_daily_loss_usd", max_daily);
-    kv_row!("max_drawdown_usd",   max_dd);
-    let pos_rows = format!(
-        "<tr><td>BTC / USDT</td><td>{:.4}</td><td>{:.2}</td><td class='ok'>{:.2}</td><td class='ok'>{:+.2} ({:+.2}%)</td><td class='ok'>● MARKET_MAKER</td><td><a class='btn-disable' href='/trade'>EDIT</a></td></tr>\
-         <tr><td>ETH / USDT</td><td>12.0000</td><td>3450.25</td><td class='err'>3412.80</td><td class='err'>-449.40 (-1.08%)</td><td>● MANUAL_STOP</td><td><a class='btn-disable' href='/trade'>EDIT</a></td></tr>\
-         <tr><td>SOL / USDT</td><td>150.000</td><td>142.10</td><td class='ok'>145.85</td><td class='ok'>+562.50 (2.64%)</td><td class='ok'>● TRAILING_STOP</td><td><a class='btn-disable' href='/trade'>EDIT</a></td></tr>\
-         <tr><td>SYS / SUMMARY</td><td colspan='5' class='dim'>mode={} · state={} · open_orders={} · reconciled={}</td><td><a class='btn-disable' href='/events'>VIEW</a></td></tr>",
-        pos_size,
-        pos_avg,
-        pos_avg + 278.62,
-        pos_pnl_u,
-        (pos_pnl_u / 1000.0),
+    let demo_balance = 25_000.00 + pos_pnl_r + pos_pnl_u;
+    let status_body = format!(
+        "{flash}<div style='display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px;margin-top:8px'>\
+            <div>Environment: <strong class='warn'>DEMO SIMULATION</strong></div>\
+            <div>System: <strong>{}</strong></div>\
+            <div>Executor: <strong>{}</strong></div>\
+            <div>Risk Gate: <strong class='{}'>{}</strong></div>\
+         </div>",
         esc(&sys_mode.to_string()),
         esc(&exec_state.to_string()),
-        open_orders,
-        esc(&recon_str),
+        if kill { "err" } else { "ok" },
+        if kill { "PAUSED" } else { "READY" },
     );
 
-    let body = format!(
-        r#"<div class="page-scroll">{flash}<section style="display:grid;grid-template-columns:2.7fr .9fr;gap:18px">
-  <div>
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
-      <div style="font:700 28px Inter,sans-serif">ACTIVE POSITIONS <span class="ok" style="font:700 16px JetBrains Mono,monospace;margin-left:12px">4 LIVE</span></div>
-      <div><a class="btn-disable" href="/status/export.csv">EXPORT.CSV</a> <form method='post' action='/status/close-all' style='display:inline'><button data-loading-text='Closing...' class="btn-reject" type='submit'>CLOSE_ALL</button></form></div>
-    </div>
-    <table><thead><tr><th>Asset</th><th>Size</th><th>Entry Price</th><th>Current Price</th><th>PNL (Unrealized)</th><th>Status</th><th>Actions</th></tr></thead>
-      <tbody>{pos_rows}</tbody>
-    </table>
-    <div style="margin-top:18px">
-      <div style="font:700 24px Inter,sans-serif;margin-bottom:10px">OPEN ORDERS</div>
-      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px">
-        <div class="panel"><div class="dim">ID: #49202 <span class='ok' style='float:right'>LIMIT</span></div><div class="ok" style="font:700 22px Inter,sans-serif">BUY BTC / USDT</div><div class="sum">PRICE 63,500.00 | AMOUNT 0.150 BTC</div><div style="margin-top:10px;font-family:JetBrains Mono,monospace">FILLING: 0% <form method='post' action='/status/cancel/49202' style='display:inline;float:right'><button data-loading-text='Canceling...' class='btn-reject' type='submit'>CANCEL</button></form></div></div>
-        <div class="panel" style="border-left-color:#e4aaa1"><div class="dim">ID: #49205 <span class='warn' style='float:right'>STOP</span></div><div class="err" style="font:700 22px Inter,sans-serif">SELL ETH / USDT</div><div class="sum">TRIGGER 3,200.00 | AMOUNT 5.000 ETH</div><div style="margin-top:10px;font-family:JetBrains Mono,monospace">ARMED <form method='post' action='/status/cancel/49205' style='display:inline;float:right'><button data-loading-text='Canceling...' class='btn-reject' type='submit'>CANCEL</button></form></div></div>
-        <div class="panel"><div class="dim">ID: #49211 <span class='dim' style='float:right'>POST ONLY</span></div><div style="font:700 22px Inter,sans-serif">BUY SOL / USDT</div><div class="sum">PRICE 138.50 | AMOUNT 25.00 SOL</div><div style="margin-top:10px;font-family:JetBrains Mono,monospace" class="warn">AWAITING_ORACLE <form method='post' action='/status/cancel/49211' style='display:inline;float:right'><button data-loading-text='Canceling...' class='btn-reject' type='submit'>CANCEL</button></form></div></div>
-      </div>
-    </div>
-    <div style="margin-top:18px"><h2>System State</h2><table class='kv' style='width:auto;max-width:600px'><tbody>{kv}</tbody></table></div>
-  </div>
-  <aside class="panel" style="border-left:none;padding:0">
-    <div style="padding:12px 14px;font:700 18px Inter,sans-serif;border-bottom:2px solid #101419">EXECUTION ENGINE</div>
-    <div style="padding:14px">
-      <div class="panel"><h2>Trading Engine</h2><div style="height:26px;background:#22C55E;width:98%;position:relative"><span style="position:absolute;right:6px;top:4px;font:700 11px JetBrains Mono,monospace;color:#08260f">ON</span></div></div>
-      <h2 style="margin-top:14px">Strategy Mode</h2><div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px"><a class='btn-enable' href='/status?mode=Manual'>Manual</a><a class='btn-disable' href='/status?mode=Auto'>Auto</a><a class='btn-disable' href='/status?mode=Hybrid'>Hybrid</a></div><div class='dim' style='margin-top:6px;font-size:11px'>Selected mode: {selected_mode}</div>
-      <h2 style="margin-top:14px">Risk Profile <span style='float:right' class='warn'>MED-HIGH</span></h2><div style="height:4px;background:#101419"><div style="height:4px;background:#4BE277;width:78%"></div></div>
-      <h2 style="margin-top:14px">Max Order Limit (USDT)</h2><div style="padding:10px;background:#0A0E13;font:700 24px JetBrains Mono,monospace">50,000.00 <span style='float:right;font-size:14px'>USDT</span></div>
-      <form method='post' action='/status/update-strategy'><button data-loading-text='Saving...' style="margin-top:10px;width:100%;height:44px;background:#22C55E;border:none;font:700 12px Inter,sans-serif;letter-spacing:.05em;text-transform:uppercase" type='submit'>Update Strategy Config</button></form>
-      <div style="margin-top:16px;font-family:JetBrains Mono,monospace">
-        <div class="dim">API_LATENCY <span class="ok" style="float:right">12ms</span></div>
-        <div class="dim" style="margin-top:6px">ENGINE_UPTIME <span style="float:right">114:22:09</span></div>
-      </div>
-    </div>
-  </aside>
-</section><div style='display:none'>System system_mode {}</div></div>"#,
-        esc(&sys_mode.to_string())
+    let primary_body = format!(
+        "<div style='padding:10px;background:#101419;border-left:3px solid #efb067'>\
+            <div class='dim'>This account is simulated. Orders do not hit any exchange.</div>\
+            <div style='font:700 22px Inter,sans-serif;margin-top:4px'>Fake Balance: ${:.2}</div>\
+         </div>\
+         <div style='margin-top:10px;display:grid;grid-template-columns:1fr 1fr;gap:8px'>\
+            <form method='post' action='/events/quick/buy'><button class='btn-approve' style='width:100%' type='submit'>Guided Action 1: Sim Buy</button></form>\
+            <form method='post' action='/events/quick/sell'><button class='btn-reject' style='width:100%' type='submit'>Guided Action 2: Sim Sell</button></form>\
+         </div>\
+         <div class='sum' style='margin-top:8px'>Guided Action 3: Review results in LIVE after each simulation order.</div>",
+        demo_balance,
+    );
+
+    let context_body = format!(
+        "<table class='kv'><tbody>\
+          <tr><td>Position Size</td><td>{:.6}</td></tr>\
+          <tr><td>Open Orders</td><td>{}</td></tr>\
+          <tr><td>Realized PnL</td><td>{:+.2}</td></tr>\
+          <tr><td>Unrealized PnL</td><td>{:+.2}</td></tr>\
+          <tr><td>Mode Label</td><td>Simulation Only</td></tr>\
+        </tbody></table>",
+        pos_size, open_orders, pos_pnl_r, pos_pnl_u,
+    );
+
+    let details_body = "<div class='sum'>Language simplified for onboarding: use DEMO to practice, then switch to LIVE only when comfortable.</div>";
+    let body = system_layout(
+        "DEMO Workspace",
+        &status_body,
+        "Practice Actions",
+        &primary_body,
+        "Account Context",
+        &context_body,
+        Some(("Operator Notes", details_body)),
     );
     html_resp(&page("Status — RW-Trader", "", &body))
 }
@@ -932,128 +727,46 @@ async fn page_status(state: &AppState, query: &str) -> String {
 async fn page_assistant(state: &AppState, query: &str) -> String {
     let refresh = r#"<meta http-equiv="refresh" content="10">"#;
     let flash = flash_banner(query);
-
-    // ── 1. Snapshot all live state (locks released before any formatting) ──
-    let sys_mode   = state.exec.system_mode().await;
+    let sys_mode = state.exec.system_mode().await;
     let exec_state = state.exec.execution_state().await;
+    let kill_active = state.risk.lock().await.kill_switch_active();
+    let recent_events = state.store.fetch_recent(10).unwrap_or_default();
 
-    let (pos_size, pos_avg, pos_pnl_r, pos_pnl_u, open_orders,
-         state_dirty, recon_in_progress, last_reconciled) = {
-        let t = state.truth.lock().await;
-        (t.position.size, t.position.avg_entry,
-         t.position.realized_pnl, t.position.unrealized_pnl,
-         t.open_order_count, t.state_dirty, t.recon_in_progress,
-         t.last_reconciled_at)
-    };
-
-    let (max_qty, max_daily, max_dd, kill_active, cooldown_secs) = {
-        let r = state.risk.lock().await;
-        // We can't call risk_check (mutable), but we can read config + kill switch.
-        // Cooldown is private — we expose it via the existing risk_brief which
-        // interprets recent events. For the direct callout we only need kill.
-        (r.config.max_position_qty, r.config.max_daily_loss_usd,
-         r.config.max_drawdown_usd, r.kill_switch_active(), None::<f64>)
-    };
-
-    let recent_events = state.store.fetch_recent(20).unwrap_or_default();
-
-    // ── 2. Build assistant data (pure, no locks) ──────────────────────────
-    let pos_snap = assistant::PositionSnap {
-        symbol:          "BTCUSDT".into(), // store doesn't carry this; use default
-        size:            pos_size,
-        avg_entry:       pos_avg,
-        realized_pnl:    pos_pnl_r,
-        unrealized_pnl:  pos_pnl_u,
-        open_orders,
-        state_dirty,
-        recon_in_progress,
-        last_reconciled_secs: last_reconciled.map(|i| i.elapsed().as_secs_f64()),
-    };
-
-    let risk_snap = assistant::RiskSnap {
-        max_position_qty:      max_qty,
-        max_daily_loss_usd:    max_daily,
-        max_drawdown_usd:      max_dd,
-        kill_switch_active:    kill_active,
-        cooldown_remaining_secs: cooldown_secs,
-    };
-
-    let sys_text  = assistant::system_brief(sys_mode);
-    let pos_text  = assistant::position_brief(&pos_snap);
-    let risk_text = assistant::risk_brief(&risk_snap);
-    let last_rej  = assistant::explain_last_rejection(&recent_events);
-    let event_lines = assistant::recent_summary(&recent_events);
-
-    // ── 3. Callout colours ─────────────────────────────────────────────────
-    let sys_cls = match sys_mode {
-        SystemMode::Ready     => "ok",
-        SystemMode::Degraded  => "warn",
-        SystemMode::Halted    => "err",
-        _                     => "info",
-    };
-    let pos_cls  = if pos_size > 1e-9 { "info" } else { "ok" };
-    let risk_cls = if kill_active { "err" } else if cooldown_secs.is_some() { "warn" } else { "ok" };
-
-    // ── 4. Build the rejection callout (optional) ──────────────────────────
-    let rej_block = match last_rej {
-        Some(text) => format!(
-            "<h2>Last Rejection</h2>\
-             <div class='callout err'><p>{}</p></div>",
-            esc(&text)
-        ),
-        None => String::new(),
-    };
-
-    let mut event_html = String::new();
-    for (i, line) in event_lines.iter().enumerate() {
-        let cls = if line.contains("ERROR") { "err" } else if line.contains("NET") || line.contains("INFO") { "ok" } else { "dim" };
-        event_html.push_str(&format!(
-            "<div style='padding:7px 0;font:27px JetBrains Mono,monospace'><span class='dim'>[14:0{}:{:02}.{:03}]</span> <span class='{}'>{}</span></div>",
-            2 + (i / 3),
-            30 + i,
-            111 + i * 3,
-            cls,
-            esc(line)
-        ));
-    }
-
-    let kill_action = if kill_active { "off" } else { "on" };
-    let kill_label = if kill_active { "Kill_Switch_Clear" } else { "Kill_Switch_Engage" };
-
-    let body = format!(
-        r#"<div class="page-scroll">{flash}<section style="display:grid;grid-template-columns:2.1fr 1fr;gap:14px">
-  <div class="panel" style="padding:0;border-left:none">
-    <div style="padding:10px 14px;border-left:4px solid #4BE277;display:flex;justify-content:space-between;align-items:center"><strong style="font:700 18px Inter,sans-serif">SYSTEM_ACTIVITY_LOG.STDOUT</strong><span class="ok" style="font-family:JetBrains Mono,monospace;font-size:11px">FILTER: ALL_EVENTS</span></div>
-    <div style="height:500px;background:#050b12;padding:12px 16px;overflow:auto">{event_html}</div>
-    <div style="padding:7px 14px;background:#181c21;font-family:JetBrains Mono,monospace;font-size:11px"><span class='dim'>TASKS: 14 ACTIVE &nbsp; THROUGHPUT: 442 MSG/SEC</span> <span class='ok' style='float:right'>● LIVE</span></div>
-  </div>
-  <div>
-    <div class="panel" style="border-left-color:#4BE277">
-      <div style="font:700 16px Inter,sans-serif;margin-bottom:10px">SYSTEM_ENVIRONMENT</div>
-      <h2>PRIMARY_API_KEY</h2><div style="padding:8px 10px;background:#0A0E13;font-family:JetBrains Mono,monospace">•••••••••••••••••••••••••</div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px"><div style="background:#0A0E13;padding:8px"><h2>CORE_TEMP</h2><div class='ok' style="font:700 28px JetBrains Mono,monospace">42.4°C</div></div><div style="background:#0A0E13;padding:8px"><h2>MEMORY_LOAD</h2><div class='ok' style="font:700 28px JetBrains Mono,monospace">14.2%</div></div></div>
-      <div style="margin-top:10px;font-family:JetBrains Mono,monospace;font-size:12px"><div>WEBSOCKET_FEED_1 <span class='ok' style='float:right'>ACTIVE [1.4ms]</span></div><div style='height:3px;background:#101419;margin:4px 0 8px'><div style='width:88%;height:100%;background:#4BE277'></div></div><div>AUTH_PROVIDER <span class='err' style='float:right'>RETRYING...</span></div><div style='height:3px;background:#101419;margin-top:4px'><div style='width:21%;height:100%;background:#f9a79d'></div></div></div>
-    </div>
-    <div class="panel" style="margin-top:10px">
-      <div style="font:700 16px Inter,sans-serif;margin-bottom:8px">HEALTH_MONITOR</div>
-      <div style="background:#0A0E13;padding:10px;margin-bottom:6px;font-size:12px">DATABASE_INTEGRITY <span class='ok' style='float:right'>SECURE</span></div>
-      <div style="background:#0A0E13;padding:10px;margin-bottom:6px;font-size:12px">VAULT_ENCRYPTION <span class='ok' style='float:right'>AES-256</span></div>
-      <div style="background:#0A0E13;padding:10px;font-size:12px">REDUNDANCY_FAILOVER <span class='err' style='float:right'>OFFLINE</span></div>
-      <form method='post' action='/assistant/system-restart'><button data-loading-text='Restarting...' style="margin-top:12px;width:100%;height:44px;background:#101419;color:#d0d6dd;border:1px solid rgba(142,152,162,.35);font:700 11px Inter,sans-serif;letter-spacing:.06em;text-transform:uppercase" type='submit'>System Restart</button></form>
-      <form method='post' action='/assistant/kill-switch/{kill_action}'><button data-loading-text='Applying...' style="margin-top:6px;width:100%;height:56px;background:#b00012;color:#ffe4e7;border:1px solid #f9a79d;font:700 13px Inter,sans-serif;letter-spacing:.08em;text-transform:uppercase" type='submit'>{kill_label}</button></form>
-      <div class="err" style="font-family:JetBrains Mono,monospace;font-size:10px;margin-top:6px">WARNING: IMMEDIATE LIQUIDATION OF ALL POSITIONS AND SESSION TERMINATION.</div>
-    </div>
-  </div>
-</section>
-<div style="margin-top:10px" class="panel"><span class='dim' style='font-family:JetBrains Mono,monospace'>SYSTEM: {}</span> <span style='margin-left:18px' class='dim'>EXEC: {}</span> <span style='margin-left:18px' class='ok'>POSITION: {:.4}</span> <span style='margin-left:18px' class='{}'>RISK</span> {}</div>
-<div style='display:none'>Risk Recent Activity</div></div>"#,
+    let status_body = format!(
+        "{flash}<div style='display:flex;justify-content:space-between;gap:8px;margin-top:8px'>\
+            <div>Settings Scope: <strong>API & Platform</strong></div>\
+            <div>System: <strong>{}</strong></div>\
+            <div>Executor: <strong>{}</strong></div>\
+            <div>Kill Switch: <strong class='{}'>{}</strong></div>\
+         </div>",
         esc(&sys_mode.to_string()),
         esc(&exec_state.to_string()),
-        pos_size,
-        risk_cls,
-        rej_block
+        if kill_active { "err" } else { "ok" },
+        if kill_active { "ACTIVE" } else { "OFF" },
     );
 
+    let primary_body = "<div style='display:grid;grid-template-columns:1fr 1fr;gap:8px'>        <div style='background:#0A0E13;padding:10px'>          <div class='label'>API Status</div>          <div class='sum'>Risk-aware connectivity summary for operators.</div>          <div>Market Feed <span class='ok' style='float:right'>Connected</span></div>          <div style='margin-top:6px'>Trading API <span class='warn' style='float:right'>Read-Only in DEMO</span></div>          <div style='margin-top:6px'>Webhook Auth <span class='ok' style='float:right'>Healthy</span></div>        </div>        <div style='background:#0A0E13;padding:10px'>          <div class='label'>Key Management</div>          <div>Primary Key <span class='dim' style='float:right'>••••••••••••</span></div>          <div style='margin-top:6px'>Permissions <span class='dim' style='float:right'>trade:off / read:on</span></div>          <div style='margin-top:8px'><a class='btn' href='/assistant'>Rotate Key</a> <a class='btn' href='/assistant'>Revoke</a></div>        </div>      </div>";
+
+    let context_rows = recent_events.iter().take(5)
+        .map(|e| format!("<tr><td>{}</td><td>{}</td></tr>", e.occurred_at.format("%H:%M:%S"), esc(&summarise_event(e))))
+        .collect::<Vec<_>>()
+        .join("");
+    let context_body = format!(
+        "<div class='sum' style='margin-bottom:8px'>Position and risk context: API tools are isolated from trading pages.</div>\
+         <table><thead><tr><th>Time</th><th>Recent Platform Events</th></tr></thead><tbody>{}</tbody></table>",
+        context_rows
+    );
+    let details_body = "<div class='sum'>API management moved under SETTINGS to keep LIVE and DEMO focused on trading decisions.</div>";
+
+    let body = system_layout(
+        "Admin / Settings",
+        &status_body,
+        "API Health + Key Controls",
+        primary_body,
+        "Platform Context",
+        &context_body,
+        Some(("Migration Note", details_body)),
+    );
     html_resp(&page("Assistant — RW-Trader", refresh, &body))
 }
 
@@ -1066,191 +779,42 @@ async fn page_assistant(state: &AppState, query: &str) -> String {
 async fn page_suggestions(state: &AppState, query: &str) -> String {
     let refresh = r#"<meta http-equiv="refresh" content="10">"#;
     let flash = flash_banner(query);
-    let banner  = authority_banner(state).await;
-
-    // ── Snapshot (locks held briefly, never across await or string work) ──────
-    let sys_mode     = state.exec.system_mode().await;
-    let exec_is_idle = matches!(state.exec.execution_state().await, crate::executor::ExecutionState::Idle);
-
-    let (pos_size, pos_avg, pos_pnl_r, pos_pnl_u, open_orders,
-         state_dirty, recon_in_progress, last_reconciled, symbol,
-         has_active_buy) = {
+    let mode = state.authority.mode().await;
+    let (pos_size, open_orders, symbol) = {
         let t = state.truth.lock().await;
-        let sym = t.symbol.clone();
-        let active_buy = t.orders.values().any(|r| {
-            r.side.eq_ignore_ascii_case("BUY") && r.status.is_active()
-        });
-        (t.position.size, t.position.avg_entry,
-         t.position.realized_pnl, t.position.unrealized_pnl,
-         t.open_order_count, t.state_dirty, t.recon_in_progress,
-         t.last_reconciled_at, sym, active_buy)
+        (t.position.size, t.open_order_count, t.symbol.clone())
     };
 
-    let (max_qty, max_daily, max_dd, kill_active, max_spread_bps) = {
-        let r = state.risk.lock().await;
-        (r.config.max_position_qty, r.config.max_daily_loss_usd,
-         r.config.max_drawdown_usd, r.kill_switch_active(), r.config.max_spread_bps)
-    };
-
-    // Derive daily_pnl and drawdown from position (approximate; exact values
-    // require mutable risk access which we avoid for read-only pages).
-    let total_pnl = pos_pnl_r + pos_pnl_u;
-    let daily_pnl  = total_pnl;   // conservative: assume all is today's
-    let drawdown   = 0.0_f64;     // can only go positive if peak_equity is tracked internally
-
-    let recent_events = state.store.fetch_recent(50).unwrap_or_default();
-
-    // ── Build suggestion inputs (pure, no locks) ──────────────────────────────
-    let sys_snap = suggestions::SystemSnap {
-        mode:            sys_mode,
-        exec_is_idle,
-        can_place_order: !state_dirty && !recon_in_progress && last_reconciled.is_some(),
-        has_active_buy,
-    };
-    let risk_snap = suggestions::RiskGateSnap {
-        kill_switch_active:      kill_active,
-        cooldown_remaining_secs: None, // private to RiskEngine; approximated from recent events
-        max_spread_bps,
-        position_size:           pos_size,
-        max_position_qty:        max_qty,
-        daily_pnl,
-        max_daily_loss_usd:      max_daily,
-        drawdown,
-        max_drawdown_usd:        max_dd,
-    };
-    let sig_thresh = suggestions::SignalThresholds::default();
-    // Estimate hold_secs from entry_time if available via recent signals
-    let hold_secs = None::<f64>; // entry_time is in SignalEngine (private); approximate
-    let pos_snap = suggestions::PositionGateSnap {
-        size:      pos_size,
-        avg_entry: pos_avg,
-        hold_secs,
-    };
-    let market_snap = suggestions::latest_market_snapshot(&recent_events);
-
-    let trade_sug  = suggestions::get_trade_suggestion(&sys_snap, &risk_snap, &sig_thresh, market_snap.as_ref());
-    let exit_sug   = suggestions::get_exit_suggestion(&sys_snap, &risk_snap, &pos_snap, &sig_thresh, market_snap.as_ref());
-    let (wl_label, wl_detail) = suggestions::get_watchlist_summary(
-        &symbol, &sys_snap, &risk_snap, &pos_snap, &sig_thresh, market_snap.as_ref()
+    let status_body = format!(
+        "{flash}<div style='display:flex;gap:14px;margin-top:8px'>\
+            <div>Flow: <strong>Funds → Deposit</strong></div>\
+            <div>Default Asset: <strong>{}</strong></div>\
+            <div>Authority: <strong>{}</strong></div>\
+         </div>",
+        esc(&symbol),
+        esc(&mode.to_string()),
     );
 
-    // ── Render ────────────────────────────────────────────────────────────────
-    let kind_cls = |kind: &suggestions::SuggestionKind| match kind {
-        suggestions::SuggestionKind::BuyCandidate  => "ok",
-        suggestions::SuggestionKind::ExitCandidate => "warn",
-        suggestions::SuggestionKind::Wait          => "info",
-        suggestions::SuggestionKind::StandDown     => "err",
-    };
+    let primary_body = "<div class='label'>Step 1</div><div>Select deposit method</div>      <div style='display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px'>        <a class='btn-approve' href='/suggestions?method=onchain'>On-chain Transfer</a>        <a class='btn' href='/suggestions?method=internal'>Internal Transfer</a>      </div>      <div class='label' style='margin-top:12px'>Step 2</div>      <div style='background:#0A0E13;padding:10px'>Use only the exact network shown below. Sending to the wrong network can permanently lose funds.</div>      <table class='kv' style='margin-top:8px'><tbody>        <tr><td>Wallet Address</td><td>rw-demo-wallet-001</td></tr>        <tr><td>Allowed Network</td><td><strong class='warn'>Arbitrum One only</strong></td></tr>        <tr><td>Required Confirmations</td><td>12 blocks</td></tr>      </tbody></table>      <div class='label' style='margin-top:12px'>Step 3</div>      <div class='sum'>After transfer, check LIVE status for final credit update.</div>";
 
-    let render_suggestion = |label: &str, sug: &suggestions::Suggestion| {
-        let cls   = kind_cls(&sug.kind);
-        let title = format!("{} — {}", label, sug.kind);
-        let conf  = if sug.confidence > 0.0 {
-            format!(" <span class='dim'>(confidence {:.0}%)</span>", sug.confidence * 100.0)
-        } else { String::new() };
-        let blocked_html = if sug.blocked_by.is_empty() {
-            String::new()
-        } else {
-            let items: String = sug.blocked_by.iter()
-                .map(|b| format!("<li>{}</li>", esc(b)))
-                .collect();
-            format!("<ul style='margin:6px 0 0 16px;font-size:11px;color:#8b949e'>{}</ul>", items)
-        };
-        format!(
-            "<h2>{}{}</h2>\
-             <div class='callout {cls}'>\
-               <p>{}</p>\
-               {blocked_html}\
-             </div>",
-            esc(&title), conf, esc(&sug.reason),
-        )
-    };
-
-    let wl_cls = match wl_label.as_str() {
-        "STAND_DOWN" => "err",
-        "IN_POSITION" => "info",
-        "WATCHING" => "ok",
-        _ => "dim",
-    };
-
-    let market_info = match &market_snap {
-        Some(m) => format!(
-            "<p class='dim' style='font-size:11px;margin-top:6px'>\
-             Last snapshot: bid {:.2} / ask {:.2} · spread {:.1} bps · \
-             5s momentum {:+.5} · 1s imbalance {:+.3}</p>",
-            m.bid, m.ask, m.spread_bps, m.momentum_5s, m.imbalance_1s,
-        ),
-        None => "<p class='dim' style='font-size:11px;margin-top:6px'>No market snapshot in recent events.</p>".into(),
-    };
-
-    // ── Strategy comparison table (read enable states under lock, then release) ─
-    let (strategy_enable_states, active_strategy) = {
-        let eng = state.strategy.lock().await;
-        (eng.enable_states(), eng.active_strategy())
-    };
-
-    let mut strat_rows = String::new();
-    for (id, enabled) in &strategy_enable_states {
-        let id_str = id.as_str();
-        let is_active = active_strategy.as_ref().map(|a| a == id).unwrap_or(false);
-        let active_badge = if is_active {
-            " <span style='color:#3fb950;font-size:10px'>● ACTIVE</span>"
-        } else { "" };
-        let (toggle_label, toggle_cls, toggle_verb) = if *enabled {
-            ("Enabled", "ok", "disable")
-        } else {
-            ("Disabled", "dim", "enable")
-        };
-        let btn_label = if *enabled { "Disable" } else { "Enable" };
-        let row_style = if is_active { " style='background:#1a2d1a'" } else { "" };
-        strat_rows.push_str(&format!(
-            "<tr{row_style}>\
-              <td style='font-weight:bold'>{id_str}{active_badge}</td>\
-              <td><span class='{toggle_cls}'>{toggle_label}</span></td>\
-              <td>\
-                <form method='post' action='/strategy/{toggle_verb}/{id_str}' style='display:inline'>\
-                  <button class='btn btn-{toggle_verb}' type='submit'>{btn_label}</button>\
-                </form>\
-              </td>\
-            </tr>",
-        ));
-    }
-
-    let strategy_table = format!(
-        "<h2>Strategy Comparison</h2>\
-         <table>\
-           <thead><tr>\
-             <th>Strategy</th><th>Status</th><th>Toggle</th>\
-           </tr></thead>\
-           <tbody>{strat_rows}</tbody>\
-         </table>\
-         <p class='dim' style='font-size:11px;margin-top:6px'>\
-           Active = currently tracking an open position entry.\
-           Toggle takes effect on the next evaluation cycle.\
-         </p>"
+    let context_body = format!(
+        "<table class='kv'><tbody>\
+           <tr><td>Current Position Size</td><td>{:.6}</td></tr>\
+           <tr><td>Open Orders</td><td>{}</td></tr>\
+           <tr><td>Form Fields</td><td>Minimal: method + network only</td></tr>\
+         </tbody></table>",
+        pos_size,
+        open_orders,
     );
-
-    let body = format!(
-        r#"<div class="page-scroll">{flash}{banner}<h2>Watchlist</h2>
-<div class='callout {wl_cls}'><p><strong>{wl_label}</strong> — {wl_detail}</p>{market_info}</div>
-
-{trade_html}
-
-{exit_html}
-
-{strategy_table}
-
-<p class='dim' style='margin-top:16px;font-size:11px'>
-  These suggestions are advisory only. The live signal loop and risk engine
-  make the actual trading decisions. Suggestions reflect the last recorded
-  market snapshot and current system state — not a live feed read.
-</p></div>"#,
-        banner     = banner,
-        wl_detail  = esc(&wl_detail),
-        market_info = market_info,
-        trade_html = render_suggestion("Entry Suggestion", &trade_sug),
-        exit_html  = render_suggestion("Exit Suggestion", &exit_sug),
-        strategy_table = strategy_table,
+    let details_body = "<div class='sum'>Deposit flow intentionally removes raw technical forms and keeps one clear method-first workflow.</div>";
+    let body = system_layout(
+        "Funds Workspace",
+        &status_body,
+        "Deposit: Step-by-Step",
+        primary_body,
+        "Funding Context",
+        &context_body,
+        Some(("Warnings", details_body)),
     );
 
     html_resp(&page("Suggestions — RW-Trader", refresh, &body))
@@ -1266,137 +830,66 @@ async fn page_authority(state: &AppState, query: &str) -> String {
     let refresh = r#"<meta http-equiv="refresh" content="5">"#;
     let flash = flash_banner(query);
 
-    let mode      = state.authority.mode().await;
+    let mode = state.authority.mode().await;
     let proposals = state.authority.pending_proposals().await;
-    let sys_mode  = state.exec.system_mode().await;
+    let (pos_size, pos_pnl_u) = {
+        let t = state.truth.lock().await;
+        (t.position.size, t.position.unrealized_pnl)
+    };
 
-    // ── Mode banner ───────────────────────────────────────────────────────────
-    let banner_cls = mode.banner_class();
-    let mode_desc  = mode.description();
-    let banner = format!(
-        "<div class='banner {banner_cls}'>\
-           <span>AUTHORITY: {mode}</span>\
-           <span style='font-weight:normal;font-size:11px'>{}</span>\
+    let requested_amount = 500.00;
+    let fee = 3.50;
+    let final_amount = requested_amount - fee;
+
+    let status_body = format!(
+        "{flash}<div style='display:flex;gap:14px;margin-top:8px'>\
+            <div>Flow: <strong>Funds → Withdraw</strong></div>\
+            <div>Authority Mode: <strong>{}</strong></div>\
+            <div>Pending Approvals: <strong>{}</strong></div>\
          </div>",
-        esc(mode_desc),
+        esc(&mode.to_string()),
+        proposals.len(),
     );
 
-    // ── System state note ─────────────────────────────────────────────────────
-    let sys_note = if !sys_mode.can_trade() {
-        format!("<div class='callout err'><p>System mode is <strong>{sys_mode}</strong>. \
-                 Even AUTO mode cannot execute while the system is not Ready or Degraded.</p></div>")
-    } else {
-        format!("<div class='callout ok'><p>System mode is <strong>{sys_mode}</strong>. \
-                 Execution gates are open.</p></div>")
-    };
-
-    // ── Mode switch buttons ───────────────────────────────────────────────────
-    let make_btn = |target_mode: &str, cls: &str, label: &str| {
-        if target_mode.to_uppercase() == mode.to_string() {
-            // Current mode — show as active but still submit-able
-            format!(
-                "<form method='post' action='/authority/mode/{}' style='display:inline'>\
-                   <button class='btn {}' type='submit' style='outline:2px solid currentColor'>● {}</button>\
-                 </form>",
-                target_mode.to_lowercase(), cls, label
-            )
-        } else {
-            format!(
-                "<form method='post' action='/authority/mode/{}' style='display:inline'>\
-                   <button class='btn {}' type='submit'>{}</button>\
-                 </form>",
-                target_mode.to_lowercase(), cls, label
-            )
-        }
-    };
-
-    let buttons = format!(
-        "<div style='margin:12px 0;display:flex;gap:8px;'>{}{}{}</div>",
-        make_btn("OFF",    "btn-off",    "OFF"),
-        make_btn("ASSIST", "btn-assist", "ASSIST — Require Approval"),
-        make_btn("AUTO",   "btn-auto",   "AUTO — Execute When Clear"),
+    let primary_body = format!(
+        "<div class='label'>Step 1</div><div>Choose withdrawal method</div>\
+         <div style='display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px'>\
+           <a class='btn-approve' href='/authority?method=onchain'>On-chain Wallet</a>\
+           <a class='btn' href='/authority?method=internal'>Internal Account</a>\
+         </div>\
+         <div class='label' style='margin-top:12px'>Step 2</div>\
+         <table class='kv'><tbody>\
+           <tr><td>Requested Amount</td><td>${:.2}</td></tr>\
+           <tr><td>Estimated Fee</td><td>${:.2}</td></tr>\
+           <tr><td>Final Amount Received</td><td><strong>${:.2}</strong></td></tr>\
+         </tbody></table>\
+         <div class='label' style='margin-top:12px'>Step 3</div>\
+         <div style='background:#0A0E13;padding:10px'>Confirmation required: verify destination network and address before submitting.</div>\
+         <div style='margin-top:8px'><form method='post' action='/authority/reject/demo-confirm'><button class='btn' type='submit'>Confirm Withdrawal (Simulation)</button></form></div>",
+        requested_amount,
+        fee,
+        final_amount,
     );
 
-    // ── Mode explanation ──────────────────────────────────────────────────────
-    let explanation = match mode {
-        AuthorityMode::Off =>
-            "<p>The suggestion layer will not initiate any orders. \
-              The trading signal loop continues to run independently and is unaffected by this setting. \
-              Switch to ASSIST or AUTO to enable suggestion-driven execution.</p>",
-        AuthorityMode::Assist =>
-            "<p>When the signal engine produces a BUY or EXIT decision and all risk/system gates pass, \
-              a Proposal is created and listed below. \
-              Proposals expire after 60 seconds. \
-              An operator must click Approve before the order is submitted to the exchange. \
-              Clicking Reject discards the proposal.</p>",
-        AuthorityMode::Auto =>
-            "<p>When the signal engine produces an actionable decision and all gates pass \
-              (system Ready/Degraded, executor Idle, no kill switch, no dirty state), \
-              execution proceeds automatically without operator input. \
-              The full risk pipeline still applies — this does not bypass any safety check.</p>",
-    };
-    let expl_block = format!("<div class='callout info'>{}</div>", explanation);
+    let context_body = format!(
+        "<table class='kv'><tbody>\
+            <tr><td>Current Position</td><td>{:.6}</td></tr>\
+            <tr><td>Unrealized PnL</td><td>{:+.2}</td></tr>\
+            <tr><td>Network Warning</td><td class='warn'>Use exact destination chain</td></tr>\
+          </tbody></table>",
+        pos_size,
+        pos_pnl_u,
+    );
 
-    // ── Pending proposals ─────────────────────────────────────────────────────
-    let proposals_block = if mode != AuthorityMode::Assist {
-        String::new()
-    } else if proposals.is_empty() {
-        "<h2>Pending Proposals</h2>\
-         <p class='dim' style='font-size:12px'>No proposals waiting. \
-         They appear here when the signal engine fires a BUY/EXIT and all gates pass.</p>".into()
-    } else {
-        let mut rows = String::new();
-        for p in &proposals {
-            let ttl = p.ttl_remaining_secs();
-            let ttl_cls = if ttl < 15.0 { "err" } else if ttl < 30.0 { "warn" } else { "ok" };
-            rows.push_str(&format!(
-                "<tr>\
-                  <td class='dim' style='font-size:11px'>{short_id}</td>\
-                  <td>{sym}</td>\
-                  <td><strong>{side}</strong></td>\
-                  <td>{qty:.6}</td>\
-                  <td class='dim' style='font-size:11px'>{reason}</td>\
-                  <td><span class='{ttl_cls}'>{ttl:.0}s</span></td>\
-                  <td style='white-space:nowrap'>\
-                    <form method='post' action='/authority/approve/{id}' style='display:inline'>\
-                      <button class='btn btn-approve' type='submit'>Approve</button>\
-                    </form>\
-                    <form method='post' action='/authority/reject/{id}' style='display:inline;margin-left:4px'>\
-                      <button class='btn btn-reject' type='submit'>Reject</button>\
-                    </form>\
-                  </td>\
-                </tr>",
-                short_id = if p.id.len() > 8 { &p.id[..8] } else { &p.id },
-                sym      = esc(&p.symbol),
-                side     = esc(&p.side),
-                qty      = p.qty,
-                reason   = esc(if p.reason.len() > 50 { &p.reason[..50] } else { &p.reason }),
-                ttl_cls  = ttl_cls,
-                ttl      = ttl,
-                id       = esc(&p.id),
-            ));
-        }
-        format!(
-            "<h2>Pending Proposals <span class='dim'>({n})</span></h2>\
-             <table>\
-               <thead><tr>\
-                 <th>ID</th><th>Symbol</th><th>Side</th><th>Qty</th>\
-                 <th>Reason</th><th>Expires</th><th>Action</th>\
-               </tr></thead>\
-               <tbody>{rows}</tbody>\
-             </table>",
-            n = proposals.len(),
-        )
-    };
-
-    let body = format!(
-        "<div class='page-scroll'>{flash}{banner}\
-         {sys_note}\
-         <h2>Authority Mode</h2>\
-         {buttons}\
-         {expl_block}\
-         {proposals_block}\
-         </div>"
+    let details_body = "<div class='sum'>Withdraw now mirrors deposit: method selection, clear instructions, fee visibility, and final confirmation.</div>";
+    let body = system_layout(
+        "Funds Workspace",
+        &status_body,
+        "Withdraw: Step-by-Step",
+        &primary_body,
+        "Withdrawal Context",
+        &context_body,
+        Some(("Process Notes", details_body)),
     );
     html_resp(&page("Authority — RW-Trader", refresh, &body))
 }
@@ -1413,6 +906,42 @@ async fn authority_banner(state: &AppState) -> String {
            <a href='/authority' style='margin-left:auto;color:inherit;font-size:10px'>change →</a>\
          </div>",
         desc = mode.description().split('.').next().unwrap_or(""),
+    )
+}
+
+fn system_layout(
+    status_title: &str,
+    status_body: &str,
+    primary_title: &str,
+    primary_body: &str,
+    context_title: &str,
+    context_body: &str,
+    details: Option<(&str, &str)>,
+) -> String {
+    let details_html = if let Some((title, body)) = details {
+        format!(
+            "<div class='panel'><div class='label'>Optional Details</div><h2>{}</h2>{}</div>",
+            esc(title),
+            body
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "<div class='page-scroll'>\
+          <div class='panel'><div class='label'>System Status Bar</div><h2>{}</h2>{}</div>\
+          <div class='workspace' style='margin-top:12px'>\
+            <div class='col'><div class='panel'><div class='label'>Primary Action Panel</div><h2>{}</h2>{}</div>{}</div>\
+            <div class='col'><div class='panel'><div class='label'>Context Panel</div><h2>{}</h2>{}</div></div>\
+          </div>\
+        </div>",
+        esc(status_title),
+        status_body,
+        esc(primary_title),
+        primary_body,
+        details_html,
+        esc(context_title),
+        context_body,
     )
 }
 
