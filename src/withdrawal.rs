@@ -273,7 +273,7 @@ impl WithdrawalManager {
 
         let out = if let Some(p) = g.proposals.get_mut(id) {
             p.status = WithdrawalStatus::Executed;
-            p.failure_reason = Some(format!("withdraw_id={}", response.id));
+            p.failure_reason = None;
             p.clone()
         } else {
             return Err("proposal missing at finalize step".to_string());
