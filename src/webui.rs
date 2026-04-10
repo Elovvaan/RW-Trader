@@ -49,6 +49,10 @@ pub struct AppState {
     pub withdrawals: Arc<WithdrawalManager>,
 }
 
+#[cfg(test)]
+fn test_app_state_extras() -> (Option<Arc<BinanceClient>>, Arc<WithdrawalManager>) {
+    (None, Arc::new(WithdrawalManager::new()))
+}
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 pub async fn run(addr: &str, state: AppState) -> Result<()> {
