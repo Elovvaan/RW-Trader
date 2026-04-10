@@ -16,6 +16,7 @@ mod store;
 mod strategy;
 mod suggestions;
 mod webui;
+mod withdrawal;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -104,6 +105,8 @@ async fn main() -> Result<()> {
                 risk:      Arc::new(Mutex::new(stub_risk)),
                 authority: Arc::new(authority::AuthorityLayer::new()),
                 strategy:  Arc::new(Mutex::new(strategy::StrategyEngine::new())),
+                client:    None,
+                withdrawals: Arc::new(withdrawal::WithdrawalManager::new(withdrawal::WithdrawalConfig::default())),
             };
             webui::run(&addr, state).await?;
             return Ok(());
@@ -332,6 +335,24 @@ async fn main() -> Result<()> {
     // AppState holds Arc refs to event_store, exec, truth, risk_engine, authority.
     // All are Arc-cloned — no ownership transferred, no lock held at spawn time.
     let authority = Arc::new(authority::AuthorityLayer::new());
+    let allowed_withdrawal_destinations: std::collections::HashSet<String> = std::env::var("WITHDRAW_ALLOWED_DESTINATIONS")
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let withdrawals = Arc::new(withdrawal::WithdrawalManager::new(withdrawal::WithdrawalConfig {
+        auto_execute_enabled: env_bool("WITHDRAW_AUTO_ENABLED", false),
+        max_withdrawal_amount: env_f64("WITHDRAW_MAX_AMOUNT", 1000.0),
+        allowed_destinations: allowed_withdrawal_destinations,
+        cooldown: Duration::from_secs(env_u64("WITHDRAW_COOLDOWN_SECS", 300)),
+        duplicate_window: Duration::from_secs(env_u64("WITHDRAW_DUP_WINDOW_SECS", 600)),
+        default_fee: env_f64("WITHDRAW_DEFAULT_FEE", 0.0),
+    }));
     if let Some(ref addr) = web_ui_addr {
         let ui_state = webui::AppState {
             store:    Arc::clone(&event_store),
@@ -340,6 +361,8 @@ async fn main() -> Result<()> {
             risk:     Arc::clone(&risk_engine),
             authority: Arc::clone(&authority),
             strategy: Arc::clone(&strategy_engine),
+            client: Some(Arc::clone(&client)),
+            withdrawals: Arc::clone(&withdrawals),
         };
         // Capture the port from the env var directly; fall back to parsing the address.
         let port_str = std::env::var("PORT")
@@ -941,4 +964,10 @@ fn env_f64(key: &str, default: f64) -> f64 {
 }
 fn env_u64(key: &str, default: u64) -> u64 {
     std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+fn env_bool(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(default)
 }

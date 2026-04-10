@@ -28,6 +28,11 @@ pub struct AccountInfo {
     balances: Vec<Balance>,
 }
 
+
+#[derive(Debug, Deserialize)]
+pub struct WithdrawResponse {
+    pub id: String,
+}
 #[derive(Debug, Deserialize)]
 pub struct OpenOrder {
     pub symbol: String,
@@ -592,6 +597,36 @@ impl BinanceClient {
         params.insert("newClientOrderId", client_order_id.to_string());
         params.insert("newOrderRespType", "FULL".to_string());
         self.post_order(params).await
+    }
+
+
+    pub async fn request_withdrawal(
+        &self,
+        asset: &str,
+        amount: f64,
+        address: &str,
+        network: &str,
+    ) -> Result<WithdrawResponse> {
+        let mut params = BTreeMap::new();
+        params.insert("coin", asset.to_uppercase());
+        params.insert("address", address.to_string());
+        params.insert("amount", format!("{:.8}", amount));
+        params.insert("network", network.to_uppercase());
+
+        let query = self.signed_query(params);
+        let url = format!("{}/sapi/v1/capital/withdraw/apply", self.base_url);
+
+        debug!(asset, amount, address, network, "POST withdrawal request");
+        let resp = self
+            .http
+            .post(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(query)
+            .send()
+            .await?;
+
+        Self::parse_response(resp, "request_withdrawal").await
     }
 
     // ── Internal ──────────────────────────────────────────────────────────────
