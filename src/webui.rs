@@ -26,13 +26,14 @@ use tracing::{debug, error, info};
 
 use crate::assistant;
 use crate::authority::{AuthorityLayer, AuthorityMode};
-use crate::executor::{Executor, SystemMode};
+use crate::executor::Executor;
 use crate::reader::{get_trade_timeline, summarise_event, LifecycleStage, TradeOutcome};
 use crate::reconciler::TruthState;
 use crate::risk::RiskEngine;
 use crate::store::EventStore;
 use crate::strategy::{StrategyEngine, ALL_STRATEGIES};
-use crate::suggestions;
+use crate::withdrawal::{NewWithdrawalRequest, WithdrawalManager, WithdrawalStatus};
+use crate::client::BinanceClient;
 
 // ── Shared application state ──────────────────────────────────────────────────
 
@@ -44,8 +45,14 @@ pub struct AppState {
     pub risk:      Arc<Mutex<RiskEngine>>,
     pub authority: Arc<AuthorityLayer>,
     pub strategy:  Arc<Mutex<StrategyEngine>>,
+    pub client:    Option<Arc<BinanceClient>>,
+    pub withdrawals: Arc<WithdrawalManager>,
 }
 
+#[cfg(test)]
+fn test_app_state_extras() -> (Option<Arc<BinanceClient>>, Arc<WithdrawalManager>) {
+    (None, Arc::new(WithdrawalManager::new()))
+}
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 pub async fn run(addr: &str, state: AppState) -> Result<()> {
@@ -84,8 +91,10 @@ async fn handle(mut stream: TcpStream, state: Arc<AppState>) -> Result<()> {
     let path_query = parts.next().unwrap_or("/");
     let (path, query) = path_query.split_once('?').unwrap_or((path_query, ""));
 
+    let body = raw.split("\r\n\r\n").nth(1).unwrap_or("");
+
     let response: String = if method == "POST" {
-        handle_post(path, query, &state).await
+        handle_post(path, query, body, &state).await
     } else if path == "/" {
         redirect("/events")
     } else if path == "/events" {
@@ -119,7 +128,7 @@ async fn handle(mut stream: TcpStream, state: Arc<AppState>) -> Result<()> {
     Ok(())
 }
 
-async fn handle_post(path: &str, _query: &str, state: &AppState) -> String {
+async fn handle_post(path: &str, _query: &str, body: &str, state: &AppState) -> String {
     if path == "/events/quick/buy" {
         log_ui_action(&*state.store, "ui_quick_execute_buy", "manual quick execute from /events");
         return redirect_with_ok("/events", "Queued quick BUY market simulation.");
@@ -161,15 +170,50 @@ async fn handle_post(path: &str, _query: &str, state: &AppState) -> String {
         return redirect_with_ok("/assistant", "Kill switch cleared.");
     }
 
-    // Dedicated withdrawal confirmation endpoint (simulation UI action).
-    // Must never route through proposal rejection logic.
+    // Dedicated simulation-only withdrawal confirmation endpoint.
+    // Intentionally separate from real proposal rejection/execution handlers.
     if path == "/withdraw/confirm/simulation" {
         log_ui_action(
             &*state.store,
             "ui_withdrawal_confirmed_simulation",
             "withdrawal confirmation requested from /authority",
         );
-        return redirect_with_ok("/authority", "Withdrawal confirmation recorded (simulation).");
+        return redirect_with_ok("/authority", "Withdrawal confirmation recorded (simulation). No real funds moved.");
+    }
+
+    if path == "/withdraw/request" {
+        let form = parse_form_body(body);
+        let amount = form.get("amount").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+        let asset = form.get("asset").cloned().unwrap_or_default();
+        let destination = form.get("destination").cloned().unwrap_or_default();
+        let network = form.get("network").cloned().unwrap_or_default();
+        let reason = form.get("reason").cloned().unwrap_or_default();
+        let fee = form.get("fee_estimate").and_then(|v| v.parse::<f64>().ok());
+        let confirmed = form.get("confirm_text").map(|v| v == "CONFIRM").unwrap_or(false)
+            && form.get("confirm_checkbox").map(|v| v == "on").unwrap_or(false);
+        if !confirmed {
+            return redirect_with_err("/authority", "Explicit reconfirmation required. Tick confirmation and type CONFIRM.");
+        }
+
+        let req = NewWithdrawalRequest { amount, asset, destination, network, reason, estimated_fee: fee };
+        let kill = state.risk.lock().await.kill_switch_active();
+        let client_ref = state.client.as_ref().map(|c| c.as_ref());
+        let proposal = match state.withdrawals.create_request(req, kill, client_ref, &*state.store).await {
+            Ok(p) => p,
+            Err(e) => return redirect_with_err("/authority", &e),
+        };
+
+        let mode = state.authority.mode().await;
+        if mode == AuthorityMode::Auto {
+            match state.withdrawals.execute(&proposal.id, mode, kill, client_ref, &*state.store).await {
+                Ok(_) => return redirect_with_ok("/authority", "Withdrawal auto-executed under AUTO policy."),
+                Err(e) => {
+                    state.withdrawals.mark_failed(&proposal.id, &e, &*state.store).await;
+                    return redirect_with_err("/authority", &e);
+                }
+            }
+        }
+        return redirect_with_ok("/authority", &format!("Withdrawal proposal {} created and awaiting authority approval.", proposal.id));
     }
 
     // POST /strategy/enable/{id} or /strategy/disable/{id}
@@ -230,10 +274,76 @@ async fn handle_post(path: &str, _query: &str, state: &AppState) -> String {
         return redirect_with_ok("/authority", "Proposal rejected.");
     }
 
+
+    // POST /withdraw/proposal/approve/{proposal_id}
+    if let Some(pid) = path.strip_prefix("/withdraw/proposal/approve/") {
+        match state.withdrawals.approve(pid, &*state.store).await {
+            Ok(_) => return redirect_with_ok("/authority", "Withdrawal proposal approved."),
+            Err(e) => return redirect_with_err("/authority", &e),
+        }
+    }
+
+    // POST /withdraw/proposal/reject/{proposal_id}
+    if let Some(pid) = path.strip_prefix("/withdraw/proposal/reject/") {
+        match state.withdrawals.reject(pid, &*state.store).await {
+            Ok(_) => return redirect_with_ok("/authority", "Withdrawal proposal rejected."),
+            Err(e) => return redirect_with_err("/authority", &e),
+        }
+    }
+
+    // POST /withdraw/proposal/execute/{proposal_id}
+    if let Some(pid) = path.strip_prefix("/withdraw/proposal/execute/") {
+        let kill = state.risk.lock().await.kill_switch_active();
+        let mode = state.authority.mode().await;
+        let client_ref = state.client.as_ref().map(|c| c.as_ref());
+        match state.withdrawals.execute(pid, mode, kill, client_ref, &*state.store).await {
+            Ok(_) => return redirect_with_ok("/authority", "Withdrawal executed."),
+            Err(e) => {
+                state.withdrawals.mark_failed(pid, &e, &*state.store).await;
+                return redirect_with_err("/authority", &e);
+            }
+        }
+    }
+
     not_found()
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+fn parse_form_body(body: &str) -> std::collections::HashMap<String, String> {
+    body.split('&')
+        .filter_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            Some((url_decode(k), url_decode(v)))
+        })
+        .collect()
+}
+
+fn url_decode(s: &str) -> String {
+    let mut out = String::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'+' {
+            out.push(' ');
+            i += 1;
+        } else if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = &s[i + 1..i + 3];
+            if let Ok(v) = u8::from_str_radix(hex, 16) {
+                out.push(v as char);
+                i += 3;
+            } else {
+                out.push('%');
+                i += 1;
+            }
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
 
 fn qparam<'a>(query: &'a str, key: &str) -> Option<&'a str> {
     query.split('&').find_map(|pair| {
@@ -862,14 +972,11 @@ async fn page_authority(state: &AppState, query: &str) -> String {
 
     let mode = state.authority.mode().await;
     let proposals = state.authority.pending_proposals().await;
+    let withdrawals = state.withdrawals.proposals().await;
     let (pos_size, pos_pnl_u) = {
         let t = state.truth.lock().await;
         (t.position.size, t.position.unrealized_pnl)
     };
-
-    let requested_amount = 500.00;
-    let fee = 3.50;
-    let final_amount = requested_amount - fee;
 
     let status_body = format!(
         "{flash}<div style='display:flex;gap:14px;margin-top:8px'>\
@@ -923,23 +1030,69 @@ async fn page_authority(state: &AppState, query: &str) -> String {
         }).collect::<Vec<_>>().join("")
     };
 
+    let withdrawal_rows = if withdrawals.is_empty() {
+        "<tr><td colspan='10' class='dim'>No withdrawal proposals.</td></tr>".to_string()
+    } else {
+        withdrawals
+            .iter()
+            .map(|w| {
+                let status = match w.status {
+                    WithdrawalStatus::Requested => "REQUESTED",
+                    WithdrawalStatus::Approved => "APPROVED",
+                    WithdrawalStatus::Rejected => "REJECTED",
+                    WithdrawalStatus::Executed => "EXECUTED",
+                    WithdrawalStatus::Failed => "FAILED",
+                };
+                format!(
+                    "<tr><td style='font-size:11px'>{}</td><td>{}</td><td>{:.8}</td><td style='font-size:11px'>{}</td><td>{}</td><td>{:.8}</td><td>{:.8}</td><td>{}</td><td>{}</td><td><div style='display:flex;gap:6px'>\
+                    <form method='post' action='/withdraw/proposal/approve/{}'><button class='btn-approve' type='submit'>Approve</button></form>\
+                    <form method='post' action='/withdraw/proposal/reject/{}'><button class='btn-reject' type='submit'>Reject</button></form>\
+                    <form method='post' action='/withdraw/proposal/execute/{}'><button class='btn' type='submit'>Execute</button></form>\
+                    </div></td></tr>",
+                    esc(&w.id),
+                    esc(&w.asset),
+                    w.amount,
+                    esc(&w.destination),
+                    esc(&w.network),
+                    w.estimated_fee,
+                    w.final_received_amount(),
+                    esc(&w.reason),
+                    status,
+                    esc(&w.id),
+                    esc(&w.id),
+                    esc(&w.id),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+
+    let allowed_destinations = state.withdrawals.allowed_destinations().join(", ");
     let primary_body = format!(
         "{}\
-         <div class='label' style='margin-top:12px'>Pending Proposal Review</div>\
+         <div class='label' style='margin-top:12px'>Pending Trade Proposal Review</div>\
          <table><thead><tr><th>ID</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Confidence</th><th>TTL</th><th>Reason</th><th>Actions</th></tr></thead><tbody>{}</tbody></table>\
-         <div class='label' style='margin-top:12px'>Withdrawal Confirmation (Simulation)</div>\
-         <table class='kv'><tbody>\
-           <tr><td>Requested Amount</td><td>${:.2}</td></tr>\
-           <tr><td>Estimated Fee</td><td>${:.2}</td></tr>\
-           <tr><td>Final Amount Received</td><td><strong>${:.2}</strong></td></tr>\
-         </tbody></table>\
-         <div style='background:#0A0E13;padding:10px;margin-top:8px'>Confirmation required: verify destination network and address before submitting.</div>\
+         <div class='label' style='margin-top:12px'>Create Real Withdrawal Request (POST /withdraw/request)</div>\
+         <div class='sum'>Allowed destination whitelist: <code>{}</code></div>\
+         <form method='post' action='/withdraw/request' style='display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px'>\
+            <input name='asset' placeholder='Asset (USDT)' required />\
+            <input name='network' placeholder='Network (ETH/TRX/...)' required />\
+            <input name='amount' placeholder='Amount' required />\
+            <input name='fee_estimate' placeholder='Fee estimate' value='0' required />\
+            <input name='destination' placeholder='Destination address / label' style='grid-column:1/3' required />\
+            <input name='reason' placeholder='Business reason for withdrawal' style='grid-column:1/3' required />\
+            <label style='grid-column:1/3'><input type='checkbox' name='confirm_checkbox' /> I confirm destination, network, amount, fee, and final received amount.</label>\
+            <input name='confirm_text' placeholder='Type CONFIRM to continue' style='grid-column:1/3' required />\
+            <button class='btn' type='submit' style='grid-column:1/3'>Submit Withdrawal Proposal</button>\
+         </form>\
+         <div style='background:#0A0E13;padding:10px;margin-top:8px'>Final received amount is calculated as Amount - Fee estimate and displayed in the proposal table below for re-check before approval/execution.</div>\
+         <div class='label' style='margin-top:12px'>Withdrawal Proposal Review</div>\
+         <table><thead><tr><th>ID</th><th>Asset</th><th>Amount</th><th>Destination</th><th>Network</th><th>Fee</th><th>Final</th><th>Reason</th><th>Status</th><th>Actions</th></tr></thead><tbody>{}</tbody></table>\
          <div style='margin-top:8px'><form method='post' action='/withdraw/confirm/simulation'><button class='btn' type='submit'>Confirm Withdrawal (Simulation)</button></form></div>",
         mode_controls,
         proposal_rows,
-        requested_amount,
-        fee,
-        final_amount,
+        esc(&allowed_destinations),
+        withdrawal_rows,
     );
 
     let context_body = format!(
@@ -952,7 +1105,7 @@ async fn page_authority(state: &AppState, query: &str) -> String {
         pos_pnl_u,
     );
 
-    let details_body = "<div class='sum'>Withdraw now mirrors deposit: method selection, clear instructions, fee visibility, and final confirmation.</div>";
+    let details_body = "<div class='sum'>Real withdrawals require request → authority review → execute, with simulation endpoint kept separate.</div>";
     let body = system_layout(
         "Funds Workspace",
         &status_body,
