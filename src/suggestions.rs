@@ -21,8 +21,6 @@
 // blocked_by: every failing gate is named explicitly so the operator knows
 // exactly what needs to change before trading becomes possible.
 
-use std::time::Duration;
-
 use crate::events::{MarketSnapshotPayload, TradingEvent};
 use crate::executor::SystemMode;
 
@@ -124,6 +122,8 @@ pub struct RiskGateSnap {
     pub kill_switch_active:     bool,
     pub cooldown_remaining_secs: Option<f64>,
     pub max_spread_bps:         f64,
+    pub buy_power:              f64,
+    pub sell_inventory:         f64,
     pub position_size:          f64,
     pub max_position_qty:       f64,
     pub daily_pnl:              f64,
@@ -184,6 +184,21 @@ pub fn get_trade_suggestion(
         ));
     }
 
+    // Inventory-aware, action-first recommendation:
+    // if base inventory exists while flat, emit a SELL-oriented suggestion first.
+    if risk.sell_inventory > 0.0 && risk.position_size <= 1e-9 {
+        return Suggestion {
+            kind: SuggestionKind::ExitCandidate,
+            reason: format!(
+                "SELL READY: base inventory {:.8} is available while no active position is open. \
+                 Prioritise SELL to reduce base exposure before new BUY entries.",
+                risk.sell_inventory
+            ),
+            confidence: 0.90,
+            blocked_by: vec![],
+        };
+    }
+
     // ── WAIT conditions — collect all failing gates ───────────────────────────
     let mut blocked: Vec<String> = Vec::new();
 
@@ -201,6 +216,9 @@ pub fn get_trade_suggestion(
             "position size {:.6} is at or above limit {:.6}",
             risk.position_size, risk.max_position_qty
         ));
+    }
+    if risk.buy_power <= 0.0 {
+        blocked.push("BUY DISABLED (NO USDT)".into());
     }
     if let Some(secs) = risk.cooldown_remaining_secs {
         if secs > 0.0 {
@@ -551,6 +569,8 @@ mod tests {
             kill_switch_active:      false,
             cooldown_remaining_secs: None,
             max_spread_bps:          10.0,
+            buy_power:               100.0,
+            sell_inventory:          0.0,
             position_size:           0.0,
             max_position_qty:        0.01,
             daily_pnl:               0.0,
@@ -700,6 +720,17 @@ mod tests {
         let s = get_trade_suggestion(&ready_sys(), &open_risk(), &default_sig(), None);
         assert_eq!(s.kind, SuggestionKind::Wait);
         assert!(s.blocked_by.iter().any(|b| b.contains("snapshot") || b.contains("market")));
+    }
+
+    #[test]
+    fn test_sell_ready_when_base_inventory_exists_while_flat() {
+        let mut risk = open_risk();
+        risk.buy_power = 0.0;
+        risk.sell_inventory = 0.005;
+        risk.position_size = 0.0;
+        let s = get_trade_suggestion(&ready_sys(), &risk, &default_sig(), Some(&good_market()));
+        assert_eq!(s.kind, SuggestionKind::ExitCandidate);
+        assert!(s.reason.contains("SELL READY"));
     }
 
     #[test]

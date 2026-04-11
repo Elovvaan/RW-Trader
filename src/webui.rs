@@ -811,6 +811,18 @@ async fn page_events(state: &AppState, query: &str) -> String {
     let balance_note = balance_status
         .clone()
         .unwrap_or_else(|| format!("BUY uses {} free, SELL uses {} free.", quote_asset, base_asset));
+    let sell_ready = sell_inventory > 0.0;
+    let buy_ready = buy_power > 0.0;
+    let sell_state = if sell_ready {
+        format!("SELL READY ({:.8} {})", sell_inventory, base_asset)
+    } else {
+        format!("SELL DISABLED (NO {})", base_asset)
+    };
+    let buy_state = if buy_ready {
+        format!("BUY READY ({:.8} {})", buy_power, quote_asset)
+    } else {
+        format!("BUY DISABLED (NO {})", quote_asset)
+    };
     let status_body = format!(
         "{flash}<div style='display:flex;gap:14px;margin-top:8px'>\
           <div>System: <strong>{}</strong></div>\
@@ -822,6 +834,10 @@ async fn page_events(state: &AppState, query: &str) -> String {
           <div>Total Balance (USD est): <strong>${:.2}</strong></div>\
           <div>Buy Power: <strong>{:.8} {}</strong></div>\
           <div>Sell Inventory: <strong>{:.8} {}</strong></div>\
+          <div style='margin-top:6px;display:flex;gap:8px;flex-wrap:wrap'>\
+            <span class='{}'>{}</span>\
+            <span class='{}'>{}</span>\
+          </div>\
           <div class='{}' style='margin-top:4px'>{}</div>\
         </div>",
         esc(&sys_mode.to_string()),
@@ -834,20 +850,28 @@ async fn page_events(state: &AppState, query: &str) -> String {
         quote_asset,
         sell_inventory,
         base_asset,
+        if sell_ready { "ok" } else { "warn" },
+        esc(&sell_state),
+        if buy_ready { "ok" } else { "warn" },
+        esc(&buy_state),
         if balance_status.is_some() { "warn" } else { "dim" },
         esc(&balance_note),
     );
 
+    let buy_btn_attrs = if buy_ready { "" } else { " disabled title='BUY DISABLED (NO USDT)'" };
+    let sell_btn_attrs = if sell_ready { "" } else { " disabled title='SELL DISABLED (NO BTC)'" };
     let primary_body = format!(
         "<div style='padding:10px;background:#101419;border-left:3px solid #4BE277'>\
            <div class='dim'>Latest recommendation summary</div>\
            <div style='margin-top:4px'><strong>{}</strong></div>\
          </div>\
          <div style='margin-top:10px;display:grid;grid-template-columns:1fr 1fr;gap:8px'>\
-           <form method='post' action='/events/quick/buy'><button class='btn-approve' style='width:100%' type='submit'>Execute Sim Buy</button></form>\
-           <form method='post' action='/events/quick/sell'><button class='btn-reject' style='width:100%' type='submit'>Execute Sim Sell</button></form>\
+           <form method='post' action='/events/quick/buy'><button class='btn-approve' style='width:100%' type='submit'{}>Execute Sim Buy</button></form>\
+           <form method='post' action='/events/quick/sell'><button class='btn-reject' style='width:100%' type='submit'{}>EXECUTE SELL</button></form>\
          </div>",
-        esc(&best_summary)
+        esc(&best_summary),
+        buy_btn_attrs,
+        sell_btn_attrs,
     );
 
     let rows = events.iter().take(10).map(|e| format!(
