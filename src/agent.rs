@@ -414,7 +414,7 @@ async fn fetch_free_balance(client: &BinanceClient, asset: &str) -> Result<f64, 
     Ok(balances
         .into_iter()
         .find(|b| b.asset.eq_ignore_ascii_case(asset))
-        .and_then(|b| b.free.parse::<f64>().ok())
+        .map(|b| b.free)
         .unwrap_or(0.0))
 }
 

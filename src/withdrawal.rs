@@ -132,7 +132,7 @@ impl WithdrawalManager {
             let free = balances
                 .iter()
                 .find(|b| b.asset.eq_ignore_ascii_case(req.asset.trim()))
-                .and_then(|b| b.free.parse::<f64>().ok())
+                .map(|b| b.free)
                 .unwrap_or(0.0);
             if free < req.amount {
                 return Err(format!(

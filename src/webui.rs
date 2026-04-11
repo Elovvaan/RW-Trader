@@ -774,25 +774,51 @@ async fn page_events(state: &AppState, query: &str) -> String {
 
     let sys_mode = state.exec.system_mode().await;
     let exec_state = state.exec.execution_state().await;
-    let (symbol, pos_size, open_orders) = {
+    let (symbol, pos_size, open_orders, total_balance_usd, tradable_balance, balance_status, raw_balances) = {
         let t = state.truth.lock().await;
-        (t.symbol.clone(), t.position.size, t.open_order_count)
+        (
+            t.symbol.clone(),
+            t.position.size,
+            t.open_order_count,
+            t.total_balance_usd,
+            t.tradable_balance,
+            t.balance_status.clone(),
+            t.balances.clone(),
+        )
     };
     let kill = state.risk.lock().await.kill_switch_active();
 
     let best_summary = events.first().map(summarise_event).unwrap_or_else(|| "No fresh event yet; waiting for next snapshot.".to_string());
+    let quote_asset = ["USDT", "USDC", "BUSD", "FDUSD", "TUSD", "BTC", "ETH", "BNB"]
+        .iter()
+        .find(|q| symbol.ends_with(**q))
+        .copied()
+        .unwrap_or("USDT");
+    let balance_note = balance_status
+        .clone()
+        .unwrap_or_else(|| format!("Tradable asset ({} free): {:.8}", quote_asset, tradable_balance));
     let status_body = format!(
         "{flash}<div style='display:flex;gap:14px;margin-top:8px'>\
           <div>System: <strong>{}</strong></div>\
           <div>Executor: <strong>{}</strong></div>\
           <div>Risk: <strong class='{}'>{}</strong></div>\
           <div>Symbol: <strong>{}</strong></div>\
+        </div>\
+        <div style='margin-top:10px;padding:10px;background:#101419;border-left:3px solid #4BE277'>\
+          <div>Total Balance (USD est): <strong>${:.2}</strong></div>\
+          <div>Tradable Balance: <strong>{:.8} {}</strong></div>\
+          <div class='{}' style='margin-top:4px'>{}</div>\
         </div>",
         esc(&sys_mode.to_string()),
         esc(&exec_state.to_string()),
         if kill { "err" } else { "ok" },
         if kill { "Paused" } else { "Ready" },
         esc(&symbol),
+        total_balance_usd,
+        tradable_balance,
+        quote_asset,
+        if balance_status.is_some() { "warn" } else { "dim" },
+        esc(&balance_note),
     );
 
     let primary_body = format!(
@@ -818,13 +844,34 @@ async fn page_events(state: &AppState, query: &str) -> String {
         .and_then(|e| e.correlation_id.as_ref())
         .map(|id| format!("/trade/{}", esc(&url_encode(id))))
         .unwrap_or_else(|| "/trade".to_string());
+    let balances_rows = raw_balances
+        .iter()
+        .filter(|b| (b.free + b.locked) > 0.0)
+        .map(|b| format!(
+            "<tr><td>{}</td><td>{:.8}</td><td>{:.8}</td></tr>",
+            esc(&b.asset),
+            b.free,
+            b.locked
+        ))
+        .collect::<Vec<_>>()
+        .join("");
+    let balances_table = if balances_rows.is_empty() {
+        "<div class='dim' style='margin-top:8px'>No funded assets reported yet.</div>".to_string()
+    } else {
+        format!(
+            "<div style='margin-top:8px'><div class='dim'>Raw balances</div>\
+             <table><thead><tr><th>Asset</th><th>Free</th><th>Locked</th></tr></thead><tbody>{}</tbody></table></div>",
+            balances_rows
+        )
+    };
     let context_body = format!(
         "<table><thead><tr><th>Time</th><th>Type</th><th>Summary</th></tr></thead><tbody>{}</tbody></table>\
-         <div class='sum' style='margin-top:8px'>Position {:.6} · Open orders {} · <a href='{}'>Open timeline view</a></div>",
+         <div class='sum' style='margin-top:8px'>Position {:.6} · Open orders {} · <a href='{}'>Open timeline view</a></div>{}",
         rows,
         pos_size,
         open_orders,
         corr_link,
+        balances_table,
     );
 
     let body = system_layout(

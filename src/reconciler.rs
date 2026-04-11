@@ -167,6 +167,12 @@ pub struct TruthState {
 
     /// Account balances from last reconcile.
     pub balances: Vec<Balance>,
+    /// Total account value estimate in USD (stable-asset sum + convertible assets).
+    pub total_balance_usd: f64,
+    /// Free quote-asset amount usable for the active trading symbol.
+    pub tradable_balance: f64,
+    /// Human-readable explanation of balance usability, if constrained.
+    pub balance_status: Option<String>,
 
     /// Fill IDs we have already processed. Prevents double-counting.
     pub seen_fill_ids: HashSet<i64>,
@@ -194,6 +200,9 @@ impl TruthState {
             orders: HashMap::new(),
             open_order_count: 0,
             balances: Vec::new(),
+            total_balance_usd: 0.0,
+            tradable_balance: 0.0,
+            balance_status: None,
             seen_fill_ids: HashSet::new(),
             last_reconciled_at: None,
             state_dirty: true,   // start dirty until first reconcile
@@ -254,6 +263,77 @@ impl TruthState {
         record.avg_fill_price = avg_fill_price;
         record.last_seen = Instant::now();
     }
+}
+
+fn split_symbol_assets(symbol: &str) -> (&str, &str) {
+    for quote in ["USDT", "USDC", "BUSD", "FDUSD", "TUSD", "BTC", "ETH", "BNB"] {
+        if let Some(base) = symbol.strip_suffix(quote) {
+            if !base.is_empty() {
+                return (base, quote);
+            }
+        }
+    }
+    (symbol, "")
+}
+
+fn is_stable_asset(asset: &str) -> bool {
+    matches!(asset.to_ascii_uppercase().as_str(), "USDT" | "USDC" | "BUSD" | "FDUSD" | "TUSD" | "DAI")
+}
+
+fn map_balances(
+    symbol: &str,
+    balances: &[Balance],
+    mark_price: f64,
+) -> (f64, f64, Option<String>) {
+    let (base_asset, quote_asset) = split_symbol_assets(symbol);
+    let mut total_usd = 0.0;
+    let mut stable_sum = 0.0;
+    let mut non_stable_total = 0.0;
+
+    for b in balances {
+        let total_amt = b.free + b.locked;
+        if total_amt <= 0.0 {
+            continue;
+        }
+        if is_stable_asset(&b.asset) {
+            stable_sum += total_amt;
+            total_usd += total_amt;
+            continue;
+        }
+        non_stable_total += total_amt;
+        if b.asset.eq_ignore_ascii_case(base_asset) && mark_price > 0.0 {
+            total_usd += total_amt * mark_price;
+        }
+    }
+
+    let tradable_balance = balances
+        .iter()
+        .find(|b| b.asset.eq_ignore_ascii_case(quote_asset))
+        .map(|b| b.free)
+        .unwrap_or(0.0);
+
+    let funds_detected = balances.iter().any(|b| (b.free + b.locked) > 0.0);
+    let balance_status = if tradable_balance > 0.0 || !funds_detected {
+        None
+    } else {
+        Some(format!(
+            "Funds detected but not in tradable asset for {} (requires {})",
+            symbol, quote_asset
+        ))
+    };
+
+    let final_total = if total_usd > 0.0 {
+        total_usd
+    } else if stable_sum > 0.0 {
+        stable_sum
+    } else if non_stable_total > 0.0 {
+        // No conversion route available; expose non-zero via status message/UI.
+        0.0
+    } else {
+        0.0
+    };
+
+    (final_total, tradable_balance, balance_status)
 }
 
 // ── Reconciliation ────────────────────────────────────────────────────────────
@@ -458,10 +538,15 @@ fn apply_reconciliation(
     state.open_order_count = exchange_open_count;
 
     // ── Balances update ───────────────────────────────────────────────────────
-    info!("RECONCILE: Balances updated ({} non-zero assets)", balances.len());
+    info!("RECONCILE: Balances updated ({} assets)", balances.len());
     for b in &balances {
         info!("  {} free={} locked={}", b.asset, b.free, b.locked);
     }
+    let (total_balance_usd, tradable_balance, balance_status) =
+        map_balances(&state.symbol, &balances, mark_price);
+    state.total_balance_usd = total_balance_usd;
+    state.tradable_balance = tradable_balance;
+    state.balance_status = balance_status;
     state.balances = balances;
 
     // ── Summary ───────────────────────────────────────────────────────────────
