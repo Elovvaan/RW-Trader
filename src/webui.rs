@@ -264,6 +264,18 @@ async fn handle_post(path: &str, _query: &str, body: &str, state: &AppState) -> 
         if size <= 0.0 {
             return redirect_with_err("/authority", "trade request size must be > 0");
         }
+        {
+            let t = state.truth.lock().await;
+            let side_free = t.available_balance_for_side(&side);
+            if side_free <= 0.0 {
+                let msg = if side == "BUY" {
+                    "Insufficient BUY balance: quote-asset buy power is 0."
+                } else {
+                    "Insufficient SELL balance: base-asset sell inventory is 0."
+                };
+                return redirect_with_err("/authority", msg);
+            }
+        }
 
         let mode = state.authority.mode().await;
         if mode == AuthorityMode::Off {
@@ -774,14 +786,15 @@ async fn page_events(state: &AppState, query: &str) -> String {
 
     let sys_mode = state.exec.system_mode().await;
     let exec_state = state.exec.execution_state().await;
-    let (symbol, pos_size, open_orders, total_balance_usd, tradable_balance, balance_status, raw_balances) = {
+    let (symbol, pos_size, open_orders, total_balance_usd, buy_power, sell_inventory, balance_status, raw_balances) = {
         let t = state.truth.lock().await;
         (
             t.symbol.clone(),
             t.position.size,
             t.open_order_count,
             t.total_balance_usd,
-            t.tradable_balance,
+            t.buy_power,
+            t.sell_inventory,
             t.balance_status.clone(),
             t.balances.clone(),
         )
@@ -794,9 +807,10 @@ async fn page_events(state: &AppState, query: &str) -> String {
         .find(|q| symbol.ends_with(**q))
         .copied()
         .unwrap_or("USDT");
+    let base_asset = symbol.strip_suffix(quote_asset).unwrap_or(symbol.as_str());
     let balance_note = balance_status
         .clone()
-        .unwrap_or_else(|| format!("Tradable asset ({} free): {:.8}", quote_asset, tradable_balance));
+        .unwrap_or_else(|| format!("BUY uses {} free, SELL uses {} free.", quote_asset, base_asset));
     let status_body = format!(
         "{flash}<div style='display:flex;gap:14px;margin-top:8px'>\
           <div>System: <strong>{}</strong></div>\
@@ -806,7 +820,8 @@ async fn page_events(state: &AppState, query: &str) -> String {
         </div>\
         <div style='margin-top:10px;padding:10px;background:#101419;border-left:3px solid #4BE277'>\
           <div>Total Balance (USD est): <strong>${:.2}</strong></div>\
-          <div>Tradable Balance: <strong>{:.8} {}</strong></div>\
+          <div>Buy Power: <strong>{:.8} {}</strong></div>\
+          <div>Sell Inventory: <strong>{:.8} {}</strong></div>\
           <div class='{}' style='margin-top:4px'>{}</div>\
         </div>",
         esc(&sys_mode.to_string()),
@@ -815,8 +830,10 @@ async fn page_events(state: &AppState, query: &str) -> String {
         if kill { "Paused" } else { "Ready" },
         esc(&symbol),
         total_balance_usd,
-        tradable_balance,
+        buy_power,
         quote_asset,
+        sell_inventory,
+        base_asset,
         if balance_status.is_some() { "warn" } else { "dim" },
         esc(&balance_note),
     );
