@@ -76,6 +76,35 @@ fn flat_inventory_priority_decision(
     }
 }
 
+fn dip_pct_from_history(mid_history: &VecDeque<f64>, lookback_cycles: usize) -> Option<f64> {
+    let current_mid = mid_history.back().copied().filter(|mid| *mid > 0.0)?;
+    let reference_mid = mid_history
+        .len()
+        .checked_sub(1 + lookback_cycles)
+        .and_then(|idx| mid_history.get(idx).copied())
+        .filter(|mid| *mid > 0.0)?;
+    Some((current_mid / reference_mid) - 1.0)
+}
+
+fn quote_inventory_decision(
+    has_quote: bool,
+    market_buy_ok: bool,
+    dip_pct: Option<f64>,
+    dip_trigger_pct: f64,
+) -> (&'static str, Option<&'static str>, Option<&'static str>) {
+    if !has_quote {
+        return ("HOLD", None, None);
+    }
+    let dip_trigger_hit = dip_pct.map(|v| v <= -dip_trigger_pct).unwrap_or(false);
+    if dip_trigger_hit && market_buy_ok {
+        ("INVENTORY_BUY", Some("BUY"), Some("dip"))
+    } else if market_buy_ok {
+        ("INVENTORY_BUY", Some("BUY"), Some("momentum"))
+    } else {
+        ("HOLD", None, None)
+    }
+}
+
 pub fn spawn_profit_sweep_agent(cfg: AgentConfig, state: AgentState) {
     if !cfg.enabled() {
         info!("[AGENT] Profit sweep agent disabled (threshold<=0 or asset missing)");
@@ -344,13 +373,7 @@ pub fn spawn_trade_agent(cfg: TradeAgentConfig, state: AgentState) {
                     mid_history.pop_front();
                 }
             }
-            let dip_reference = mid_history
-                .len()
-                .checked_sub(DIP_LOOKBACK_CYCLES)
-                .and_then(|idx| mid_history.get(idx).copied());
-            let dip_pct = dip_reference
-                .filter(|r| *r > 0.0)
-                .map(|r| (metrics.mid / r) - 1.0);
+            let dip_pct = dip_pct_from_history(&mid_history, DIP_LOOKBACK_CYCLES);
 
             let (decision, side, reason_for_trade, trigger_type) = if has_base {
                 let entry_price = if avg_entry > 0.0 { avg_entry } else { metrics.mid };
@@ -420,22 +443,30 @@ pub fn spawn_trade_agent(cfg: TradeAgentConfig, state: AgentState) {
                     )
                 }
             } else if has_quote {
-                let dip_trigger_hit = dip_pct.map(|v| v <= -DIP_TRIGGER_PCT).unwrap_or(false);
-                if dip_trigger_hit {
+                let (quote_decision, quote_side, quote_trigger) =
+                    quote_inventory_decision(has_quote, market_buy_ok, dip_pct, DIP_TRIGGER_PCT);
+                if quote_decision == "INVENTORY_BUY" && quote_trigger == Some("dip") {
                     (
                         "INVENTORY_BUY",
                         Some("BUY"),
                         format!(
-                            "buy_dip price={:.2} dip_pct={:+.4}% lookback_cycles={} trigger={:.4}% buy_power={:.8}",
+                            "buy_dip price={:.2} dip_pct={:+.4}% lookback_cycles={} trigger={:.4}% spread_bps={:.2}<={:.2} momentum={:+.6}>{:.6} buy_power={:.8}",
                             metrics.mid,
                             dip_pct.unwrap_or(0.0) * 100.0,
                             DIP_LOOKBACK_CYCLES,
                             -DIP_TRIGGER_PCT * 100.0,
+                            metrics.spread_bps,
+                            cfg.max_spread_bps,
+                            metrics.momentum_5s,
+                            cfg.momentum_threshold,
                             buy_power
                         ),
-                        Some("momentum"),
+                        Some("dip"),
                     )
-                } else if market_buy_ok {
+                } else if quote_decision == "INVENTORY_BUY"
+                    && quote_side == Some("BUY")
+                    && quote_trigger == Some("momentum")
+                {
                     (
                         "INVENTORY_BUY",
                         Some("BUY"),
@@ -618,7 +649,9 @@ pub fn spawn_trade_agent(cfg: TradeAgentConfig, state: AgentState) {
 
 #[cfg(test)]
 mod tests {
-    use super::flat_inventory_priority_decision;
+    use std::collections::VecDeque;
+
+    use super::{dip_pct_from_history, flat_inventory_priority_decision, quote_inventory_decision};
 
     #[test]
     fn base_only_returns_sell_ready() {
@@ -646,6 +679,49 @@ mod tests {
         let (decision, side) = flat_inventory_priority_decision(false, false, false);
         assert_eq!(decision, "HOLD");
         assert_eq!(side, None);
+    }
+
+    #[test]
+    fn dip_detected_but_spread_too_wide_returns_hold() {
+        let (decision, side, trigger) =
+            quote_inventory_decision(true, false, Some(-0.01), 0.003);
+        assert_eq!(decision, "HOLD");
+        assert_eq!(side, None);
+        assert_eq!(trigger, None);
+    }
+
+    #[test]
+    fn dip_detected_with_market_buy_ok_allows_buy() {
+        let (decision, side, trigger) =
+            quote_inventory_decision(true, true, Some(-0.01), 0.003);
+        assert_eq!(decision, "INVENTORY_BUY");
+        assert_eq!(side, Some("BUY"));
+        assert_eq!(trigger, Some("dip"));
+    }
+
+    #[test]
+    fn exactly_n_samples_does_not_activate_dip_one_tick_early() {
+        let lookback_cycles = 5;
+        let mut mid_history: VecDeque<f64> = vec![100.0, 100.0, 100.0, 100.0, 99.6].into();
+        let dip_pct = dip_pct_from_history(&mid_history, lookback_cycles);
+        assert!(dip_pct.is_none());
+
+        mid_history.push_back(99.6);
+        let dip_pct = dip_pct_from_history(&mid_history, lookback_cycles).unwrap();
+        assert!(dip_pct <= -0.003);
+    }
+
+    #[test]
+    fn dip_activates_only_at_true_configured_lookback_horizon() {
+        let lookback_cycles = 5;
+        let mut mid_history: VecDeque<f64> =
+            vec![99.8, 100.0, 100.0, 100.0, 100.0, 99.6].into();
+        let dip_pct = dip_pct_from_history(&mid_history, lookback_cycles).unwrap();
+        assert!(dip_pct > -0.003, "dip should not trigger from only 4 intervals ago");
+
+        mid_history.push_back(99.6);
+        let dip_pct = dip_pct_from_history(&mid_history, lookback_cycles).unwrap();
+        assert!(dip_pct <= -0.003, "dip should trigger at exactly 5 intervals ago");
     }
 }
 
