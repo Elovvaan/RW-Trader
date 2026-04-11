@@ -209,16 +209,23 @@ async fn handle_post(path: &str, _query: &str, body: &str, state: &AppState) -> 
         }
 
         let req = NewWithdrawalRequest { amount, asset, destination, network, reason, estimated_fee: fee };
-        let kill = state.risk.lock().await.kill_switch_active();
         let client_ref = state.client.as_ref().map(|c| c.as_ref());
-        let proposal = match state.withdrawals.create_request(req, kill, client_ref, &*state.store).await {
+        let proposal = match state
+            .withdrawals
+            .create_request(req, state.risk.lock().await.kill_switch_active(), client_ref, &*state.store)
+            .await
+        {
             Ok(p) => p,
             Err(e) => return redirect_with_err("/authority", &e),
         };
 
         let mode = state.authority.mode().await;
         if mode == AuthorityMode::Auto {
-            match state.withdrawals.execute(&proposal.id, mode, kill, client_ref, &*state.store).await {
+            match state
+                .withdrawals
+                .execute(&proposal.id, mode, &state.risk, client_ref, &*state.store)
+                .await
+            {
                 Ok(_) => {
                     return redirect(&format!(
                         "/authority?ok={}&wd_id={}&wd_step=status",
@@ -320,10 +327,13 @@ async fn handle_post(path: &str, _query: &str, body: &str, state: &AppState) -> 
 
     // POST /withdraw/proposal/execute/{proposal_id}
     if let Some(pid) = path.strip_prefix("/withdraw/proposal/execute/") {
-        let kill = state.risk.lock().await.kill_switch_active();
         let mode = state.authority.mode().await;
         let client_ref = state.client.as_ref().map(|c| c.as_ref());
-        match state.withdrawals.execute(pid, mode, kill, client_ref, &*state.store).await {
+        match state
+            .withdrawals
+            .execute(pid, mode, &state.risk, client_ref, &*state.store)
+            .await
+        {
             Ok(_) => return redirect(&format!("/authority?ok={}&wd_id={}&wd_step=status", url_encode("Withdrawal completed."), url_encode(pid))),
             Err(e) => {
                 state.withdrawals.mark_failed(pid, &e, &*state.store).await;
@@ -1268,6 +1278,7 @@ mod tests {
             max_open_orders:     1,
             max_slippage_bps:    20.0,
         }, &pos);
+        let (client, withdrawals) = test_app_state_extras();
         AppState {
             store:    InMemoryEventStore::new(),
             exec:     Arc::new(Executor::new("BTCUSDT".into(), CircuitBreakerConfig::default(), WatchdogConfig::default())),
@@ -1275,6 +1286,8 @@ mod tests {
             risk:     Arc::new(Mutex::new(risk)),
             authority: Arc::new(crate::authority::AuthorityLayer::new()),
             strategy:  Arc::new(Mutex::new(crate::strategy::StrategyEngine::new())),
+            client,
+            withdrawals,
         }
     }
 
