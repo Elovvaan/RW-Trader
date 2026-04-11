@@ -8,7 +8,10 @@ use tracing::{info, warn};
 use crate::authority::{AuthorityLayer, AuthorityMode};
 use crate::client::BinanceClient;
 use crate::events::{OperatorActionPayload, StoredEvent, TradingEvent};
+use crate::executor::{ExecutionState, Executor};
+use crate::feed::FeedState;
 use crate::reconciler::TruthState;
+use crate::signal::SignalEngine;
 use crate::store::EventStore;
 use crate::withdrawal::{WithdrawalManager, WithdrawalStatus};
 
@@ -29,11 +32,30 @@ impl AgentConfig {
 #[derive(Clone)]
 pub struct AgentState {
     pub store: Arc<dyn EventStore>,
+    pub exec: Arc<Executor>,
+    pub feed: Arc<Mutex<FeedState>>,
+    pub signal: Arc<Mutex<SignalEngine>>,
     pub truth: Arc<Mutex<TruthState>>,
     pub authority: Arc<AuthorityLayer>,
     pub withdrawals: Arc<WithdrawalManager>,
     pub client: Arc<BinanceClient>,
+    pub symbol: String,
     pub web_base_url: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TradeAgentConfig {
+    pub enabled: bool,
+    pub trade_size: f64,
+    pub momentum_threshold: f64,
+    pub poll_interval: Duration,
+    pub max_spread_bps: f64,
+}
+
+impl TradeAgentConfig {
+    pub fn active(&self) -> bool {
+        self.enabled && self.trade_size > 0.0
+    }
 }
 
 pub fn spawn_profit_sweep_agent(cfg: AgentConfig, state: AgentState) {
@@ -230,6 +252,152 @@ pub fn spawn_profit_sweep_agent(cfg: AgentConfig, state: AgentState) {
                             cfg.sweep_threshold,
                             sweep_amount,
                             e
+                        ),
+                    );
+                }
+            }
+        }
+    });
+}
+
+pub fn spawn_trade_agent(cfg: TradeAgentConfig, state: AgentState) {
+    if !cfg.active() {
+        info!("[AGENT] Trade agent disabled (TRADE_ENABLED=false or TRADE_SIZE<=0)");
+        return;
+    }
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(cfg.poll_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        log_agent_action(
+            &*state.store,
+            "started",
+            &format!(
+                "trade enabled={} symbol={} size={:.8} momentum_threshold={:.6} spread_max_bps={:.2} interval_s={}",
+                cfg.enabled,
+                state.symbol,
+                cfg.trade_size,
+                cfg.momentum_threshold,
+                cfg.max_spread_bps,
+                cfg.poll_interval.as_secs()
+            ),
+        );
+
+        loop {
+            interval.tick().await;
+
+            let mode = state.authority.mode().await;
+            let exec_state = state.exec.execution_state().await;
+            let pending = state.authority.pending_proposals().await;
+
+            let metrics = {
+                let feed = state.feed.lock().await;
+                let signal = state.signal.lock().await;
+                signal.compute_metrics_pub(&feed)
+            };
+
+            let (decision, side, reason) = if metrics.momentum_5s > cfg.momentum_threshold
+                && metrics.spread_bps <= cfg.max_spread_bps
+            {
+                (
+                    "LONG",
+                    Some("BUY"),
+                    format!(
+                        "momentum={:+.6}>{:.6} spread_bps={:.2}<={:.2} imbalance_1s={:+.3} price={:.2}",
+                        metrics.momentum_5s, cfg.momentum_threshold, metrics.spread_bps, cfg.max_spread_bps, metrics.imbalance_1s, metrics.mid
+                    ),
+                )
+            } else if metrics.momentum_5s < -cfg.momentum_threshold {
+                (
+                    "SHORT",
+                    Some("SELL"),
+                    format!(
+                        "momentum={:+.6}<-{:.6} spread_bps={:.2} imbalance_1s={:+.3} price={:.2}",
+                        metrics.momentum_5s, cfg.momentum_threshold, metrics.spread_bps, metrics.imbalance_1s, metrics.mid
+                    ),
+                )
+            } else {
+                (
+                    "HOLD",
+                    None,
+                    format!(
+                        "momentum={:+.6} threshold={:.6} spread_bps={:.2} imbalance_1s={:+.3} price={:.2}",
+                        metrics.momentum_5s, cfg.momentum_threshold, metrics.spread_bps, metrics.imbalance_1s, metrics.mid
+                    ),
+                )
+            };
+
+            log_agent_action(
+                &*state.store,
+                "trade_decision",
+                &format!("mode={} decision={} symbol={} {}", mode, decision, state.symbol, reason),
+            );
+
+            let Some(side) = side else { continue; };
+
+            if mode == AuthorityMode::Off {
+                continue;
+            }
+
+            if !matches!(exec_state, ExecutionState::Idle) || !pending.is_empty() {
+                log_agent_action(
+                    &*state.store,
+                    "trade_skipped_idempotent_guard",
+                    &format!(
+                        "mode={} exec_state={} pending_proposals={} decision={} side={}",
+                        mode,
+                        exec_state,
+                        pending.len(),
+                        decision,
+                        side
+                    ),
+                );
+                continue;
+            }
+
+            let Some(url) = state.web_base_url.as_ref().map(|b| format!("{}/trade/request", b)) else {
+                log_agent_action(
+                    &*state.store,
+                    "trade_skipped_no_web_ui",
+                    "WEB_UI_ADDR missing; cannot POST /trade/request",
+                );
+                continue;
+            };
+
+            let mut form = HashMap::new();
+            form.insert("symbol".to_string(), state.symbol.clone());
+            form.insert("side".to_string(), side.to_string());
+            form.insert("size".to_string(), format!("{:.8}", cfg.trade_size));
+            form.insert(
+                "reason".to_string(),
+                format!("agent_trade {} {}", decision, reason),
+            );
+
+            match reqwest::Client::new().post(&url).form(&form).send().await {
+                Ok(resp) => {
+                    log_agent_action(
+                        &*state.store,
+                        "trade_request_posted",
+                        &format!(
+                            "status={} mode={} decision={} side={} symbol={} size={:.8}",
+                            resp.status(),
+                            mode,
+                            decision,
+                            side,
+                            state.symbol,
+                            cfg.trade_size
+                        ),
+                    );
+                }
+                Err(e) => {
+                    warn!(error = %e, "[AGENT] Trade request POST failed");
+                    log_agent_action(
+                        &*state.store,
+                        "trade_request_failed",
+                        &format!(
+                            "mode={} decision={} side={} symbol={} size={:.8} error={}",
+                            mode, decision, side, state.symbol, cfg.trade_size, e
                         ),
                     );
                 }

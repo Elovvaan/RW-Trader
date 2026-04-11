@@ -393,10 +393,38 @@ async fn main() -> Result<()> {
         sweep_cfg,
         agent::AgentState {
             store: Arc::clone(&event_store),
+            exec: Arc::clone(&exec),
+            feed: Arc::clone(&feed_state),
+            signal: Arc::clone(&signal_engine),
             truth: Arc::clone(&truth),
             authority: Arc::clone(&authority),
             withdrawals: Arc::clone(&withdrawals),
             client: Arc::clone(&client),
+            symbol: symbol.clone(),
+            web_base_url,
+        },
+    );
+
+    let trade_cfg = agent::TradeAgentConfig {
+        enabled: env_bool("TRADE_ENABLED", false),
+        trade_size: env_f64("TRADE_SIZE", order_qty),
+        momentum_threshold: env_f64("MOMENTUM_THRESHOLD", 0.00005),
+        poll_interval: Duration::from_secs(env_u64("TRADE_INTERVAL_SECS", 1)),
+        max_spread_bps: env_f64("SIGNAL_MAX_SPREAD_BPS", 5.0),
+    };
+    let web_base_url = web_ui_addr.as_ref().map(|addr| format!("http://{}", addr));
+    agent::spawn_trade_agent(
+        trade_cfg,
+        agent::AgentState {
+            store: Arc::clone(&event_store),
+            exec: Arc::clone(&exec),
+            feed: Arc::clone(&feed_state),
+            signal: Arc::clone(&signal_engine),
+            truth: Arc::clone(&truth),
+            authority: Arc::clone(&authority),
+            withdrawals: Arc::clone(&withdrawals),
+            client: Arc::clone(&client),
+            symbol: symbol.clone(),
             web_base_url,
         },
     );
