@@ -9,6 +9,7 @@ use uuid::Uuid;
 use crate::authority::AuthorityMode;
 use crate::client::BinanceClient;
 use crate::events::{OperatorActionPayload, StoredEvent, TradingEvent};
+use crate::risk::RiskEngine;
 use crate::store::EventStore;
 
 #[derive(Clone, Debug)]
@@ -144,12 +145,11 @@ impl WithdrawalManager {
         }
 
         let fingerprint = format!(
-            "{}|{}|{}|{:.8}|{}",
+            "{}|{}|{}|{:.8}",
             req.asset.trim().to_uppercase(),
             req.network.trim().to_uppercase(),
             req.destination.trim(),
             req.amount,
-            req.reason.trim().to_lowercase()
         );
 
         let mut g = self.inner.lock().await;
@@ -228,11 +228,11 @@ impl WithdrawalManager {
         &self,
         id: &str,
         mode: AuthorityMode,
-        kill_switch_active: bool,
+        risk: &Mutex<RiskEngine>,
         client: Option<&BinanceClient>,
         store: &dyn EventStore,
     ) -> Result<WithdrawalProposal, String> {
-        if kill_switch_active {
+        if risk.lock().await.kill_switch_active() {
             return Err("withdrawals are blocked while kill-switch is active".into());
         }
 
@@ -269,6 +269,10 @@ impl WithdrawalManager {
             p.failure_reason = None;
         }
         drop(g);
+
+        if risk.lock().await.kill_switch_active() {
+            return Err("withdrawals are blocked while kill-switch is active".into());
+        }
 
         let response = if let Some(cl) = client {
             cl.request_withdrawal(&asset, amount, &destination, &network)
@@ -331,4 +335,107 @@ pub fn log_withdrawal_stage(store: &dyn EventStore, stage: &str, proposal_id: &s
             reason: reason.to_string(),
         }),
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::position::Position;
+    use crate::risk::RiskConfig;
+    use crate::store::InMemoryEventStore;
+
+    fn make_manager() -> WithdrawalManager {
+        WithdrawalManager::new(WithdrawalConfig {
+            auto_execute_enabled: true,
+            max_withdrawal_amount: 10_000.0,
+            allowed_destinations: HashSet::new(),
+            cooldown: Duration::from_secs(0),
+            duplicate_window: Duration::from_secs(600),
+            default_fee: 0.0,
+        })
+    }
+
+    fn make_request(reason: &str) -> NewWithdrawalRequest {
+        NewWithdrawalRequest {
+            amount: 10.0,
+            asset: "USDT".to_string(),
+            destination: "0xabc123".to_string(),
+            network: "ETH".to_string(),
+            reason: reason.to_string(),
+            estimated_fee: None,
+        }
+    }
+
+    fn make_risk() -> Mutex<RiskEngine> {
+        Mutex::new(RiskEngine::new(
+            RiskConfig::default_for_btcusdt(),
+            &Position::new("BTCUSDT"),
+        ))
+    }
+
+    #[tokio::test]
+    async fn duplicate_blocks_even_with_different_reason() {
+        let manager = make_manager();
+        let store = InMemoryEventStore::new();
+
+        let first = manager
+            .create_request(make_request("ops payout"), false, None, &*store)
+            .await;
+        assert!(first.is_ok());
+
+        let dup = manager
+            .create_request(make_request("finance free-text changed"), false, None, &*store)
+            .await;
+        assert_eq!(dup.unwrap_err(), "duplicate request already pending");
+    }
+
+    #[tokio::test]
+    async fn execute_blocked_when_kill_switch_enabled_before_execute() {
+        let manager = make_manager();
+        let store = InMemoryEventStore::new();
+        let risk = make_risk();
+
+        let proposal = manager
+            .create_request(make_request("settlement"), false, None, &*store)
+            .await
+            .expect("request should be created");
+
+        {
+            let mut guard = risk.lock().await;
+            guard.set_kill_switch(true);
+        }
+
+        let err = manager
+            .execute(&proposal.id, AuthorityMode::Auto, &risk, None, &*store)
+            .await
+            .unwrap_err();
+        assert_eq!(err, "withdrawals are blocked while kill-switch is active");
+    }
+
+    #[tokio::test]
+    async fn execute_blocked_when_kill_switch_flips_on_after_request() {
+        let manager = make_manager();
+        let store = InMemoryEventStore::new();
+        let risk = make_risk();
+
+        let proposal = manager
+            .create_request(make_request("monthly transfer"), false, None, &*store)
+            .await
+            .expect("request should be created");
+
+        {
+            let mut guard = risk.lock().await;
+            guard.set_kill_switch(false);
+        }
+        {
+            let mut guard = risk.lock().await;
+            guard.set_kill_switch(true);
+        }
+
+        let err = manager
+            .execute(&proposal.id, AuthorityMode::Auto, &risk, None, &*store)
+            .await
+            .unwrap_err();
+        assert_eq!(err, "withdrawals are blocked while kill-switch is active");
+    }
 }
