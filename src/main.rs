@@ -768,6 +768,21 @@ async fn main() -> Result<()> {
             continue;
         }
 
+        let side_str = match order_side { risk::OrderSide::Buy => "BUY", risk::OrderSide::Sell => "SELL" };
+        let side_available_balance = {
+            let t = truth.lock().await;
+            t.available_balance_for_side(side_str)
+        };
+        if side_available_balance <= 0.0 {
+            info!(
+                side = side_str,
+                available = side_available_balance,
+                "Skipping execution: side-aware free balance is zero"
+            );
+            order_seq = order_seq.saturating_sub(1);
+            continue;
+        }
+
         let proposed = risk::ProposedOrder {
             symbol:         symbol.clone(),
             side:           order_side,
@@ -810,9 +825,6 @@ async fn main() -> Result<()> {
         event_store.append(events::risk_event(
             &risk_verdict, &proposed, &position_snapshot, &symbol, &correlation_id,
         ));
-
-        // Compute side_str here so it's available to the authority gate below.
-        let side_str = match order_side { risk::OrderSide::Buy => "BUY", risk::OrderSide::Sell => "SELL" };
 
         // ── Gate 4: Authority layer ───────────────────────────────────────────
         // OFF   → block (no execution from suggestion path)

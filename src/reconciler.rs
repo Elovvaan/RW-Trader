@@ -171,6 +171,10 @@ pub struct TruthState {
     pub total_balance_usd: f64,
     /// Free quote-asset amount usable for the active trading symbol.
     pub tradable_balance: f64,
+    /// Free quote-asset amount for BUY orders on the active symbol.
+    pub buy_power: f64,
+    /// Free base-asset amount for SELL orders on the active symbol.
+    pub sell_inventory: f64,
     /// Human-readable explanation of balance usability, if constrained.
     pub balance_status: Option<String>,
 
@@ -202,6 +206,8 @@ impl TruthState {
             balances: Vec::new(),
             total_balance_usd: 0.0,
             tradable_balance: 0.0,
+            buy_power: 0.0,
+            sell_inventory: 0.0,
             balance_status: None,
             seen_fill_ids: HashSet::new(),
             last_reconciled_at: None,
@@ -215,6 +221,18 @@ impl TruthState {
     /// False if state is dirty, reconcile is running, or we have never reconciled.
     pub fn can_place_order(&self) -> bool {
         !self.state_dirty && !self.recon_in_progress && self.last_reconciled_at.is_some()
+    }
+
+    /// Side-aware free balance used for readiness checks.
+    /// BUY consumes quote asset, SELL consumes base asset.
+    pub fn available_balance_for_side(&self, side: &str) -> f64 {
+        if side.eq_ignore_ascii_case("BUY") {
+            self.buy_power
+        } else if side.eq_ignore_ascii_case("SELL") {
+            self.sell_inventory
+        } else {
+            0.0
+        }
     }
 
     /// Register a new order record from a successful submission response.
@@ -284,7 +302,7 @@ fn map_balances(
     symbol: &str,
     balances: &[Balance],
     mark_price: f64,
-) -> (f64, f64, Option<String>) {
+) -> (f64, f64, f64, Option<String>) {
     let (base_asset, quote_asset) = split_symbol_assets(symbol);
     let mut total_usd = 0.0;
     let mut stable_sum = 0.0;
@@ -306,20 +324,37 @@ fn map_balances(
         }
     }
 
-    let tradable_balance = balances
+    let buy_power = balances
         .iter()
         .find(|b| b.asset.eq_ignore_ascii_case(quote_asset))
         .map(|b| b.free)
         .unwrap_or(0.0);
+    let sell_inventory = balances
+        .iter()
+        .find(|b| b.asset.eq_ignore_ascii_case(base_asset))
+        .map(|b| b.free)
+        .unwrap_or(0.0);
 
     let funds_detected = balances.iter().any(|b| (b.free + b.locked) > 0.0);
-    let balance_status = if tradable_balance > 0.0 || !funds_detected {
+    let balance_status = if !funds_detected {
         None
-    } else {
+    } else if buy_power <= 0.0 && sell_inventory > 0.0 {
+        Some(format!(
+            "You can SELL {} now. You cannot BUY more {} until you hold {}.",
+            base_asset, base_asset, quote_asset
+        ))
+    } else if buy_power <= 0.0 && sell_inventory <= 0.0 {
         Some(format!(
             "Funds detected but not in tradable asset for {} (requires {})",
             symbol, quote_asset
         ))
+    } else if sell_inventory <= 0.0 {
+        Some(format!(
+            "BUY ready with {}. SELL inventory empty for {}.",
+            quote_asset, base_asset
+        ))
+    } else {
+        None
     };
 
     let final_total = if total_usd > 0.0 {
@@ -333,7 +368,7 @@ fn map_balances(
         0.0
     };
 
-    (final_total, tradable_balance, balance_status)
+    (final_total, buy_power, sell_inventory, balance_status)
 }
 
 // ── Reconciliation ────────────────────────────────────────────────────────────
@@ -542,10 +577,12 @@ fn apply_reconciliation(
     for b in &balances {
         info!("  {} free={} locked={}", b.asset, b.free, b.locked);
     }
-    let (total_balance_usd, tradable_balance, balance_status) =
+    let (total_balance_usd, buy_power, sell_inventory, balance_status) =
         map_balances(&state.symbol, &balances, mark_price);
     state.total_balance_usd = total_balance_usd;
-    state.tradable_balance = tradable_balance;
+    state.tradable_balance = buy_power;
+    state.buy_power = buy_power;
+    state.sell_inventory = sell_inventory;
     state.balance_status = balance_status;
     state.balances = balances;
 
