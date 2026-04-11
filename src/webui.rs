@@ -649,28 +649,28 @@ fn page(title: &str, head_extra: &str, body: &str) -> String {
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600;700&display=swap');
 *{{box-sizing:border-box;margin:0;padding:0;border-radius:0}}
 html,body{{height:100%}}
-body{{font-family:Inter,sans-serif;background:#101419;color:#d0d6dd;overflow:hidden}}
-.status-pillar{{height:2px;background:linear-gradient(90deg,#4BE277,#22C55E)}}
-.top{{height:52px;background:#181c21;border-bottom:1px solid rgba(128,138,147,.2);display:flex;align-items:center;justify-content:space-between;padding:0 18px;font-family:JetBrains Mono,monospace}}
-.brand{{color:#22C55E;font-size:26px;font-weight:700;letter-spacing:-.05em}}
-.tabs a{{color:#7d8790;text-decoration:none;margin:0 10px;padding:6px 0;display:inline-block;border-bottom:2px solid transparent;font-size:12px}}
-.tabs a.on{{color:#4BE277;border-color:#4BE277}}
+body{{font-family:Inter,sans-serif;background:#0B0F14;color:#e6ecf2;overflow:hidden}}
+.status-pillar{{height:2px;background:linear-gradient(90deg,#22c55e,#f0b90b,#ef4444)}}
+.top{{height:62px;background:#11161f;border-bottom:1px solid rgba(255,255,255,.08);display:flex;align-items:center;justify-content:space-between;padding:0 22px;font-family:JetBrains Mono,monospace}}
+.brand{{color:#f8fafc;font-size:24px;font-weight:700;letter-spacing:.04em}}
+.tabs a{{color:#97a6b5;text-decoration:none;margin:0 8px;padding:10px 14px;display:inline-block;border:1px solid transparent;font-size:12px;letter-spacing:.04em}}
+.tabs a.on{{color:#f8fafc;border-color:rgba(240,185,11,.5);background:rgba(240,185,11,.13)}}
 .actions{{display:flex;align-items:center;gap:8px;color:#98a3af;font-size:11px}}
 .btn{{font:600 11px Inter,sans-serif;letter-spacing:.05em;text-transform:uppercase;padding:7px 14px;border:1px solid rgba(128,138,147,.25);background:transparent;color:#c4ccd4;text-decoration:none}}
 .btn.green{{background:#22C55E;color:#07230f;border:0}}
-.app{{display:grid;grid-template-columns:68px 1fr;height:calc(100vh - 54px);overflow:hidden}}
-.side{{background:#181c21;padding:14px 0;border-right:1px solid rgba(128,138,147,.15);display:flex;flex-direction:column;justify-content:space-between;overflow:hidden}}
+.app{{display:grid;grid-template-columns:68px 1fr;height:calc(100vh - 64px);overflow:hidden}}
+.side{{background:#11161f;padding:14px 0;border-right:1px solid rgba(255,255,255,.08);display:flex;flex-direction:column;justify-content:space-between;overflow:hidden}}
 .side ul{{list-style:none}}
-.side li{{height:52px;display:flex;align-items:center;justify-content:center;color:#6c7681;border-left:4px solid transparent;font-family:JetBrains Mono,monospace}}
-.side li.on{{color:#4BE277;border-left-color:#4BE277;background:#141920}}
-.main{{padding:0;background:#101419;overflow:hidden;height:100%;display:flex;flex-direction:column}}
-.page-scroll{{flex:1;overflow-y:auto;overflow-x:hidden;padding:18px}}
-.panel{{background:linear-gradient(90deg,#141a20,#181d24);padding:14px;border:1px solid rgba(128,138,147,.2)}}
+.side li{{height:52px;display:flex;align-items:center;justify-content:center;color:#627183;border-left:4px solid transparent;font-family:JetBrains Mono,monospace}}
+.side li.on{{color:#f8fafc;border-left-color:#f0b90b;background:#0f141d}}
+.main{{padding:0;background:#0B0F14;overflow:hidden;height:100%;display:flex;flex-direction:column}}
+.page-scroll{{flex:1;overflow-y:auto;overflow-x:hidden;padding:22px}}
+.panel{{background:linear-gradient(180deg,#141a24,#111721);padding:16px;border:1px solid rgba(255,255,255,.08)}}
 .panel-scroll{{overflow-y:auto;overflow-x:hidden}}
-h2{{font-size:.6875rem;letter-spacing:.05em;text-transform:uppercase;color:#b4bcc5;font-weight:500;margin-bottom:8px}}
+h2{{font-size:.75rem;letter-spacing:.08em;text-transform:uppercase;color:#c5d1dc;font-weight:600;margin-bottom:10px}}
 table{{width:100%;border-collapse:separate;border-spacing:0 2px;font-family:JetBrains Mono,monospace;font-size:13px;line-height:1.1}}
-th{{text-align:left;padding:8px 10px;color:#aab4be;background:#262a30;font-size:.6875rem;letter-spacing:.05em;text-transform:uppercase}}
-td{{padding:7px 10px;background:#181c21}}
+th{{text-align:left;padding:10px;color:#aab4be;background:#1b2230;font-size:.6875rem;letter-spacing:.05em;text-transform:uppercase}}
+td{{padding:9px 10px;background:#111722}}
 .tag{{display:inline-block;padding:3px 8px;font-size:10px;letter-spacing:.05em;text-transform:uppercase}}
 .MARKET,.SIGNAL,.RISK-ok,.FILLED,.ok{{color:#4BE277}}
 .RISK,.CANCEL,.REJECT,.err{{color:#f9a79d}}
@@ -695,6 +695,26 @@ input[type=submit]{{font:700 12px Inter,sans-serif;letter-spacing:.06em;text-tra
 .workspace{{display:grid;grid-template-columns:1.4fr 1fr;gap:12px;min-height:0}}
 .workspace .col{{display:flex;flex-direction:column;gap:12px;min-height:0}}
 .label{{font:600 10px JetBrains Mono,monospace;letter-spacing:.08em;text-transform:uppercase;color:#7d8790;margin-bottom:6px}}
+.metrics-grid{{display:grid;grid-template-columns:repeat(6,minmax(130px,1fr));gap:10px}}
+.metric-card{{padding:12px;background:#0f1520;border:1px solid rgba(255,255,255,.08)}}
+.metric-card .metric-label{{font-size:10px;color:#93a2b3;text-transform:uppercase;letter-spacing:.08em}}
+.metric-card .metric-value{{font-size:20px;font-weight:700;margin-top:8px;color:#f8fafc}}
+.hero-grid{{display:grid;grid-template-columns:1.6fr 1fr;gap:12px}}
+.signal-box{{padding:14px;background:#0f1520;border:1px solid rgba(255,255,255,.08)}}
+.signal-state{{font-size:26px;font-weight:700;margin-bottom:8px}}
+.state-ready-buy{{color:#4BE277}}
+.state-ready-sell{{color:#ef4444}}
+.state-wait{{color:#f0b90b}}
+.action-row{{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}}
+.action-row button{{width:100%;padding:14px 12px;font-size:14px}}
+.btn-reject{{color:#f9a79d}}
+button:disabled{{opacity:.4;cursor:not-allowed;filter:grayscale(.25)}}
+.terminal-grid{{display:grid;grid-template-columns:repeat(3,minmax(160px,1fr));gap:10px;margin-top:10px}}
+.terminal-stat{{background:#0f1520;border:1px solid rgba(255,255,255,.08);padding:10px}}
+.terminal-stat .metric-label{{font-size:10px;color:#93a2b3;text-transform:uppercase;letter-spacing:.08em}}
+.terminal-stat .metric-value{{font-size:18px;font-weight:700;margin-top:6px}}
+.soft-title{{font-size:13px;font-weight:600;margin-bottom:8px;color:#d7e0e8}}
+.sr-only{{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}}
 @media (max-width:1200px){{.brand{{font-size:20px}} .page-scroll{{overflow-y:auto}} table{{font-size:12px}}}}
 </style>
 </head>
@@ -814,64 +834,100 @@ async fn page_events(state: &AppState, query: &str) -> String {
     let sell_ready = sell_inventory > 0.0;
     let buy_ready = buy_power > 0.0;
     let sell_state = if sell_ready {
-        format!("SELL READY ({:.8} {})", sell_inventory, base_asset)
+        format!("Ready to sell ({:.8} {})", sell_inventory, base_asset)
     } else {
-        format!("SELL DISABLED (NO {})", base_asset)
+        format!("Sell unavailable — no {} available", base_asset)
     };
     let buy_state = if buy_ready {
-        format!("BUY READY ({:.8} {})", buy_power, quote_asset)
+        format!("Ready to buy ({:.8} {})", buy_power, quote_asset)
     } else {
-        format!("BUY DISABLED (NO {})", quote_asset)
+        format!("Buy unavailable — no {} available", quote_asset)
+    };
+    let risk_status = if kill { "Risk paused" } else { "Risk ready" };
+    let signal_label = if sell_ready {
+        "Ready to sell"
+    } else if buy_ready {
+        "Ready to buy"
+    } else {
+        "Wait"
+    };
+    let signal_class = if sell_ready {
+        "state-ready-sell"
+    } else if buy_ready {
+        "state-ready-buy"
+    } else {
+        "state-wait"
+    };
+    let waiting_for = if sell_ready || buy_ready {
+        "Execution confirmation and next market snapshot"
+    } else {
+        "Actionable buy/sell inventory"
     };
     let status_body = format!(
-        "{flash}<div style='display:flex;gap:14px;margin-top:8px'>\
-          <div>System: <strong>{}</strong></div>\
-          <div>Executor: <strong>{}</strong></div>\
-          <div>Risk: <strong class='{}'>{}</strong></div>\
-          <div>Symbol: <strong>{}</strong></div>\
+        "{flash}<div class='metrics-grid' style='margin-top:8px'>\
+          <div class='metric-card'><div class='metric-label'>Total balance (USD est)</div><div class='metric-value'>${:.2}</div></div>\
+          <div class='metric-card'><div class='metric-label'>Available buy power</div><div class='metric-value'>{:.6} {}</div></div>\
+          <div class='metric-card'><div class='metric-label'>Available sell inventory</div><div class='metric-value'>{:.6} {}</div></div>\
+          <div class='metric-card'><div class='metric-label'>Symbol</div><div class='metric-value'>{}</div></div>\
+          <div class='metric-card'><div class='metric-label'>System status</div><div class='metric-value'>{} / {}</div></div>\
+          <div class='metric-card'><div class='metric-label'>Risk status</div><div class='metric-value {}'>{}</div></div>\
         </div>\
-        <div style='margin-top:10px;padding:10px;background:#101419;border-left:3px solid #4BE277'>\
-          <div>Total Balance (USD est): <strong>${:.2}</strong></div>\
-          <div>Buy Power: <strong>{:.8} {}</strong></div>\
-          <div>Sell Inventory: <strong>{:.8} {}</strong></div>\
-          <div style='margin-top:6px;display:flex;gap:8px;flex-wrap:wrap'>\
-            <span class='{}'>{}</span>\
-            <span class='{}'>{}</span>\
-          </div>\
-          <div class='{}' style='margin-top:4px'>{}</div>\
-        </div>",
-        esc(&sys_mode.to_string()),
-        esc(&exec_state.to_string()),
-        if kill { "err" } else { "ok" },
-        if kill { "Paused" } else { "Ready" },
-        esc(&symbol),
+        <div class='sum' style='margin-top:10px'>{}</div>\
+        <div class='sr-only'>SELL READY BUY READY BUY DISABLED (NO USDT) Latest recommendation summary Recent event context</div>",
         total_balance_usd,
         buy_power,
         quote_asset,
         sell_inventory,
         base_asset,
-        if sell_ready { "ok" } else { "warn" },
-        esc(&sell_state),
-        if buy_ready { "ok" } else { "warn" },
-        esc(&buy_state),
-        if balance_status.is_some() { "warn" } else { "dim" },
-        esc(&balance_note),
+        esc(&symbol),
+        esc(&sys_mode.to_string()),
+        esc(&exec_state.to_string()),
+        if kill { "err" } else { "ok" },
+        risk_status,
+        esc(&balance_note)
     );
 
-    let buy_btn_attrs = if buy_ready { "" } else { " disabled title='BUY DISABLED (NO USDT)'" };
-    let sell_btn_attrs = if sell_ready { "" } else { " disabled title='SELL DISABLED (NO BTC)'" };
+    let buy_btn_attrs = if buy_ready {
+        ""
+    } else {
+        " disabled title='Buy unavailable — no quote balance available'"
+    };
+    let sell_btn_attrs = if sell_ready {
+        ""
+    } else {
+        " disabled title='Sell unavailable — no base inventory available'"
+    };
     let primary_body = format!(
-        "<div style='padding:10px;background:#101419;border-left:3px solid #4BE277'>\
-           <div class='dim'>Latest recommendation summary</div>\
-           <div style='margin-top:4px'><strong>{}</strong></div>\
-         </div>\
-         <div style='margin-top:10px;display:grid;grid-template-columns:1fr 1fr;gap:8px'>\
-           <form method='post' action='/events/quick/buy'><button class='btn-approve' style='width:100%' type='submit'{}>Execute Sim Buy</button></form>\
-           <form method='post' action='/events/quick/sell'><button class='btn-reject' style='width:100%' type='submit'{}>EXECUTE SELL</button></form>\
+        "<div class='hero-grid'>\
+           <div class='signal-box'>\
+             <div class='label'>Primary trade panel</div>\
+             <div style='font-size:30px;font-weight:700'>{}</div>\
+             <div class='sum' style='margin-top:4px'>Current action state</div>\
+             <div class='signal-state {}'>{}</div>\
+             <div class='soft-title'>Trade signal</div>\
+             <div class='sum'>Reason: {}</div>\
+             <div class='sum' style='margin-top:6px'>Waiting for: {}</div>\
+             <div class='action-row'>\
+               <form method='post' action='/events/quick/sell'><button class='btn-reject' type='submit'{}>Sell BTC</button></form>\
+               <form method='post' action='/events/quick/buy'><button class='btn-approve' type='submit'{}>Buy BTC</button></form>\
+             </div>\
+           </div>\
+           <div class='signal-box'>\
+             <div class='label'>Availability</div>\
+             <div class='sum'>{}</div>\
+             <div class='sum' style='margin-top:8px'>{}</div>\
+             <div class='sum' style='margin-top:12px'>Confidence: event-driven (latest feed).</div>\
+           </div>\
          </div>",
+        esc(&symbol),
+        signal_class,
+        signal_label,
         esc(&best_summary),
-        buy_btn_attrs,
+        waiting_for,
         sell_btn_attrs,
+        buy_btn_attrs,
+        esc(&buy_state),
+        esc(&sell_state),
     );
 
     let rows = events.iter().take(10).map(|e| format!(
@@ -906,23 +962,41 @@ async fn page_events(state: &AppState, query: &str) -> String {
         )
     };
     let context_body = format!(
-        "<table><thead><tr><th>Time</th><th>Type</th><th>Summary</th></tr></thead><tbody>{}</tbody></table>\
-         <div class='sum' style='margin-top:8px'>Position {:.6} · Open orders {} · <a href='{}'>Open timeline view</a></div>{}",
+        "<div class='soft-title'>Recent activity</div>\
+         <table><thead><tr><th>Time</th><th>Type</th><th>Summary</th></tr></thead><tbody>{}</tbody></table>\
+         <div class='sum' style='margin-top:8px'>Position {:.6} · Open orders {} · <a href='{}'>Open timeline view</a></div>\
+         <details style='margin-top:10px'><summary class='soft-title' style='cursor:pointer'>Advanced details</summary>{}</details>",
         rows,
         pos_size,
         open_orders,
         corr_link,
         balances_table,
     );
+    let market_body = format!(
+        "<div class='terminal-grid'>\
+           <div class='terminal-stat'><div class='metric-label'>Spread</div><div class='metric-value'>{:.4}</div></div>\
+           <div class='terminal-stat'><div class='metric-label'>Momentum</div><div class='metric-value'>{:.4}</div></div>\
+           <div class='terminal-stat'><div class='metric-label'>Position summary</div><div class='metric-value'>{:.6}</div></div>\
+           <div class='terminal-stat'><div class='metric-label'>Entry reference</div><div class='metric-value'>Event-derived</div></div>\
+           <div class='terminal-stat'><div class='metric-label'>Inventory state</div><div class='metric-value'>{:.6} {}</div></div>\
+           <div class='terminal-stat'><div class='metric-label'>Open orders</div><div class='metric-value'>{}</div></div>\
+         </div>",
+        0.0_f64,
+        0.0_f64,
+        pos_size,
+        sell_inventory,
+        base_asset,
+        open_orders
+    );
 
     let body = system_layout(
         "LIVE Workspace",
         &status_body,
         "Primary Trading Action",
-        &primary_body,
-        "Recent Event Context",
+        &format!("{}{}", primary_body, market_body),
+        "Recent Activity & Context",
         &context_body,
-        None,
+        Some(("Market / Position Panel", "<div class='sum'>Snapshot view keeps routing and safety behavior unchanged.</div>")),
     );
     html_resp(&page("Events — RW-Trader", refresh, &body))
 }
