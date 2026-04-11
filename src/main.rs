@@ -1,4 +1,5 @@
 mod assistant;
+mod agent;
 mod authority;
 mod client;
 mod events;
@@ -379,6 +380,26 @@ async fn main() -> Result<()> {
         info!("Web UI available at http://{}", web_ui_addr.as_deref().unwrap_or(""));
         info!("Server running on port {}", port_str);
     }
+
+    // ── 6c. Profit Sweep Agent loop ──────────────────────────────────────────
+    let sweep_cfg = agent::AgentConfig {
+        sweep_threshold: env_f64("SWEEP_THRESHOLD", 0.0),
+        sweep_asset: std::env::var("SWEEP_ASSET").unwrap_or_else(|_| "USDT".to_string()),
+        sweep_interval: Duration::from_secs(env_u64("SWEEP_INTERVAL", 30)),
+        sweep_network: std::env::var("WITHDRAW_DEFAULT_NETWORK").unwrap_or_else(|_| "ETH".to_string()),
+    };
+    let web_base_url = web_ui_addr.as_ref().map(|addr| format!("http://{}", addr));
+    agent::spawn_profit_sweep_agent(
+        sweep_cfg,
+        agent::AgentState {
+            store: Arc::clone(&event_store),
+            truth: Arc::clone(&truth),
+            authority: Arc::clone(&authority),
+            withdrawals: Arc::clone(&withdrawals),
+            client: Arc::clone(&client),
+            web_base_url,
+        },
+    );
 
     // ── 7. Spawn reconciliation loop (with executor + event store) ──────────
     let recon_secs = env_u64("RECONCILE_INTERVAL_SECS", 2);
