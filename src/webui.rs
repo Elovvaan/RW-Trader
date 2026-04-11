@@ -647,26 +647,27 @@ fn page(title: &str, head_extra: &str, body: &str) -> String {
 {head_extra}
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600;700&display=swap');
-*{{box-sizing:border-box;margin:0;padding:0;border-radius:0}}
-html,body{{height:100%}}
-body{{font-family:Inter,sans-serif;background:#0B0F14;color:#e6ecf2;overflow:hidden}}
+body{{margin:0;box-sizing:border-box;font-family:Inter,sans-serif;background:#0B0F14;color:#e6ecf2}}
+*,*::before,*::after{{box-sizing:inherit}}
+a{{color:inherit}}
+.app-shell{{max-width:1400px;margin:0 auto;padding:16px}}
 .status-pillar{{height:2px;background:linear-gradient(90deg,#22c55e,#f0b90b,#ef4444)}}
-.top{{height:62px;background:#11161f;border-bottom:1px solid rgba(255,255,255,.08);display:flex;align-items:center;justify-content:space-between;padding:0 22px;font-family:JetBrains Mono,monospace}}
+.top{{min-height:62px;background:#11161f;border:1px solid rgba(255,255,255,.08);display:flex;align-items:center;justify-content:space-between;padding:0 22px;font-family:JetBrains Mono,monospace}}
 .brand{{color:#f8fafc;font-size:24px;font-weight:700;letter-spacing:.04em}}
 .tabs a{{color:#97a6b5;text-decoration:none;margin:0 8px;padding:10px 14px;display:inline-block;border:1px solid transparent;font-size:12px;letter-spacing:.04em}}
 .tabs a.on{{color:#f8fafc;border-color:rgba(240,185,11,.5);background:rgba(240,185,11,.13)}}
 .actions{{display:flex;align-items:center;gap:8px;color:#98a3af;font-size:11px}}
 .btn{{font:600 11px Inter,sans-serif;letter-spacing:.05em;text-transform:uppercase;padding:7px 14px;border:1px solid rgba(128,138,147,.25);background:transparent;color:#c4ccd4;text-decoration:none}}
 .btn.green{{background:#22C55E;color:#07230f;border:0}}
-.app{{display:grid;grid-template-columns:68px 1fr;height:calc(100vh - 64px);overflow:hidden}}
-.side{{background:#11161f;padding:14px 0;border-right:1px solid rgba(255,255,255,.08);display:flex;flex-direction:column;justify-content:space-between;overflow:hidden}}
+.app{{display:grid;grid-template-columns:68px 1fr;gap:16px;margin-top:16px;align-items:start}}
+.side{{background:#11161f;padding:14px 0;border:1px solid rgba(255,255,255,.08);display:flex;flex-direction:column;justify-content:space-between}}
 .side ul{{list-style:none}}
 .side li{{height:52px;display:flex;align-items:center;justify-content:center;color:#627183;border-left:4px solid transparent;font-family:JetBrains Mono,monospace}}
 .side li.on{{color:#f8fafc;border-left-color:#f0b90b;background:#0f141d}}
-.main{{padding:0;background:#0B0F14;overflow:hidden;height:100%;display:flex;flex-direction:column}}
-.page-scroll{{flex:1;overflow-y:auto;overflow-x:hidden;padding:22px}}
+.main{{padding:0;background:#0B0F14;min-width:0}}
+.page-scroll{{padding:0}}
 .panel{{background:linear-gradient(180deg,#141a24,#111721);padding:16px;border:1px solid rgba(255,255,255,.08)}}
-.panel-scroll{{overflow-y:auto;overflow-x:hidden}}
+.panel-scroll{{overflow:auto}}
 h2{{font-size:.75rem;letter-spacing:.08em;text-transform:uppercase;color:#c5d1dc;font-weight:600;margin-bottom:10px}}
 table{{width:100%;border-collapse:separate;border-spacing:0 2px;font-family:JetBrains Mono,monospace;font-size:13px;line-height:1.1}}
 th{{text-align:left;padding:10px;color:#aab4be;background:#1b2230;font-size:.6875rem;letter-spacing:.05em;text-transform:uppercase}}
@@ -692,8 +693,8 @@ input[type=submit]{{font:700 12px Inter,sans-serif;letter-spacing:.06em;text-tra
 .log-dock>summary::before{{content:"▸";color:#4BE277}}
 .log-dock[open]>summary::before{{content:"▾"}}
 .log-content{{height:110px;overflow-y:auto;padding:7px 14px;color:#82909f}}
-.workspace{{display:grid;grid-template-columns:1.4fr 1fr;gap:12px;min-height:0}}
-.workspace .col{{display:flex;flex-direction:column;gap:12px;min-height:0}}
+.workspace{{display:grid;grid-template-columns:2fr 1fr;gap:16px;align-items:start}}
+.workspace .col{{display:flex;flex-direction:column;gap:16px}}
 .label{{font:600 10px JetBrains Mono,monospace;letter-spacing:.08em;text-transform:uppercase;color:#7d8790;margin-bottom:6px}}
 .metrics-grid{{display:grid;grid-template-columns:repeat(6,minmax(130px,1fr));gap:10px}}
 .metric-card{{padding:12px;background:#0f1520;border:1px solid rgba(255,255,255,.08)}}
@@ -715,11 +716,12 @@ button:disabled{{opacity:.4;cursor:not-allowed;filter:grayscale(.25)}}
 .terminal-stat .metric-value{{font-size:18px;font-weight:700;margin-top:6px}}
 .soft-title{{font-size:13px;font-weight:600;margin-bottom:8px;color:#d7e0e8}}
 .sr-only{{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}}
-@media (max-width:1200px){{.brand{{font-size:20px}} .page-scroll{{overflow-y:auto}} table{{font-size:12px}}}}
+@media (max-width:1200px){{.brand{{font-size:20px}} table{{font-size:12px}} .workspace{{grid-template-columns:1fr}} .app{{grid-template-columns:1fr}} .side{{display:none}}}}
 </style>
 </head>
 <body>
 <div class="status-pillar"></div>
+<div class="app-shell">
 <header class="top">
   <div class="brand">RW-TRADER</div>
   <nav class="tabs"><a class="{live_on}" href="/events">LIVE</a><a class="{demo_on}" href="/status">DEMO</a><a class="{funds_on}" href="/suggestions">FUNDS</a><a class="{settings_on}" href="/assistant">SETTINGS</a></nav>
@@ -731,6 +733,7 @@ button:disabled{{opacity:.4;cursor:not-allowed;filter:grayscale(.25)}}
     <ul><li>?</li><li>☰</li></ul>
   </aside>
   <main class="main">{body}</main>
+</div>
 </div>
 <script>
 document.querySelectorAll('form').forEach((form) => {{
