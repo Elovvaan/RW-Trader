@@ -16,11 +16,13 @@ type HmacSha256 = Hmac<Sha256>;
 // ── Response types ────────────────────────────────────────────────────────────
 // These mirror the Binance API exactly. Fields match the JSON keys via serde.
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Balance {
     pub asset: String,
-    pub free: String,
-    pub locked: String,
+    #[serde(deserialize_with = "de_str_f64")]
+    pub free: f64,
+    #[serde(deserialize_with = "de_str_f64")]
+    pub locked: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -153,6 +155,14 @@ struct BinanceError {
 struct ServerTime {
     #[serde(rename = "serverTime")]
     server_time: u64,
+}
+
+fn de_str_f64<'de, D>(deserializer: D) -> std::result::Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    s.parse::<f64>().map_err(serde::de::Error::custom)
 }
 
 // ── Client ────────────────────────────────────────────────────────────────────
@@ -386,19 +396,25 @@ impl BinanceClient {
             .send()
             .await?;
 
-        let account: AccountInfo = Self::parse_response(resp, "account").await?;
+        let account: AccountInfo = match Self::parse_response(resp, "account").await {
+            Ok(a) => a,
+            Err(e) => {
+                let msg = format!("{e:#}");
+                let no_permission = msg.contains("Binance error -2015")
+                    || msg.contains("Invalid API-key, IP, or permissions for action")
+                    || msg.contains("Binance error -2014")
+                    || msg.to_ascii_lowercase().contains("permission");
+                if no_permission {
+                    bail!(
+                        "Balance read permission denied. Enable Spot & Reading permissions for this API key. Original error: {}",
+                        msg
+                    );
+                }
+                return Err(e);
+            }
+        };
 
-        // Filter zero balances — useful for real accounts with many assets
-        let nonzero: Vec<Balance> = account
-            .balances
-            .into_iter()
-            .filter(|b| {
-                b.free.parse::<f64>().unwrap_or(0.0) > 0.0
-                    || b.locked.parse::<f64>().unwrap_or(0.0) > 0.0
-            })
-            .collect();
-
-        Ok(nonzero)
+        Ok(account.balances)
     }
 
     pub async fn fetch_open_orders(&self, symbol: &str) -> Result<Vec<OpenOrder>> {
