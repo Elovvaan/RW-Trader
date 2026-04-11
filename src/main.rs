@@ -741,6 +741,13 @@ async fn main() -> Result<()> {
             continue;
         }
 
+        let sell_side_free_balance = if matches!(order_side, risk::OrderSide::Sell) {
+            let t = truth.lock().await;
+            t.available_balance_for_side("SELL").max(0.0)
+        } else {
+            0.0
+        };
+
         let dynamic_qty = {
             let strat = strategy_engine.lock().await;
             let notional_budget_qty = if proposed_price > 0.0 {
@@ -753,7 +760,17 @@ async fn main() -> Result<()> {
                     regime_weight,
                     &signal_result.metrics,
                 ),
-                risk::OrderSide::Sell => position_snapshot.size.max(0.0),
+                risk::OrderSide::Sell => {
+                    let pos_qty = position_snapshot.size.max(0.0);
+                    if pos_qty > 0.0 {
+                        pos_qty
+                    } else {
+                        // Position-aware immediate SELL path:
+                        // if we are flat but hold base inventory from balances,
+                        // allow execution from free base balance.
+                        sell_side_free_balance
+                    }
+                }
             }
         };
         info!(

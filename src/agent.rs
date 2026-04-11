@@ -297,23 +297,63 @@ pub fn spawn_trade_agent(cfg: TradeAgentConfig, state: AgentState) {
                 signal.compute_metrics_pub(&feed)
             };
 
-            let (decision, side, reason) = if metrics.momentum_5s > cfg.momentum_threshold
-                && metrics.spread_bps <= cfg.max_spread_bps
-            {
+            let (position_size, buy_power, sell_inventory) = {
+                let t = state.truth.lock().await;
+                (t.position.size.max(0.0), t.buy_power.max(0.0), t.sell_inventory.max(0.0))
+            };
+            let has_base = sell_inventory > 0.0;
+            let has_quote = buy_power > 0.0;
+            let market_buy_ok = metrics.momentum_5s > cfg.momentum_threshold
+                && metrics.spread_bps <= cfg.max_spread_bps;
+            let market_sell_ok = metrics.momentum_5s < -cfg.momentum_threshold;
+
+            // Position-aware + action-first routing:
+            //   1) If we hold base inventory, prioritise SELL opportunities.
+            //   2) If we hold quote inventory, prioritise BUY opportunities.
+            //   3) If both are available, still prefer SELL first to reduce base exposure.
+            let (decision, side, reason) = if has_base && market_sell_ok {
+                (
+                    "INVENTORY_SELL",
+                    Some("SELL"),
+                    format!(
+                        "priority=base_first pos={:.8} sell_inventory={:.8} buy_power={:.8} momentum={:+.6}<-{:.6} spread_bps={:.2}",
+                        position_size, sell_inventory, buy_power, metrics.momentum_5s, cfg.momentum_threshold, metrics.spread_bps
+                    ),
+                )
+            } else if has_quote && market_buy_ok {
+                (
+                    "INVENTORY_BUY",
+                    Some("BUY"),
+                    format!(
+                        "priority=quote_first pos={:.8} buy_power={:.8} sell_inventory={:.8} momentum={:+.6}>{:.6} spread_bps={:.2}<={:.2}",
+                        position_size, buy_power, sell_inventory, metrics.momentum_5s, cfg.momentum_threshold, metrics.spread_bps, cfg.max_spread_bps
+                    ),
+                )
+            } else if has_base && !has_quote && position_size < 1e-9 {
+                // Flat position but base inventory exists: keep SELL path immediately available.
+                (
+                    "SELL_READY",
+                    Some("SELL"),
+                    format!(
+                        "flat_with_base_inventory pos={:.8} sell_inventory={:.8} buy_power={:.8} momentum={:+.6} spread_bps={:.2}",
+                        position_size, sell_inventory, buy_power, metrics.momentum_5s, metrics.spread_bps
+                    ),
+                )
+            } else if market_buy_ok {
                 (
                     "LONG",
                     Some("BUY"),
                     format!(
-                        "momentum={:+.6}>{:.6} spread_bps={:.2}<={:.2} imbalance_1s={:+.3} price={:.2}",
+                        "fallback momentum={:+.6}>{:.6} spread_bps={:.2}<={:.2} imbalance_1s={:+.3} price={:.2}",
                         metrics.momentum_5s, cfg.momentum_threshold, metrics.spread_bps, cfg.max_spread_bps, metrics.imbalance_1s, metrics.mid
                     ),
                 )
-            } else if metrics.momentum_5s < -cfg.momentum_threshold {
+            } else if market_sell_ok {
                 (
                     "SHORT",
                     Some("SELL"),
                     format!(
-                        "momentum={:+.6}<-{:.6} spread_bps={:.2} imbalance_1s={:+.3} price={:.2}",
+                        "fallback momentum={:+.6}<-{:.6} spread_bps={:.2} imbalance_1s={:+.3} price={:.2}",
                         metrics.momentum_5s, cfg.momentum_threshold, metrics.spread_bps, metrics.imbalance_1s, metrics.mid
                     ),
                 )
@@ -322,8 +362,8 @@ pub fn spawn_trade_agent(cfg: TradeAgentConfig, state: AgentState) {
                     "HOLD",
                     None,
                     format!(
-                        "momentum={:+.6} threshold={:.6} spread_bps={:.2} imbalance_1s={:+.3} price={:.2}",
-                        metrics.momentum_5s, cfg.momentum_threshold, metrics.spread_bps, metrics.imbalance_1s, metrics.mid
+                        "momentum={:+.6} threshold={:.6} spread_bps={:.2} imbalance_1s={:+.3} price={:.2} pos={:.8} buy_power={:.8} sell_inventory={:.8}",
+                        metrics.momentum_5s, cfg.momentum_threshold, metrics.spread_bps, metrics.imbalance_1s, metrics.mid, position_size, buy_power, sell_inventory
                     ),
                 )
             };
