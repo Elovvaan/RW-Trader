@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -32,6 +32,17 @@ impl NpcRole {
             NpcRole::InventoryManager => "inventory_manager",
             NpcRole::Learner => "learner",
         }
+    }
+
+    fn all() -> [NpcRole; 6] {
+        [
+            NpcRole::Scout,
+            NpcRole::DipBuyer,
+            NpcRole::MomentumExecutor,
+            NpcRole::RiskManager,
+            NpcRole::InventoryManager,
+            NpcRole::Learner,
+        ]
     }
 }
 
@@ -94,6 +105,33 @@ impl NpcTradingMode {
             Self::Live => "live",
         }
     }
+
+    fn learner_writable(&self) -> bool {
+        matches!(self, Self::Simulation | Self::Paper)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum MarketRegime {
+    TrendingUp,
+    TrendingDown,
+    MeanRevert,
+    Choppy,
+    Volatile,
+    Illiquid,
+}
+
+impl MarketRegime {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::TrendingUp => "TRENDING_UP",
+            Self::TrendingDown => "TRENDING_DOWN",
+            Self::MeanRevert => "MEAN_REVERT",
+            Self::Choppy => "CHOPPY",
+            Self::Volatile => "VOLATILE",
+            Self::Illiquid => "ILLIQUID",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -107,6 +145,57 @@ pub struct NpcGuardConfig {
 }
 
 #[derive(Clone, Debug)]
+pub struct NpcAlphaConfig {
+    pub min_action_score: f64,
+    pub vol_spike_bps: f64,
+    pub choppy_band_bps: f64,
+    pub min_horizon_alignment: f64,
+    pub max_concurrent_positions: usize,
+    pub max_symbol_exposure_notional: f64,
+    pub max_capital_at_risk_notional: f64,
+    pub max_drawdown_pct: f64,
+    pub drawdown_derisk_trigger_pct: f64,
+    pub drawdown_hard_stop_pct: f64,
+    pub per_agent_budget_pct: HashMap<NpcRole, f64>,
+}
+
+#[derive(Clone, Debug)]
+struct LearnerRange {
+    min: f64,
+    max: f64,
+    current: f64,
+    step: f64,
+}
+
+impl LearnerRange {
+    fn bounded(mut self) -> Self {
+        if self.current < self.min {
+            self.current = self.min;
+        }
+        if self.current > self.max {
+            self.current = self.max;
+        }
+        self
+    }
+
+    fn nudge_tighter(&mut self) {
+        self.current = (self.current - self.step).max(self.min);
+    }
+
+    fn nudge_looser(&mut self) {
+        self.current = (self.current + self.step).min(self.max);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LearnerConfigRanges {
+    spread_tolerance_bps: LearnerRange,
+    dip_trigger_pct: LearnerRange,
+    cooldown_secs: LearnerRange,
+    regime_score_cutoff: HashMap<MarketRegime, LearnerRange>,
+}
+
+#[derive(Clone, Debug)]
 pub struct NpcConfig {
     pub enabled: bool,
     pub cycle_interval: Duration,
@@ -116,10 +205,20 @@ pub struct NpcConfig {
     pub dip_trigger_pct: f64,
     pub mode: NpcTradingMode,
     pub guards: NpcGuardConfig,
+    pub alpha: NpcAlphaConfig,
 }
 
 impl NpcConfig {
     pub fn from_trade_cfg(cfg: &TradeAgentConfig) -> Self {
+        let per_agent_budget_pct = HashMap::from([
+            (NpcRole::Scout, env_f64("NPC_BUDGET_SCOUT", 0.10)),
+            (NpcRole::DipBuyer, env_f64("NPC_BUDGET_DIP", 0.25)),
+            (NpcRole::MomentumExecutor, env_f64("NPC_BUDGET_MOMENTUM", 0.30)),
+            (NpcRole::RiskManager, env_f64("NPC_BUDGET_RISK", 0.15)),
+            (NpcRole::InventoryManager, env_f64("NPC_BUDGET_INVENTORY", 0.20)),
+            (NpcRole::Learner, env_f64("NPC_BUDGET_LEARNER", 0.05)),
+        ]);
+
         Self {
             enabled: cfg.active(),
             cycle_interval: cfg.poll_interval,
@@ -136,6 +235,19 @@ impl NpcConfig {
                 max_position_qty: env_f64("NPC_MAX_POSITION_QTY", cfg.trade_size.max(0.0) * 4.0),
                 kill_switch: env_bool("NPC_KILL_SWITCH", false),
             },
+            alpha: NpcAlphaConfig {
+                min_action_score: env_f64("NPC_MIN_ACTION_SCORE", 0.10),
+                vol_spike_bps: env_f64("NPC_VOL_SPIKE_BPS", 45.0),
+                choppy_band_bps: env_f64("NPC_CHOPPY_BAND_BPS", 3.0),
+                min_horizon_alignment: env_f64("NPC_MIN_HORIZON_ALIGNMENT", 0.30),
+                max_concurrent_positions: env_usize("NPC_MAX_CONCURRENT_POSITIONS", 2),
+                max_symbol_exposure_notional: env_f64("NPC_MAX_SYMBOL_EXPOSURE", 2_000.0),
+                max_capital_at_risk_notional: env_f64("NPC_MAX_CAPITAL_AT_RISK", 3_000.0),
+                max_drawdown_pct: env_f64("NPC_MAX_DRAWDOWN_PCT", 0.08),
+                drawdown_derisk_trigger_pct: env_f64("NPC_DERISK_DRAWDOWN_PCT", 0.04),
+                drawdown_hard_stop_pct: env_f64("NPC_DRAWDOWN_HARD_STOP_PCT", 0.07),
+                per_agent_budget_pct,
+            },
         }
     }
 }
@@ -146,8 +258,36 @@ struct WorkerProposal {
     role: NpcRole,
     side: String,
     score: f64,
+    raw_score: f64,
     reason: String,
     expected_slippage_bps: f64,
+    regime_eligible: bool,
+    regime_block_reason: Option<String>,
+    score_parts: ScoreBreakdown,
+    expected_hold_secs: f64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ScoreBreakdown {
+    edge_estimate: f64,
+    spread_cost: f64,
+    slippage_risk: f64,
+    liquidity_quality: f64,
+    volatility_penalty: f64,
+    conflict_penalty: f64,
+    hold_efficiency: f64,
+}
+
+impl ScoreBreakdown {
+    fn final_score(&self) -> f64 {
+        self.edge_estimate
+            - self.spread_cost
+            - self.slippage_risk
+            + self.liquidity_quality
+            - self.volatility_penalty
+            - self.conflict_penalty
+            + self.hold_efficiency
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -163,22 +303,58 @@ struct AgentPerformance {
     executed: u64,
     blocked: u64,
     wins: u64,
+    losses: u64,
     gross_pnl: f64,
+    peak_pnl: f64,
+    drawdown: f64,
     total_slippage_bps: f64,
     total_spread_bps: f64,
     total_hold_ms: f64,
 }
 
+impl AgentPerformance {
+    fn win_rate(&self) -> f64 {
+        if self.executed == 0 {
+            return 0.0;
+        }
+        self.wins as f64 / self.executed as f64
+    }
+
+    fn quality_score(&self) -> f64 {
+        let pnl_component = (self.gross_pnl / 10.0).clamp(-0.5, 0.5);
+        let win_component = (self.win_rate() - 0.5) * 0.8;
+        let dd_penalty = self.drawdown.min(1.0) * 0.7;
+        (1.0 + pnl_component + win_component - dd_penalty).clamp(0.15, 1.8)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct OpenAction {
+    role: NpcRole,
+    side: String,
+    entry_mid: f64,
+    opened_at: Instant,
+    entry_spread_bps: f64,
+    expected_edge: f64,
+    regime: MarketRegime,
+    allocated_qty: f64,
+    cycle_id: u64,
+}
+
 #[derive(Default)]
 struct NpcRuntimeState {
-    // ephemeral runtime/action state layer
     action_state: HashMap<String, ActionState>,
     last_action_at: HashMap<NpcRole, Instant>,
     mid_history: VecDeque<f64>,
-    open_actions: HashMap<String, (NpcRole, String, f64, Instant, f64)>, // role, side, entry_mid, ts, spread
+    spread_history: VecDeque<f64>,
+    open_actions: BTreeMap<String, OpenAction>,
     paper_executions: u64,
-    // derived metrics layer
     perf: HashMap<NpcRole, AgentPerformance>,
+    cycle_seq: u64,
+    cycle_open_notional: f64,
+    peak_equity: f64,
+    regime_perf: HashMap<(NpcRole, MarketRegime), AgentPerformance>,
+    learner_ranges: Option<LearnerConfigRanges>,
 }
 
 pub fn spawn_npc_trading_layer(cfg: NpcConfig, state: AgentState) {
@@ -192,12 +368,16 @@ pub fn spawn_npc_trading_layer(cfg: NpcConfig, state: AgentState) {
         let mut interval = tokio::time::interval(cfg.cycle_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        log_npc_event(&*state.store, "layer_started", &format!(
-            "mode={} interval_s={} trade_size={:.8}",
-            cfg.mode.as_str(),
-            cfg.cycle_interval.as_secs(),
-            cfg.trade_size
-        ));
+        log_npc_event(
+            &*state.store,
+            "layer_started",
+            &format!(
+                "mode={} interval_s={} trade_size={:.8}",
+                cfg.mode.as_str(),
+                cfg.cycle_interval.as_secs(),
+                cfg.trade_size
+            ),
+        );
 
         loop {
             interval.tick().await;
@@ -220,178 +400,627 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         signal.compute_metrics_pub(&feed)
     };
 
-    let (position_size, buy_power, sell_inventory) = {
+    let (position_size, buy_power, sell_inventory, exposure_notional) = {
         let t = state.truth.lock().await;
-        (t.position.size.max(0.0), t.buy_power.max(0.0), t.sell_inventory.max(0.0))
+        let pos = t.position.size.max(0.0);
+        let mid = metrics.mid.max(0.0);
+        (pos, t.buy_power.max(0.0), t.sell_inventory.max(0.0), pos * mid)
     };
 
     let mut rt = runtime.lock().await;
+    rt.cycle_seq = rt.cycle_seq.saturating_add(1);
+    let cycle_id = rt.cycle_seq;
     if metrics.mid.is_finite() && metrics.mid > 0.0 {
         rt.mid_history.push_back(metrics.mid);
-        while rt.mid_history.len() > 64 {
+        while rt.mid_history.len() > 128 {
             rt.mid_history.pop_front();
         }
     }
+    if metrics.spread_bps.is_finite() && metrics.spread_bps >= 0.0 {
+        rt.spread_history.push_back(metrics.spread_bps);
+        while rt.spread_history.len() > 128 {
+            rt.spread_history.pop_front();
+        }
+    }
 
-    let mut candidates = build_worker_candidates(cfg, &rt.mid_history, &metrics, position_size, buy_power, sell_inventory);
+    if rt.learner_ranges.is_none() {
+        rt.learner_ranges = Some(default_learner_ranges(cfg));
+    }
+    let mut effective_cfg = cfg.clone();
+    apply_learner_overrides(&mut effective_cfg, &mut rt);
+
+    let regime = detect_regime(&effective_cfg, &rt.mid_history, &rt.spread_history, &metrics);
+    let portfolio_controls = evaluate_portfolio_controls(&effective_cfg, &rt, position_size, exposure_notional, metrics.mid, regime);
+
+    let mut candidates = build_worker_candidates(
+        &effective_cfg,
+        cycle_id,
+        &rt,
+        &metrics,
+        position_size,
+        buy_power,
+        sell_inventory,
+        regime,
+        !matches!(exec_state, ExecutionState::Idle) || !pending.is_empty(),
+    );
+
+    let regime_cutoff = rt
+        .learner_ranges
+        .as_ref()
+        .and_then(|r| r.regime_score_cutoff.get(&regime).map(|v| v.current))
+        .unwrap_or(effective_cfg.alpha.min_action_score);
+
     for c in &candidates {
         rt.perf.entry(c.role).or_default().proposed += 1;
-        lifecycle(&*state.store, c.role, &c.action_id, NpcLifecycleState::Proposed, &c.reason);
-        rt.action_state.insert(c.action_id.clone(), ActionState { status: Some(NpcLifecycleState::Proposed), actor: Some(c.role), created_at: Some(Instant::now()) });
+        lifecycle(
+            &*state.store,
+            c.role,
+            &c.action_id,
+            NpcLifecycleState::Proposed,
+            &format!(
+                "regime={} score={:.4} edge={:.4} spread_cost={:.4} liquidity={:.4}",
+                regime.as_str(),
+                c.score,
+                c.score_parts.edge_estimate,
+                c.score_parts.spread_cost,
+                c.score_parts.liquidity_quality
+            ),
+        );
+        rt.action_state.insert(
+            c.action_id.clone(),
+            ActionState {
+                status: Some(NpcLifecycleState::Proposed),
+                actor: Some(c.role),
+                created_at: Some(Instant::now()),
+            },
+        );
     }
 
-    if candidates.is_empty() {
-        observe_and_learn(&mut rt, &*state.store, metrics.mid);
+    candidates.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.role.cmp(&b.role))
+    });
+
+    let metrics_line = format_cycle_metrics(cycle_id, regime, &candidates, regime_cutoff, &portfolio_controls);
+    log_npc_event(&*state.store, "alpha_cycle", &metrics_line);
+
+    let Some(chosen) = candidates.first().cloned() else {
+        log_npc_event(&*state.store, "no_action", &format!("cycle={} reason=NO_CANDIDATES", cycle_id));
+        observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
         return;
-    }
+    };
 
-    candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal).then_with(|| a.role.cmp(&b.role)));
-
-    let chosen = candidates[0].clone();
     for stale in candidates.iter().skip(1) {
-        lifecycle(&*state.store, stale.role, &stale.action_id, NpcLifecycleState::Superseded, "lower ranked candidate superseded by orchestrator");
+        lifecycle(
+            &*state.store,
+            stale.role,
+            &stale.action_id,
+            NpcLifecycleState::Superseded,
+            "lower-ranked candidate superseded by orchestrator ranking",
+        );
     }
 
-    if !matches!(exec_state, ExecutionState::Idle) || !pending.is_empty() {
-        lifecycle(&*state.store, chosen.role, &chosen.action_id, NpcLifecycleState::Conflict, "executor non-idle or pending proposal conflict");
+    if let Some(reason) = chosen.regime_block_reason.clone() {
+        lifecycle(
+            &*state.store,
+            chosen.role,
+            &chosen.action_id,
+            NpcLifecycleState::Blocked,
+            &reason,
+        );
         rt.perf.entry(chosen.role).or_default().blocked += 1;
+        observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
         return;
     }
 
-    let guard_reasons = evaluate_guards(cfg, &rt, chosen.role, &chosen.side, position_size, &metrics, chosen.expected_slippage_bps);
+    if chosen.score < regime_cutoff {
+        lifecycle(
+            &*state.store,
+            chosen.role,
+            &chosen.action_id,
+            NpcLifecycleState::Blocked,
+            &format!(
+                "NO_ACTION_SCORE_BELOW_THRESHOLD:{:.4}<{:.4}",
+                chosen.score, regime_cutoff
+            ),
+        );
+        rt.perf.entry(chosen.role).or_default().blocked += 1;
+        observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
+        return;
+    }
+
+    if !portfolio_controls.is_empty() {
+        lifecycle(
+            &*state.store,
+            chosen.role,
+            &chosen.action_id,
+            NpcLifecycleState::Blocked,
+            &portfolio_controls.join("|"),
+        );
+        rt.perf.entry(chosen.role).or_default().blocked += 1;
+        observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
+        return;
+    }
+
+    let allocation = allocate_capital(&effective_cfg, &rt, &chosen, position_size, exposure_notional, buy_power, metrics.mid);
+    if allocation.qty <= 0.0 {
+        lifecycle(
+            &*state.store,
+            chosen.role,
+            &chosen.action_id,
+            NpcLifecycleState::Blocked,
+            &format!("ALLOCATION_REJECTED:{}", allocation.reason),
+        );
+        rt.perf.entry(chosen.role).or_default().blocked += 1;
+        observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
+        return;
+    }
+
+    let guard_reasons = evaluate_guards(
+        &effective_cfg,
+        &rt,
+        chosen.role,
+        &chosen.side,
+        position_size,
+        &metrics,
+        chosen.expected_slippage_bps,
+    );
     if !guard_reasons.is_empty() {
-        lifecycle(&*state.store, chosen.role, &chosen.action_id, NpcLifecycleState::Blocked, &guard_reasons.join("|"));
+        lifecycle(
+            &*state.store,
+            chosen.role,
+            &chosen.action_id,
+            NpcLifecycleState::Blocked,
+            &guard_reasons.join("|"),
+        );
         rt.perf.entry(chosen.role).or_default().blocked += 1;
+        observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
         return;
     }
 
-    lifecycle(&*state.store, chosen.role, &chosen.action_id, NpcLifecycleState::Authorized, "all orchestrator and guard checks passed");
+    lifecycle(
+        &*state.store,
+        chosen.role,
+        &chosen.action_id,
+        NpcLifecycleState::Authorized,
+        &format!(
+            "rank=1 score={:.4} raw_score={:.4} allocation_qty={:.8} allocation_reason={}",
+            chosen.score, chosen.raw_score, allocation.qty, allocation.reason
+        ),
+    );
 
-    if cfg.mode == NpcTradingMode::Live && rt.paper_executions == 0 {
-        lifecycle(&*state.store, chosen.role, &chosen.action_id, NpcLifecycleState::Rejected, "live mode requires at least one successful paper execution first");
+    if effective_cfg.mode == NpcTradingMode::Live && rt.paper_executions == 0 {
+        lifecycle(
+            &*state.store,
+            chosen.role,
+            &chosen.action_id,
+            NpcLifecycleState::Rejected,
+            "live mode requires at least one successful paper execution first",
+        );
         rt.perf.entry(chosen.role).or_default().blocked += 1;
+        observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
         return;
     }
 
     lifecycle(&*state.store, chosen.role, &chosen.action_id, NpcLifecycleState::Queued, "ready for dispatch");
 
-    if cfg.mode == NpcTradingMode::Simulation {
-        lifecycle(&*state.store, chosen.role, &chosen.action_id, NpcLifecycleState::Executing, "simulation mode dispatch");
-        lifecycle(&*state.store, chosen.role, &chosen.action_id, NpcLifecycleState::Executed, "simulation fill accepted");
+    if effective_cfg.mode == NpcTradingMode::Simulation {
+        lifecycle(
+            &*state.store,
+            chosen.role,
+            &chosen.action_id,
+            NpcLifecycleState::Executing,
+            "simulation mode dispatch",
+        );
+        lifecycle(
+            &*state.store,
+            chosen.role,
+            &chosen.action_id,
+            NpcLifecycleState::Executed,
+            "simulation fill accepted",
+        );
         rt.last_action_at.insert(chosen.role, Instant::now());
         rt.perf.entry(chosen.role).or_default().executed += 1;
     } else {
         let Some(url) = state.web_base_url.as_ref().map(|b| format!("{}/trade/request", b)) else {
-            lifecycle(&*state.store, chosen.role, &chosen.action_id, NpcLifecycleState::Expired, "WEB_UI_ADDR missing; cannot dispatch trade request");
+            lifecycle(
+                &*state.store,
+                chosen.role,
+                &chosen.action_id,
+                NpcLifecycleState::Expired,
+                "WEB_UI_ADDR missing; cannot dispatch trade request",
+            );
+            observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
             return;
         };
 
         let mut form = HashMap::new();
         form.insert("symbol".to_string(), state.symbol.clone());
         form.insert("side".to_string(), chosen.side.clone());
-        form.insert("size".to_string(), format!("{:.8}", cfg.trade_size));
-        form.insert("reason".to_string(), format!("npc role={} action_id={} reason={}", chosen.role.as_str(), chosen.action_id, chosen.reason));
+        form.insert("size".to_string(), format!("{:.8}", allocation.qty));
+        form.insert(
+            "reason".to_string(),
+            format!(
+                "npc cycle={} role={} action_id={} regime={} score={:.4} expected_edge={:.4}",
+                cycle_id,
+                chosen.role.as_str(),
+                chosen.action_id,
+                regime.as_str(),
+                chosen.score,
+                chosen.score_parts.edge_estimate
+            ),
+        );
 
-        lifecycle(&*state.store, chosen.role, &chosen.action_id, NpcLifecycleState::Executing, "dispatching trade request to web layer");
+        lifecycle(
+            &*state.store,
+            chosen.role,
+            &chosen.action_id,
+            NpcLifecycleState::Executing,
+            "dispatching trade request to web layer",
+        );
         match reqwest::Client::new().post(&url).form(&form).send().await {
             Ok(resp) if resp.status().is_success() => {
-                lifecycle(&*state.store, chosen.role, &chosen.action_id, NpcLifecycleState::Executed, &format!("http_status={}", resp.status()));
+                lifecycle(
+                    &*state.store,
+                    chosen.role,
+                    &chosen.action_id,
+                    NpcLifecycleState::Executed,
+                    &format!("http_status={}", resp.status()),
+                );
                 rt.last_action_at.insert(chosen.role, Instant::now());
                 rt.perf.entry(chosen.role).or_default().executed += 1;
                 rt.paper_executions += 1;
             }
             Ok(resp) => {
-                lifecycle(&*state.store, chosen.role, &chosen.action_id, NpcLifecycleState::Rejected, &format!("http_status={}", resp.status()));
+                lifecycle(
+                    &*state.store,
+                    chosen.role,
+                    &chosen.action_id,
+                    NpcLifecycleState::Rejected,
+                    &format!("http_status={}", resp.status()),
+                );
+                observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
                 return;
             }
             Err(e) => {
-                lifecycle(&*state.store, chosen.role, &chosen.action_id, NpcLifecycleState::Rejected, &format!("request_error={}", e));
+                lifecycle(
+                    &*state.store,
+                    chosen.role,
+                    &chosen.action_id,
+                    NpcLifecycleState::Rejected,
+                    &format!("request_error={}", e),
+                );
+                observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
                 return;
             }
         }
     }
 
-    rt.open_actions.insert(chosen.action_id.clone(), (chosen.role, chosen.side.clone(), metrics.mid, Instant::now(), metrics.spread_bps));
-    observe_and_learn(&mut rt, &*state.store, metrics.mid);
+    let expected_edge = chosen.score_parts.edge_estimate - chosen.score_parts.spread_cost - chosen.score_parts.slippage_risk;
+    rt.cycle_open_notional += allocation.qty * metrics.mid.max(0.0);
+    rt.open_actions.insert(
+        chosen.action_id.clone(),
+        OpenAction {
+            role: chosen.role,
+            side: chosen.side.clone(),
+            entry_mid: metrics.mid,
+            opened_at: Instant::now(),
+            entry_spread_bps: metrics.spread_bps,
+            expected_edge,
+            regime,
+            allocated_qty: allocation.qty,
+            cycle_id,
+        },
+    );
+    log_npc_event(
+        &*state.store,
+        "capital_allocation",
+        &format!(
+            "cycle={} action_id={} role={} qty={:.8} quality_score={:.4} recent_perf={:.4} exposure_notional={:.2} symbol_concentration={:.4} drawdown={:.4}",
+            cycle_id,
+            chosen.action_id,
+            chosen.role.as_str(),
+            allocation.qty,
+            allocation.quality,
+            allocation.recent_performance,
+            exposure_notional,
+            allocation.symbol_concentration,
+            allocation.drawdown,
+        ),
+    );
+
+    observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
 }
 
-fn build_worker_candidates(
+fn default_learner_ranges(cfg: &NpcConfig) -> LearnerConfigRanges {
+    let mut regime_score_cutoff = HashMap::new();
+    for regime in [
+        MarketRegime::TrendingUp,
+        MarketRegime::TrendingDown,
+        MarketRegime::MeanRevert,
+        MarketRegime::Choppy,
+        MarketRegime::Volatile,
+        MarketRegime::Illiquid,
+    ] {
+        regime_score_cutoff.insert(
+            regime,
+            LearnerRange {
+                min: 0.02,
+                max: 2.5,
+                current: cfg.alpha.min_action_score,
+                step: 0.02,
+            }
+            .bounded(),
+        );
+    }
+    LearnerConfigRanges {
+        spread_tolerance_bps: LearnerRange {
+            min: 1.0,
+            max: cfg.guards.max_spread_bps.max(1.0),
+            current: cfg.guards.max_spread_bps,
+            step: 0.5,
+        }
+        .bounded(),
+        dip_trigger_pct: LearnerRange {
+            min: 0.001,
+            max: 0.02,
+            current: cfg.dip_trigger_pct,
+            step: 0.0005,
+        }
+        .bounded(),
+        cooldown_secs: LearnerRange {
+            min: 1.0,
+            max: 30.0,
+            current: cfg.guards.cooldown_secs as f64,
+            step: 1.0,
+        }
+        .bounded(),
+        regime_score_cutoff,
+    }
+}
+
+fn apply_learner_overrides(cfg: &mut NpcConfig, rt: &mut NpcRuntimeState) {
+    let Some(ranges) = rt.learner_ranges.as_ref() else {
+        return;
+    };
+    cfg.guards.max_spread_bps = ranges.spread_tolerance_bps.current;
+    cfg.dip_trigger_pct = ranges.dip_trigger_pct.current;
+    cfg.guards.cooldown_secs = ranges.cooldown_secs.current.round() as u64;
+    let _ = cfg;
+}
+
+fn detect_regime(
     cfg: &NpcConfig,
     mid_history: &VecDeque<f64>,
+    spread_history: &VecDeque<f64>,
+    metrics: &crate::signal::SignalMetrics,
+) -> MarketRegime {
+    let short = pct_change(mid_history, 3).unwrap_or(0.0);
+    let long = pct_change(mid_history, 12).unwrap_or(short);
+    let alignment = horizon_alignment(short, long);
+    let vol_bps = realized_volatility_bps(mid_history, 16).unwrap_or(0.0);
+    let avg_spread = rolling_avg(spread_history, 12).unwrap_or(metrics.spread_bps.max(0.0));
+    let liquidity = metrics.trade_samples as f64;
+
+    if liquidity < cfg.guards.min_liquidity_score || avg_spread > cfg.guards.max_spread_bps * 1.25 {
+        return MarketRegime::Illiquid;
+    }
+    if vol_bps >= cfg.alpha.vol_spike_bps {
+        return MarketRegime::Volatile;
+    }
+    if alignment < cfg.alpha.min_horizon_alignment {
+        return MarketRegime::Choppy;
+    }
+
+    let momentum = metrics.momentum_5s;
+    if momentum > cfg.momentum_threshold && short > 0.0 && long > 0.0 {
+        return MarketRegime::TrendingUp;
+    }
+    if momentum < -cfg.momentum_threshold && short < 0.0 && long < 0.0 {
+        return MarketRegime::TrendingDown;
+    }
+
+    let band = cfg.alpha.choppy_band_bps / 10_000.0;
+    if short.abs() < band && long.abs() < band {
+        MarketRegime::MeanRevert
+    } else {
+        MarketRegime::Choppy
+    }
+}
+
+fn regime_allowlist(role: NpcRole) -> HashSet<MarketRegime> {
+    match role {
+        NpcRole::Scout => HashSet::from([
+            MarketRegime::TrendingUp,
+            MarketRegime::TrendingDown,
+            MarketRegime::MeanRevert,
+            MarketRegime::Choppy,
+        ]),
+        NpcRole::DipBuyer => HashSet::from([MarketRegime::TrendingUp, MarketRegime::MeanRevert]),
+        NpcRole::MomentumExecutor => HashSet::from([MarketRegime::TrendingUp, MarketRegime::TrendingDown]),
+        NpcRole::RiskManager => HashSet::from([
+            MarketRegime::Volatile,
+            MarketRegime::Illiquid,
+            MarketRegime::TrendingDown,
+            MarketRegime::Choppy,
+        ]),
+        NpcRole::InventoryManager => HashSet::from([
+            MarketRegime::TrendingDown,
+            MarketRegime::MeanRevert,
+            MarketRegime::Choppy,
+        ]),
+        NpcRole::Learner => HashSet::from([
+            MarketRegime::TrendingUp,
+            MarketRegime::TrendingDown,
+            MarketRegime::MeanRevert,
+            MarketRegime::Choppy,
+            MarketRegime::Volatile,
+            MarketRegime::Illiquid,
+        ]),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_worker_candidates(
+    cfg: &NpcConfig,
+    cycle_id: u64,
+    rt: &NpcRuntimeState,
     metrics: &crate::signal::SignalMetrics,
     position_size: f64,
     buy_power: f64,
     sell_inventory: f64,
+    regime: MarketRegime,
+    has_conflict: bool,
 ) -> Vec<WorkerProposal> {
     let mut proposals = Vec::new();
     let momentum = metrics.momentum_5s;
     let liquidity_score = (metrics.trade_samples as f64).max(0.0);
+    let dip = dip_pct_from_history(&rt.mid_history, cfg.dip_lookback_cycles);
 
-    proposals.push(WorkerProposal {
-        action_id: format!("scout-{}", uuid::Uuid::new_v4()),
-        role: NpcRole::Scout,
-        side: if momentum >= 0.0 { "BUY".into() } else { "SELL".into() },
-        score: momentum.abs() * 1000.0 + liquidity_score * 0.01,
-        reason: format!("scout_opportunity momentum_5s={:+.6} liquidity_score={:.2}", momentum, liquidity_score),
-        expected_slippage_bps: metrics.spread_bps * 0.5,
-    });
+    for role in NpcRole::all() {
+        let allow = regime_allowlist(role);
+        let regime_eligible = allow.contains(&regime);
+        let regime_block_reason = if regime_eligible {
+            None
+        } else {
+            Some(format!(
+                "REGIME_MISMATCH role={} regime={} blocked",
+                role.as_str(),
+                regime.as_str()
+            ))
+        };
 
-    if buy_power > 0.0 {
-        if let Some(dip) = dip_pct_from_history(mid_history, cfg.dip_lookback_cycles) {
-            if dip <= -cfg.dip_trigger_pct {
-                proposals.push(WorkerProposal {
-                    action_id: format!("dip-{}", uuid::Uuid::new_v4()),
-                    role: NpcRole::DipBuyer,
-                    side: "BUY".into(),
-                    score: (-dip * 1500.0).max(0.0),
-                    reason: format!("dip_trigger dip_pct={:+.4}% lookback={} trigger=-{:.4}%", dip * 100.0, cfg.dip_lookback_cycles, cfg.dip_trigger_pct * 100.0),
-                    expected_slippage_bps: metrics.spread_bps * 0.6,
-                });
+        let (side, reason, expected_slippage_bps, expected_hold_secs) = match role {
+            NpcRole::Scout => (
+                if momentum >= 0.0 { "BUY" } else { "SELL" },
+                format!(
+                    "scout_scan momentum_5s={:+.6} liquidity={:.2}",
+                    momentum, liquidity_score
+                ),
+                metrics.spread_bps * 0.55,
+                6.0,
+            ),
+            NpcRole::DipBuyer => {
+                let dip_msg = dip
+                    .map(|d| format!("dip_pct={:+.4}%", d * 100.0))
+                    .unwrap_or_else(|| "dip_pct=NA".to_string());
+                ("BUY", format!("dip_reversion {}", dip_msg), metrics.spread_bps * 0.62, 30.0)
             }
-        }
-    }
+            NpcRole::MomentumExecutor => (
+                if momentum >= 0.0 { "BUY" } else { "SELL" },
+                format!("momentum_follow momentum_5s={:+.6}", momentum),
+                metrics.spread_bps * 0.72,
+                18.0,
+            ),
+            NpcRole::RiskManager => (
+                "SELL",
+                format!(
+                    "risk_defense spread_bps={:.2} vol_proxy={:.2}",
+                    metrics.spread_bps,
+                    realized_volatility_bps(&rt.mid_history, 10).unwrap_or(0.0)
+                ),
+                metrics.spread_bps * 0.40,
+                10.0,
+            ),
+            NpcRole::InventoryManager => (
+                "SELL",
+                format!("inventory_relief sell_inventory={:.8}", sell_inventory),
+                metrics.spread_bps * 0.50,
+                22.0,
+            ),
+            NpcRole::Learner => (
+                if momentum >= 0.0 { "BUY" } else { "SELL" },
+                "learner_observe_policy".to_string(),
+                metrics.spread_bps * 0.10,
+                4.0,
+            ),
+        };
 
-    if momentum > cfg.momentum_threshold {
+        let score_parts = score_candidate(
+            cfg,
+            rt,
+            role,
+            metrics,
+            side,
+            expected_slippage_bps,
+            expected_hold_secs,
+            has_conflict,
+            dip,
+            buy_power,
+            sell_inventory,
+            position_size,
+        );
+        let raw_score = score_parts.final_score();
+        let score = raw_score.max(-5.0);
         proposals.push(WorkerProposal {
-            action_id: format!("mom-{}", uuid::Uuid::new_v4()),
-            role: NpcRole::MomentumExecutor,
-            side: "BUY".into(),
-            score: momentum * 2000.0,
-            reason: format!("momentum_breakout momentum_5s={:+.6} threshold={:.6}", momentum, cfg.momentum_threshold),
-            expected_slippage_bps: metrics.spread_bps * 0.7,
+            action_id: format!("c{}-{}", cycle_id, role.as_str()),
+            role,
+            side: side.to_string(),
+            score,
+            raw_score,
+            reason,
+            expected_slippage_bps,
+            regime_eligible,
+            regime_block_reason,
+            score_parts,
+            expected_hold_secs,
         });
     }
-
-    if sell_inventory > 0.0 && momentum < -cfg.momentum_threshold {
-        proposals.push(WorkerProposal {
-            action_id: format!("inv-{}", uuid::Uuid::new_v4()),
-            role: NpcRole::InventoryManager,
-            side: "SELL".into(),
-            score: momentum.abs() * 1800.0 + position_size,
-            reason: format!("inventory_risk_reduction momentum_5s={:+.6}", momentum),
-            expected_slippage_bps: metrics.spread_bps * 0.5,
-        });
-    }
-
-    proposals.push(WorkerProposal {
-        action_id: format!("risk-{}", uuid::Uuid::new_v4()),
-        role: NpcRole::RiskManager,
-        side: "SELL".into(),
-        score: if metrics.spread_bps > cfg.guards.max_spread_bps { 9999.0 } else { 0.0 },
-        reason: format!("risk_watch spread_bps={:.2} cap={:.2}", metrics.spread_bps, cfg.guards.max_spread_bps),
-        expected_slippage_bps: metrics.spread_bps,
-    });
-
-    proposals.push(WorkerProposal {
-        action_id: format!("learn-{}", uuid::Uuid::new_v4()),
-        role: NpcRole::Learner,
-        side: "BUY".into(),
-        score: 0.01,
-        reason: "learner_observe_only".into(),
-        expected_slippage_bps: 0.0,
-    });
 
     proposals
+}
+
+#[allow(clippy::too_many_arguments)]
+fn score_candidate(
+    cfg: &NpcConfig,
+    rt: &NpcRuntimeState,
+    role: NpcRole,
+    metrics: &crate::signal::SignalMetrics,
+    side: &str,
+    expected_slippage_bps: f64,
+    expected_hold_secs: f64,
+    has_conflict: bool,
+    dip: Option<f64>,
+    buy_power: f64,
+    sell_inventory: f64,
+    position_size: f64,
+) -> ScoreBreakdown {
+    let momentum = metrics.momentum_5s;
+    let edge_bias = match role {
+        NpcRole::Scout => momentum.abs() * 1000.0,
+        NpcRole::DipBuyer => dip.map(|v| (-v * 1400.0).max(0.0)).unwrap_or(0.0),
+        NpcRole::MomentumExecutor => momentum.abs() * 1700.0,
+        NpcRole::RiskManager => (metrics.spread_bps / cfg.guards.max_spread_bps.max(0.1)).clamp(0.0, 2.0),
+        NpcRole::InventoryManager => (sell_inventory + position_size) * 5.0,
+        NpcRole::Learner => 0.05,
+    };
+
+    let side_penalty = if side.eq_ignore_ascii_case("BUY") && buy_power <= 0.0 {
+        2.0
+    } else if side.eq_ignore_ascii_case("SELL") && sell_inventory <= 0.0 && position_size <= 0.0 {
+        2.0
+    } else {
+        0.0
+    };
+
+    let liquidity_quality = ((metrics.trade_samples as f64) / 10.0).clamp(0.0, 1.4);
+    let volatility_penalty = (realized_volatility_bps(&rt.mid_history, 8).unwrap_or(0.0) / cfg.alpha.vol_spike_bps.max(1.0)).clamp(0.0, 3.0);
+    let spread_cost = (metrics.spread_bps / cfg.guards.max_spread_bps.max(0.1)).clamp(0.0, 3.0);
+    let slippage_risk = (expected_slippage_bps / cfg.guards.max_slippage_bps.max(0.1)).clamp(0.0, 3.0);
+    let conflict_penalty = if has_conflict { 1.0 } else { 0.0 } + side_penalty;
+    let hold_efficiency = (1.0 / expected_hold_secs.max(1.0)).clamp(0.01, 0.20);
+
+    ScoreBreakdown {
+        edge_estimate: edge_bias,
+        spread_cost,
+        slippage_risk,
+        liquidity_quality,
+        volatility_penalty,
+        conflict_penalty,
+        hold_efficiency,
+    }
 }
 
 fn evaluate_guards(
@@ -408,14 +1037,23 @@ fn evaluate_guards(
         reasons.push("KILL_SWITCH_ACTIVE".to_string());
     }
     if metrics.spread_bps > cfg.guards.max_spread_bps {
-        reasons.push(format!("MAX_SPREAD_BPS_EXCEEDED:{:.2}>{:.2}", metrics.spread_bps, cfg.guards.max_spread_bps));
+        reasons.push(format!(
+            "MAX_SPREAD_BPS_EXCEEDED:{:.2}>{:.2}",
+            metrics.spread_bps, cfg.guards.max_spread_bps
+        ));
     }
     let liquidity_score = metrics.trade_samples as f64;
     if liquidity_score < cfg.guards.min_liquidity_score {
-        reasons.push(format!("LIQUIDITY_TOO_LOW:{:.2}<{:.2}", liquidity_score, cfg.guards.min_liquidity_score));
+        reasons.push(format!(
+            "LIQUIDITY_TOO_LOW:{:.2}<{:.2}",
+            liquidity_score, cfg.guards.min_liquidity_score
+        ));
     }
     if expected_slippage_bps > cfg.guards.max_slippage_bps {
-        reasons.push(format!("SLIPPAGE_CEILING_EXCEEDED:{:.2}>{:.2}", expected_slippage_bps, cfg.guards.max_slippage_bps));
+        reasons.push(format!(
+            "SLIPPAGE_CEILING_EXCEEDED:{:.2}>{:.2}",
+            expected_slippage_bps, cfg.guards.max_slippage_bps
+        ));
     }
     if let Some(last_at) = rt.last_action_at.get(&role) {
         if last_at.elapsed() < Duration::from_secs(cfg.guards.cooldown_secs) {
@@ -423,69 +1061,306 @@ fn evaluate_guards(
         }
     }
     if side.eq_ignore_ascii_case("BUY") && position_size + cfg.trade_size > cfg.guards.max_position_qty {
-        reasons.push(format!("POSITION_LIMIT_EXCEEDED:{:.8}>{:.8}", position_size + cfg.trade_size, cfg.guards.max_position_qty));
+        reasons.push(format!(
+            "POSITION_LIMIT_EXCEEDED:{:.8}>{:.8}",
+            position_size + cfg.trade_size,
+            cfg.guards.max_position_qty
+        ));
     }
     reasons
 }
 
-fn observe_and_learn(rt: &mut NpcRuntimeState, store: &dyn EventStore, current_mid: f64) {
+fn evaluate_portfolio_controls(
+    cfg: &NpcConfig,
+    rt: &NpcRuntimeState,
+    position_size: f64,
+    exposure_notional: f64,
+    mid: f64,
+    regime: MarketRegime,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if rt.open_actions.len() >= cfg.alpha.max_concurrent_positions {
+        reasons.push(format!(
+            "MAX_CONCURRENT_POSITIONS:{}>={}",
+            rt.open_actions.len(),
+            cfg.alpha.max_concurrent_positions
+        ));
+    }
+    if exposure_notional >= cfg.alpha.max_symbol_exposure_notional {
+        reasons.push(format!(
+            "MAX_SYMBOL_EXPOSURE:{:.2}>={:.2}",
+            exposure_notional, cfg.alpha.max_symbol_exposure_notional
+        ));
+    }
+    let total_at_risk = rt.cycle_open_notional + exposure_notional;
+    if total_at_risk >= cfg.alpha.max_capital_at_risk_notional {
+        reasons.push(format!(
+            "MAX_CAPITAL_AT_RISK:{:.2}>={:.2}",
+            total_at_risk, cfg.alpha.max_capital_at_risk_notional
+        ));
+    }
+
+    let aggregate_pnl: f64 = rt.perf.values().map(|p| p.gross_pnl).sum();
+    let equity = (position_size * mid.max(0.0)) + aggregate_pnl;
+    let peak = rt.peak_equity.max(equity.max(0.0));
+    let dd = if peak > 0.0 { ((peak - equity) / peak).max(0.0) } else { 0.0 };
+    if dd >= cfg.alpha.max_drawdown_pct {
+        reasons.push(format!("MAX_DRAWDOWN_BREACH:{:.4}>={:.4}", dd, cfg.alpha.max_drawdown_pct));
+    }
+    if dd >= cfg.alpha.drawdown_hard_stop_pct {
+        reasons.push("AUTO_DERISK_DRAWDOWN_EXPANSION".to_string());
+    }
+    if matches!(regime, MarketRegime::Volatile) {
+        reasons.push("AUTO_DERISK_VOLATILITY_SPIKE".to_string());
+    }
+
+    reasons
+}
+
+struct AllocationDecision {
+    qty: f64,
+    reason: String,
+    quality: f64,
+    recent_performance: f64,
+    symbol_concentration: f64,
+    drawdown: f64,
+}
+
+fn allocate_capital(
+    cfg: &NpcConfig,
+    rt: &NpcRuntimeState,
+    chosen: &WorkerProposal,
+    _position_size: f64,
+    exposure_notional: f64,
+    buy_power: f64,
+    mid: f64,
+) -> AllocationDecision {
+    let perf = rt.perf.get(&chosen.role).cloned().unwrap_or_default();
+    let quality = perf.quality_score();
+    let recent_performance = perf.gross_pnl.clamp(-10.0, 10.0) / 10.0;
+    let symbol_concentration = if cfg.alpha.max_symbol_exposure_notional > 0.0 {
+        (exposure_notional / cfg.alpha.max_symbol_exposure_notional).clamp(0.0, 2.0)
+    } else {
+        0.0
+    };
+
+    let total_pnl: f64 = rt.perf.values().map(|p| p.gross_pnl).sum();
+    let peak = rt.peak_equity.max(1.0);
+    let drawdown = ((peak - (peak + total_pnl)) / peak).max(0.0);
+
+    let agent_budget = cfg.alpha.per_agent_budget_pct.get(&chosen.role).copied().unwrap_or(0.05).clamp(0.01, 0.80);
+    let dd_factor = if drawdown >= cfg.alpha.drawdown_derisk_trigger_pct { 0.35 } else { 1.0 };
+
+    let size_multiplier = quality * (1.0 + recent_performance).clamp(0.3, 1.4) * (1.0 - symbol_concentration).clamp(0.1, 1.0) * dd_factor;
+    let mut qty = cfg.trade_size * agent_budget * size_multiplier;
+
+    let max_by_buy_power = if mid > 0.0 { buy_power / mid } else { 0.0 };
+    qty = qty.min(max_by_buy_power.max(0.0));
+
+    if drawdown >= cfg.alpha.drawdown_hard_stop_pct {
+        qty = 0.0;
+        return AllocationDecision {
+            qty,
+            reason: "DRAWDOWN_HARD_STOP".to_string(),
+            quality,
+            recent_performance,
+            symbol_concentration,
+            drawdown,
+        };
+    }
+
+    if qty < 0.000_000_01 {
+        return AllocationDecision {
+            qty: 0.0,
+            reason: "ALLOCATION_BELOW_MIN_SIZE".to_string(),
+            quality,
+            recent_performance,
+            symbol_concentration,
+            drawdown,
+        };
+    }
+
+    AllocationDecision {
+        qty,
+        reason: "CAPITAL_ALLOCATOR_ACCEPT".to_string(),
+        quality,
+        recent_performance,
+        symbol_concentration,
+        drawdown,
+    }
+}
+
+fn observe_and_learn(cfg: &NpcConfig, rt: &mut NpcRuntimeState, store: &dyn EventStore, current_mid: f64) {
     let mut close_ids = Vec::new();
-    for (id, (role, side, entry_mid, ts, spread)) in rt.open_actions.iter() {
-        if ts.elapsed() >= Duration::from_secs(1) {
-            lifecycle(store, *role, id, NpcLifecycleState::Observed, "one-cycle post-execution observation complete");
-            let pnl = if side == "BUY" { current_mid - *entry_mid } else { *entry_mid - current_mid };
-            let hold_ms = ts.elapsed().as_secs_f64() * 1000.0;
-            let perf = rt.perf.entry(*role).or_default();
+    let mut learner_updates: Vec<(NpcRole, MarketRegime, f64)> = Vec::new();
+    for (id, open) in rt.open_actions.iter() {
+        if open.opened_at.elapsed() >= Duration::from_secs(1) {
+            lifecycle(
+                store,
+                open.role,
+                id,
+                NpcLifecycleState::Observed,
+                "one-cycle post-execution observation complete",
+            );
+            let pnl = if open.side.eq_ignore_ascii_case("BUY") {
+                (current_mid - open.entry_mid) * open.allocated_qty
+            } else {
+                (open.entry_mid - current_mid) * open.allocated_qty
+            };
+            let hold_ms = open.opened_at.elapsed().as_secs_f64() * 1000.0;
+            let perf = rt.perf.entry(open.role).or_default();
             perf.gross_pnl += pnl;
-            if pnl > 0.0 { perf.wins += 1; }
+            perf.peak_pnl = perf.peak_pnl.max(perf.gross_pnl);
+            perf.drawdown = ((perf.peak_pnl - perf.gross_pnl) / perf.peak_pnl.max(1e-9)).max(0.0);
+            if pnl > 0.0 {
+                perf.wins += 1;
+            } else {
+                perf.losses += 1;
+            }
             perf.total_hold_ms += hold_ms;
-            perf.total_spread_bps += *spread;
-            perf.total_slippage_bps += spread * 0.5;
+            perf.total_spread_bps += open.entry_spread_bps;
+            perf.total_slippage_bps += open.entry_spread_bps * 0.5;
+
+            let realized_edge = if open.entry_mid > 0.0 {
+                pnl / open.entry_mid
+            } else {
+                0.0
+            };
+
+            let regime_perf = rt.regime_perf.entry((open.role, open.regime)).or_default();
+            regime_perf.gross_pnl += pnl;
+            regime_perf.executed += 1;
+            if pnl > 0.0 {
+                regime_perf.wins += 1;
+            }
+
             lifecycle(
                 store,
                 NpcRole::Learner,
                 id,
                 NpcLifecycleState::Learned,
                 &format!(
-                    "derived_metrics role={} pnl={:+.6} hold_ms={:.0} win_rate={:.2}%",
-                    role.as_str(),
+                    "alpha_metrics cycle={} role={} regime={} expected_edge={:+.6} realized_edge={:+.6} pnl={:+.6} hold_ms={:.0}",
+                    open.cycle_id,
+                    open.role.as_str(),
+                    open.regime.as_str(),
+                    open.expected_edge,
+                    realized_edge,
                     pnl,
-                    hold_ms,
-                    if perf.executed > 0 { (perf.wins as f64 / perf.executed as f64) * 100.0 } else { 0.0 }
+                    hold_ms
                 ),
             );
+
             log_npc_event(
                 store,
-                "agent_metrics",
+                "trade_metrics",
                 &format!(
-                    "role={} proposed={} executed={} blocked={} pnl={:+.6} win_rate={:.2}% avg_spread_entry={:.2} avg_slippage={:.2} avg_hold_ms={:.0}",
-                    role.as_str(),
-                    perf.proposed,
-                    perf.executed,
-                    perf.blocked,
-                    perf.gross_pnl,
-                    if perf.executed > 0 { (perf.wins as f64 / perf.executed as f64) * 100.0 } else { 0.0 },
-                    if perf.executed > 0 { perf.total_spread_bps / perf.executed as f64 } else { 0.0 },
-                    if perf.executed > 0 { perf.total_slippage_bps / perf.executed as f64 } else { 0.0 },
-                    if perf.executed > 0 { perf.total_hold_ms / perf.executed as f64 } else { 0.0 },
+                    "action_id={} role={} regime={} expected_edge={:+.6} realized_edge={:+.6} pnl={:+.6} hold_ms={:.0} qty={:.8}",
+                    id,
+                    open.role.as_str(),
+                    open.regime.as_str(),
+                    open.expected_edge,
+                    realized_edge,
+                    pnl,
+                    hold_ms,
+                    open.allocated_qty,
                 ),
             );
+
+            if cfg.mode.learner_writable() {
+                learner_updates.push((open.role, open.regime, realized_edge));
+            }
+
             close_ids.push(id.clone());
         }
     }
     for id in close_ids {
-        rt.open_actions.remove(&id);
+        if let Some(open) = rt.open_actions.remove(&id) {
+            rt.cycle_open_notional = (rt.cycle_open_notional - (open.allocated_qty * open.entry_mid).max(0.0)).max(0.0);
+        }
+    }
+    for (role, regime, realized_edge) in learner_updates {
+        learner_update_ranges(rt, role, regime, realized_edge);
     }
 }
 
+fn learner_update_ranges(rt: &mut NpcRuntimeState, role: NpcRole, regime: MarketRegime, realized_edge: f64) {
+    let Some(ranges) = rt.learner_ranges.as_mut() else {
+        return;
+    };
+    let improving = realized_edge > 0.0;
+    if improving {
+        ranges.spread_tolerance_bps.nudge_tighter();
+        ranges.cooldown_secs.nudge_looser();
+        ranges.dip_trigger_pct.nudge_looser();
+    } else {
+        ranges.spread_tolerance_bps.nudge_looser();
+        ranges.cooldown_secs.nudge_tighter();
+        ranges.dip_trigger_pct.nudge_tighter();
+    }
+    if let Some(cutoff) = ranges.regime_score_cutoff.get_mut(&regime) {
+        if improving {
+            cutoff.nudge_tighter();
+        } else {
+            cutoff.nudge_looser();
+        }
+    }
+
+    if let Some(p) = rt.perf.get(&role) {
+        let eq = p.gross_pnl.max(0.0);
+        rt.peak_equity = rt.peak_equity.max(eq);
+    }
+}
+
+fn format_cycle_metrics(
+    cycle_id: u64,
+    regime: MarketRegime,
+    candidates: &[WorkerProposal],
+    threshold: f64,
+    portfolio_controls: &[String],
+) -> String {
+    let mut candidate_summary = Vec::new();
+    for c in candidates {
+        candidate_summary.push(format!(
+            "{}:{:.4}:eligible={}:edge={:.3}:spread={:.3}:slip={:.3}:liq={:.3}:vol_pen={:.3}:conf_pen={:.3}:hold={:.3}",
+            c.role.as_str(),
+            c.score,
+            c.regime_eligible,
+            c.score_parts.edge_estimate,
+            c.score_parts.spread_cost,
+            c.score_parts.slippage_risk,
+            c.score_parts.liquidity_quality,
+            c.score_parts.volatility_penalty,
+            c.score_parts.conflict_penalty,
+            c.score_parts.hold_efficiency,
+        ));
+    }
+    format!(
+        "cycle={} regime={} threshold={:.4} controls={} candidates=[{}]",
+        cycle_id,
+        regime.as_str(),
+        threshold,
+        if portfolio_controls.is_empty() {
+            "NONE".to_string()
+        } else {
+            portfolio_controls.join("|")
+        },
+        candidate_summary.join(",")
+    )
+}
+
 fn lifecycle(store: &dyn EventStore, role: NpcRole, action_id: &str, state: NpcLifecycleState, reason: &str) {
-    log_npc_event(store, "lifecycle", &format!(
-        "action_id={} role={} state={} reason_code={}",
-        action_id,
-        role.as_str(),
-        state.as_str(),
-        reason,
-    ));
+    log_npc_event(
+        store,
+        "lifecycle",
+        &format!(
+            "action_id={} role={} state={} reason_code={}",
+            action_id,
+            role.as_str(),
+            state.as_str(),
+            reason,
+        ),
+    );
 }
 
 fn log_npc_event(store: &dyn EventStore, action: &str, reason: &str) {
@@ -510,6 +1385,66 @@ fn dip_pct_from_history(mid_history: &VecDeque<f64>, lookback_cycles: usize) -> 
     Some((current_mid / reference_mid) - 1.0)
 }
 
+fn pct_change(mid_history: &VecDeque<f64>, lookback: usize) -> Option<f64> {
+    let now = mid_history.back().copied().filter(|v| *v > 0.0)?;
+    let then = mid_history
+        .len()
+        .checked_sub(1 + lookback)
+        .and_then(|idx| mid_history.get(idx).copied())
+        .filter(|v| *v > 0.0)?;
+    Some((now / then) - 1.0)
+}
+
+fn horizon_alignment(short: f64, long: f64) -> f64 {
+    let denom = short.abs() + long.abs();
+    if denom == 0.0 {
+        return 1.0;
+    }
+    1.0 - ((short - long).abs() / denom).clamp(0.0, 1.0)
+}
+
+fn rolling_avg(history: &VecDeque<f64>, len: usize) -> Option<f64> {
+    if history.is_empty() {
+        return None;
+    }
+    let mut sum = 0.0;
+    let mut n = 0.0;
+    for v in history.iter().rev().take(len) {
+        sum += *v;
+        n += 1.0;
+    }
+    if n == 0.0 {
+        None
+    } else {
+        Some(sum / n)
+    }
+}
+
+fn realized_volatility_bps(mid_history: &VecDeque<f64>, len: usize) -> Option<f64> {
+    if mid_history.len() < 3 {
+        return None;
+    }
+    let mut rets = Vec::new();
+    let slice: Vec<f64> = mid_history.iter().rev().take(len + 1).copied().collect();
+    if slice.len() < 2 {
+        return None;
+    }
+    for w in slice.windows(2) {
+        if w[0] > 0.0 && w[1] > 0.0 {
+            rets.push((w[0] / w[1]) - 1.0);
+        }
+    }
+    if rets.is_empty() {
+        return None;
+    }
+    let mean = rets.iter().sum::<f64>() / rets.len() as f64;
+    let var = rets.iter().map(|r| {
+        let d = r - mean;
+        d * d
+    }).sum::<f64>() / rets.len() as f64;
+    Some(var.sqrt() * 10_000.0)
+}
+
 fn env_u64(k: &str, d: u64) -> u64 {
     std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
 }
@@ -520,7 +1455,9 @@ fn env_f64(k: &str, d: f64) -> f64 {
     std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
 }
 fn env_bool(k: &str, d: bool) -> bool {
-    std::env::var(k).map(|v| v.eq_ignore_ascii_case("true") || v == "1").unwrap_or(d)
+    std::env::var(k)
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(d)
 }
 
 #[cfg(test)]
@@ -536,5 +1473,61 @@ mod tests {
         h.push_back(99.7);
         let second = dip_pct_from_history(&h, lookback).unwrap();
         assert!(second <= -0.003);
+    }
+
+    #[test]
+    fn regime_detection_illiquid_overrides() {
+        let mut cfg = NpcConfig::from_trade_cfg(&TradeAgentConfig {
+            enabled: true,
+            trade_size: 1.0,
+            momentum_threshold: 0.001,
+            poll_interval: Duration::from_secs(1),
+            max_spread_bps: 5.0,
+        });
+        cfg.guards.min_liquidity_score = 5.0;
+
+        let mids: VecDeque<f64> = vec![100.0, 100.1, 100.2, 100.3, 100.4, 100.5].into();
+        let spreads: VecDeque<f64> = vec![2.0, 2.0, 2.0, 2.0].into();
+        let metrics = crate::signal::SignalMetrics {
+            momentum_5s: 0.01,
+            spread_bps: 2.0,
+            trade_samples: 1,
+            ..Default::default()
+        };
+
+        let regime = detect_regime(&cfg, &mids, &spreads, &metrics);
+        assert_eq!(regime, MarketRegime::Illiquid);
+    }
+
+    #[test]
+    fn deterministic_action_id_by_cycle_and_role() {
+        let cfg = NpcConfig::from_trade_cfg(&TradeAgentConfig {
+            enabled: true,
+            trade_size: 1.0,
+            momentum_threshold: 0.001,
+            poll_interval: Duration::from_secs(1),
+            max_spread_bps: 5.0,
+        });
+        let rt = NpcRuntimeState::default();
+        let metrics = crate::signal::SignalMetrics {
+            momentum_5s: 0.01,
+            spread_bps: 1.0,
+            trade_samples: 10,
+            ..Default::default()
+        };
+        let candidates = build_worker_candidates(
+            &cfg,
+            42,
+            &rt,
+            &metrics,
+            0.0,
+            1000.0,
+            0.0,
+            MarketRegime::TrendingUp,
+            false,
+        );
+
+        assert!(candidates.iter().any(|c| c.action_id == "c42-scout"));
+        assert!(candidates.iter().any(|c| c.action_id == "c42-dip_buyer"));
     }
 }
