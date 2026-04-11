@@ -3,6 +3,7 @@ mod agent;
 mod authority;
 mod client;
 mod events;
+mod npc;
 mod executor;
 mod feed;
 mod orders;
@@ -413,8 +414,8 @@ async fn main() -> Result<()> {
         max_spread_bps: env_f64("SIGNAL_MAX_SPREAD_BPS", 5.0),
     };
     let web_base_url = web_ui_addr.as_ref().map(|addr| format!("http://{}", addr));
-    agent::spawn_trade_agent(
-        trade_cfg,
+    npc::spawn_npc_trading_layer(
+        npc::NpcConfig::from_trade_cfg(&trade_cfg),
         agent::AgentState {
             store: Arc::clone(&event_store),
             exec: Arc::clone(&exec),
