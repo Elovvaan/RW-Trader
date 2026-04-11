@@ -59,6 +59,23 @@ impl TradeAgentConfig {
     }
 }
 
+fn flat_inventory_priority_decision(
+    has_base: bool,
+    has_quote: bool,
+    market_buy_ok: bool,
+) -> (&'static str, Option<&'static str>) {
+    // Base-first policy while flat:
+    // 1) if base inventory exists, prioritize immediate SELL/inventory reduction
+    // 2) only consider inventory BUY when no base inventory exists
+    if has_base {
+        ("SELL_READY", Some("SELL"))
+    } else if has_quote && market_buy_ok {
+        ("INVENTORY_BUY", Some("BUY"))
+    } else {
+        ("HOLD", None)
+    }
+}
+
 pub fn spawn_profit_sweep_agent(cfg: AgentConfig, state: AgentState) {
     if !cfg.enabled() {
         info!("[AGENT] Profit sweep agent disabled (threshold<=0 or asset missing)");
@@ -344,7 +361,7 @@ pub fn spawn_trade_agent(cfg: TradeAgentConfig, state: AgentState) {
 
                 if take_profit_hit {
                     (
-                        "INVENTORY_SELL",
+                        "SELL_READY",
                         Some("SELL"),
                         format!(
                             "take_profit price={:.2} entry={:.2} target={:.2} pos={:.8} sell_inventory={:.8}",
@@ -358,7 +375,7 @@ pub fn spawn_trade_agent(cfg: TradeAgentConfig, state: AgentState) {
                     )
                 } else if stop_loss_hit {
                     (
-                        "INVENTORY_SELL",
+                        "SELL_READY",
                         Some("SELL"),
                         format!(
                             "stop_loss price={:.2} entry={:.2} floor={:.2} pos={:.8} sell_inventory={:.8}",
@@ -372,7 +389,7 @@ pub fn spawn_trade_agent(cfg: TradeAgentConfig, state: AgentState) {
                     )
                 } else if momentum_exit_hit || no_entry_price {
                     (
-                        "INVENTORY_SELL",
+                        "SELL_READY",
                         Some("SELL"),
                         format!(
                             "momentum_exit price={:.2} entry_ref={:.2} momentum={:+.6} threshold={:.6} no_entry_price={} pos={:.8} sell_inventory={:.8}",
@@ -451,21 +468,38 @@ pub fn spawn_trade_agent(cfg: TradeAgentConfig, state: AgentState) {
                         None,
                     )
                 }
-            } else if market_buy_ok {
-                (
-                    "LONG",
-                    Some("BUY"),
-                    format!(
-                        "fallback momentum_entry momentum={:+.6}>{:.6} spread_bps={:.2}<={:.2} imbalance_1s={:+.3} price={:.2}",
-                        metrics.momentum_5s,
-                        cfg.momentum_threshold,
-                        metrics.spread_bps,
-                        cfg.max_spread_bps,
-                        metrics.imbalance_1s,
-                        metrics.mid
-                    ),
-                    Some("momentum"),
-                )
+            } else if market_buy_ok || has_quote {
+                let (flat_decision, flat_side) =
+                    flat_inventory_priority_decision(has_base, has_quote, market_buy_ok);
+                if flat_decision == "INVENTORY_BUY" {
+                    (
+                        flat_decision,
+                        flat_side,
+                        format!(
+                            "flat_inventory_buy momentum={:+.6}>{:.6} spread_bps={:.2}<={:.2} buy_power={:.8}",
+                            metrics.momentum_5s,
+                            cfg.momentum_threshold,
+                            metrics.spread_bps,
+                            cfg.max_spread_bps,
+                            buy_power
+                        ),
+                        Some("momentum"),
+                    )
+                } else {
+                    (
+                        "HOLD",
+                        None,
+                        format!(
+                            "flat_no_base_no_buy_trigger momentum={:+.6} threshold={:.6} spread_bps={:.2}/{:.2} buy_power={:.8}",
+                            metrics.momentum_5s,
+                            cfg.momentum_threshold,
+                            metrics.spread_bps,
+                            cfg.max_spread_bps,
+                            buy_power
+                        ),
+                        None,
+                    )
+                }
             } else if market_bearish {
                 (
                     "SHORT",
@@ -580,6 +614,39 @@ pub fn spawn_trade_agent(cfg: TradeAgentConfig, state: AgentState) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::flat_inventory_priority_decision;
+
+    #[test]
+    fn base_only_returns_sell_ready() {
+        let (decision, side) = flat_inventory_priority_decision(true, false, false);
+        assert_eq!(decision, "SELL_READY");
+        assert_eq!(side, Some("SELL"));
+    }
+
+    #[test]
+    fn quote_only_positive_momentum_returns_inventory_buy() {
+        let (decision, side) = flat_inventory_priority_decision(false, true, true);
+        assert_eq!(decision, "INVENTORY_BUY");
+        assert_eq!(side, Some("BUY"));
+    }
+
+    #[test]
+    fn base_and_quote_while_flat_still_returns_sell_ready() {
+        let (decision, side) = flat_inventory_priority_decision(true, true, true);
+        assert_eq!(decision, "SELL_READY");
+        assert_eq!(side, Some("SELL"));
+    }
+
+    #[test]
+    fn no_balances_returns_hold_no_action() {
+        let (decision, side) = flat_inventory_priority_decision(false, false, false);
+        assert_eq!(decision, "HOLD");
+        assert_eq!(side, None);
+    }
 }
 
 async fn fetch_free_balance(client: &BinanceClient, asset: &str) -> Result<f64, String> {
