@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -269,6 +270,13 @@ pub fn spawn_trade_agent(cfg: TradeAgentConfig, state: AgentState) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(cfg.poll_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut mid_history: VecDeque<f64> = VecDeque::with_capacity(32);
+
+        // Tunable trigger parameters (kept local to decision logic only).
+        const TAKE_PROFIT_MULTIPLIER: f64 = 1.01;
+        const STOP_LOSS_MULTIPLIER: f64 = 0.99;
+        const DIP_LOOKBACK_CYCLES: usize = 5;
+        const DIP_TRIGGER_PCT: f64 = 0.003; // 0.30%
 
         log_agent_action(
             &*state.store,
@@ -297,65 +305,180 @@ pub fn spawn_trade_agent(cfg: TradeAgentConfig, state: AgentState) {
                 signal.compute_metrics_pub(&feed)
             };
 
-            let (position_size, buy_power, sell_inventory) = {
+            let (position_size, buy_power, sell_inventory, avg_entry) = {
                 let t = state.truth.lock().await;
-                (t.position.size.max(0.0), t.buy_power.max(0.0), t.sell_inventory.max(0.0))
+                (
+                    t.position.size.max(0.0),
+                    t.buy_power.max(0.0),
+                    t.sell_inventory.max(0.0),
+                    t.position.avg_entry.max(0.0),
+                )
             };
             let has_base = sell_inventory > 0.0;
             let has_quote = buy_power > 0.0;
             let market_buy_ok = metrics.momentum_5s > cfg.momentum_threshold
                 && metrics.spread_bps <= cfg.max_spread_bps;
-            let market_sell_ok = metrics.momentum_5s < -cfg.momentum_threshold;
+            let market_bearish = metrics.momentum_5s < -cfg.momentum_threshold;
 
-            // Position-aware + action-first routing:
-            //   1) If we hold base inventory, prioritise SELL opportunities.
-            //   2) If we hold quote inventory, prioritise BUY opportunities.
-            //   3) If both are available, still prefer SELL first to reduce base exposure.
-            let (decision, side, reason) = if has_base && market_sell_ok {
-                (
-                    "INVENTORY_SELL",
-                    Some("SELL"),
-                    format!(
-                        "priority=base_first pos={:.8} sell_inventory={:.8} buy_power={:.8} momentum={:+.6}<-{:.6} spread_bps={:.2}",
-                        position_size, sell_inventory, buy_power, metrics.momentum_5s, cfg.momentum_threshold, metrics.spread_bps
-                    ),
-                )
-            } else if has_quote && market_buy_ok {
-                (
-                    "INVENTORY_BUY",
-                    Some("BUY"),
-                    format!(
-                        "priority=quote_first pos={:.8} buy_power={:.8} sell_inventory={:.8} momentum={:+.6}>{:.6} spread_bps={:.2}<={:.2}",
-                        position_size, buy_power, sell_inventory, metrics.momentum_5s, cfg.momentum_threshold, metrics.spread_bps, cfg.max_spread_bps
-                    ),
-                )
-            } else if has_base && !has_quote && position_size < 1e-9 {
-                // Flat position but base inventory exists: keep SELL path immediately available.
-                (
-                    "SELL_READY",
-                    Some("SELL"),
-                    format!(
-                        "flat_with_base_inventory pos={:.8} sell_inventory={:.8} buy_power={:.8} momentum={:+.6} spread_bps={:.2}",
-                        position_size, sell_inventory, buy_power, metrics.momentum_5s, metrics.spread_bps
-                    ),
-                )
+            // Track recent mid prices for dip-based entry logic.
+            if metrics.mid.is_finite() && metrics.mid > 0.0 {
+                mid_history.push_back(metrics.mid);
+                while mid_history.len() > 32 {
+                    mid_history.pop_front();
+                }
+            }
+            let dip_reference = mid_history
+                .len()
+                .checked_sub(DIP_LOOKBACK_CYCLES)
+                .and_then(|idx| mid_history.get(idx).copied());
+            let dip_pct = dip_reference
+                .filter(|r| *r > 0.0)
+                .map(|r| (metrics.mid / r) - 1.0);
+
+            let (decision, side, reason_for_trade, trigger_type) = if has_base {
+                let entry_price = if avg_entry > 0.0 { avg_entry } else { metrics.mid };
+                let no_entry_price = avg_entry <= 0.0;
+                let take_profit_hit = metrics.mid >= entry_price * TAKE_PROFIT_MULTIPLIER;
+                let stop_loss_hit = metrics.mid <= entry_price * STOP_LOSS_MULTIPLIER;
+                let momentum_exit_hit = market_bearish;
+
+                if take_profit_hit {
+                    (
+                        "INVENTORY_SELL",
+                        Some("SELL"),
+                        format!(
+                            "take_profit price={:.2} entry={:.2} target={:.2} pos={:.8} sell_inventory={:.8}",
+                            metrics.mid,
+                            entry_price,
+                            entry_price * TAKE_PROFIT_MULTIPLIER,
+                            position_size,
+                            sell_inventory
+                        ),
+                        Some("profit"),
+                    )
+                } else if stop_loss_hit {
+                    (
+                        "INVENTORY_SELL",
+                        Some("SELL"),
+                        format!(
+                            "stop_loss price={:.2} entry={:.2} floor={:.2} pos={:.8} sell_inventory={:.8}",
+                            metrics.mid,
+                            entry_price,
+                            entry_price * STOP_LOSS_MULTIPLIER,
+                            position_size,
+                            sell_inventory
+                        ),
+                        Some("stop_loss"),
+                    )
+                } else if momentum_exit_hit || no_entry_price {
+                    (
+                        "INVENTORY_SELL",
+                        Some("SELL"),
+                        format!(
+                            "momentum_exit price={:.2} entry_ref={:.2} momentum={:+.6} threshold={:.6} no_entry_price={} pos={:.8} sell_inventory={:.8}",
+                            metrics.mid,
+                            entry_price,
+                            metrics.momentum_5s,
+                            cfg.momentum_threshold,
+                            no_entry_price,
+                            position_size,
+                            sell_inventory
+                        ),
+                        Some("momentum"),
+                    )
+                } else {
+                    (
+                        "HOLD",
+                        None,
+                        format!(
+                            "waiting_sell_trigger price={:.2} entry={:.2} tp={:.2} sl={:.2} momentum={:+.6} threshold={:.6}",
+                            metrics.mid,
+                            entry_price,
+                            entry_price * TAKE_PROFIT_MULTIPLIER,
+                            entry_price * STOP_LOSS_MULTIPLIER,
+                            metrics.momentum_5s,
+                            cfg.momentum_threshold
+                        ),
+                        None,
+                    )
+                }
+            } else if has_quote {
+                let dip_trigger_hit = dip_pct.map(|v| v <= -DIP_TRIGGER_PCT).unwrap_or(false);
+                if dip_trigger_hit {
+                    (
+                        "INVENTORY_BUY",
+                        Some("BUY"),
+                        format!(
+                            "buy_dip price={:.2} dip_pct={:+.4}% lookback_cycles={} trigger={:.4}% buy_power={:.8}",
+                            metrics.mid,
+                            dip_pct.unwrap_or(0.0) * 100.0,
+                            DIP_LOOKBACK_CYCLES,
+                            -DIP_TRIGGER_PCT * 100.0,
+                            buy_power
+                        ),
+                        Some("momentum"),
+                    )
+                } else if market_buy_ok {
+                    (
+                        "INVENTORY_BUY",
+                        Some("BUY"),
+                        format!(
+                            "momentum_entry price={:.2} momentum={:+.6}>{:.6} spread_bps={:.2}<={:.2} buy_power={:.8}",
+                            metrics.mid,
+                            metrics.momentum_5s,
+                            cfg.momentum_threshold,
+                            metrics.spread_bps,
+                            cfg.max_spread_bps,
+                            buy_power
+                        ),
+                        Some("momentum"),
+                    )
+                } else {
+                    (
+                        "HOLD",
+                        None,
+                        format!(
+                            "waiting_buy_trigger price={:.2} momentum={:+.6} threshold={:.6} spread_bps={:.2}/{:.2} dip_pct={}",
+                            metrics.mid,
+                            metrics.momentum_5s,
+                            cfg.momentum_threshold,
+                            metrics.spread_bps,
+                            cfg.max_spread_bps,
+                            dip_pct
+                                .map(|v| format!("{:+.4}%", v * 100.0))
+                                .unwrap_or_else(|| "n/a".to_string())
+                        ),
+                        None,
+                    )
+                }
             } else if market_buy_ok {
                 (
                     "LONG",
                     Some("BUY"),
                     format!(
-                        "fallback momentum={:+.6}>{:.6} spread_bps={:.2}<={:.2} imbalance_1s={:+.3} price={:.2}",
-                        metrics.momentum_5s, cfg.momentum_threshold, metrics.spread_bps, cfg.max_spread_bps, metrics.imbalance_1s, metrics.mid
+                        "fallback momentum_entry momentum={:+.6}>{:.6} spread_bps={:.2}<={:.2} imbalance_1s={:+.3} price={:.2}",
+                        metrics.momentum_5s,
+                        cfg.momentum_threshold,
+                        metrics.spread_bps,
+                        cfg.max_spread_bps,
+                        metrics.imbalance_1s,
+                        metrics.mid
                     ),
+                    Some("momentum"),
                 )
-            } else if market_sell_ok {
+            } else if market_bearish {
                 (
                     "SHORT",
                     Some("SELL"),
                     format!(
-                        "fallback momentum={:+.6}<-{:.6} spread_bps={:.2} imbalance_1s={:+.3} price={:.2}",
-                        metrics.momentum_5s, cfg.momentum_threshold, metrics.spread_bps, metrics.imbalance_1s, metrics.mid
+                        "fallback momentum_exit momentum={:+.6}<-{:.6} spread_bps={:.2} imbalance_1s={:+.3} price={:.2}",
+                        metrics.momentum_5s,
+                        cfg.momentum_threshold,
+                        metrics.spread_bps,
+                        metrics.imbalance_1s,
+                        metrics.mid
                     ),
+                    Some("momentum"),
                 )
             } else {
                 (
@@ -365,13 +488,21 @@ pub fn spawn_trade_agent(cfg: TradeAgentConfig, state: AgentState) {
                         "momentum={:+.6} threshold={:.6} spread_bps={:.2} imbalance_1s={:+.3} price={:.2} pos={:.8} buy_power={:.8} sell_inventory={:.8}",
                         metrics.momentum_5s, cfg.momentum_threshold, metrics.spread_bps, metrics.imbalance_1s, metrics.mid, position_size, buy_power, sell_inventory
                     ),
+                    None,
                 )
             };
 
             log_agent_action(
                 &*state.store,
                 "trade_decision",
-                &format!("mode={} decision={} symbol={} {}", mode, decision, state.symbol, reason),
+                &format!(
+                    "mode={} decision={} symbol={} trigger_type={} reason_for_trade={}",
+                    mode,
+                    decision,
+                    state.symbol,
+                    trigger_type.unwrap_or("none"),
+                    reason_for_trade
+                ),
             );
 
             let Some(side) = side else { continue; };
@@ -411,7 +542,12 @@ pub fn spawn_trade_agent(cfg: TradeAgentConfig, state: AgentState) {
             form.insert("size".to_string(), format!("{:.8}", cfg.trade_size));
             form.insert(
                 "reason".to_string(),
-                format!("agent_trade {} {}", decision, reason),
+                format!(
+                    "agent_trade decision={} trigger_type={} reason_for_trade={}",
+                    decision,
+                    trigger_type.unwrap_or("none"),
+                    reason_for_trade
+                ),
             );
 
             match reqwest::Client::new().post(&url).form(&form).send().await {
