@@ -29,11 +29,12 @@ use crate::authority::{AuthorityLayer, AuthorityMode};
 use crate::executor::Executor;
 use crate::reader::{get_trade_timeline, summarise_event, LifecycleStage, TradeOutcome};
 use crate::reconciler::TruthState;
-use crate::risk::RiskEngine;
+use crate::risk::{self, RiskEngine, RiskVerdict};
 use crate::store::EventStore;
 use crate::strategy::{StrategyEngine, ALL_STRATEGIES};
 use crate::withdrawal::{NewWithdrawalRequest, WithdrawalManager, WithdrawalStatus};
 use crate::client::BinanceClient;
+use uuid::Uuid;
 
 // ── Shared application state ──────────────────────────────────────────────────
 
@@ -248,6 +249,148 @@ async fn handle_post(path: &str, _query: &str, body: &str, state: &AppState) -> 
             url_encode(&format!("Withdrawal proposal {} submitted.", proposal.id)),
             url_encode(&proposal.id)
         ));
+    }
+
+    if path == "/trade/request" {
+        let form = parse_form_body(body);
+        let symbol = form.get("symbol").cloned().unwrap_or_else(|| "BTCUSDT".to_string());
+        let side = form.get("side").cloned().unwrap_or_default().to_uppercase();
+        let size = form.get("size").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+        let reason = form.get("reason").cloned().unwrap_or_else(|| "agent request".to_string());
+
+        if side != "BUY" && side != "SELL" {
+            return redirect_with_err("/authority", "trade request side must be BUY or SELL");
+        }
+        if size <= 0.0 {
+            return redirect_with_err("/authority", "trade request size must be > 0");
+        }
+
+        let mode = state.authority.mode().await;
+        if mode == AuthorityMode::Off {
+            return redirect_with_ok("/authority", "Authority mode OFF: trade request logged, no action taken.");
+        }
+        if !matches!(state.exec.execution_state().await, crate::executor::ExecutionState::Idle) {
+            return redirect_with_err("/authority", "Trade request ignored: executor is not Idle (idempotency guard).");
+        }
+        if !state.authority.pending_proposals().await.is_empty() {
+            return redirect_with_err("/authority", "Trade request ignored: pending proposal already exists (idempotency guard).");
+        }
+
+        let (position_snapshot, market_snapshot) = {
+            let t = state.truth.lock().await;
+            let market = risk::MarketSnapshot {
+                bid: t.position.mark_price,
+                ask: t.position.mark_price,
+                feed_last_seen: Some(std::time::Instant::now()),
+            };
+            (t.position.clone(), market)
+        };
+        let order_side = if side == "BUY" { risk::OrderSide::Buy } else { risk::OrderSide::Sell };
+        let expected_price = market_snapshot.ask;
+        let proposed = risk::ProposedOrder {
+            symbol: symbol.clone(),
+            side: order_side,
+            qty: size,
+            expected_price,
+        };
+        let risk_verdict = {
+            let mut r = state.risk.lock().await;
+            r.risk_check(&position_snapshot, &market_snapshot, &proposed)
+        };
+        state.store.append(crate::events::risk_event(
+            &risk_verdict,
+            &proposed,
+            &position_snapshot,
+            &symbol,
+            &Uuid::new_v4().to_string(),
+        ));
+        if let RiskVerdict::Rejected(r) = risk_verdict {
+            return redirect_with_err("/authority", &format!("Trade request rejected by risk: {}", r));
+        }
+
+        let sys_mode = state.exec.system_mode().await;
+        let exec_is_idle = matches!(state.exec.execution_state().await, crate::executor::ExecutionState::Idle);
+        let kill_active = { state.risk.lock().await.kill_switch_active() };
+        let can_place = { state.truth.lock().await.can_place_order() };
+        let auth = state.authority.check(
+            &symbol,
+            &side,
+            size,
+            &reason,
+            0.6,
+            sys_mode,
+            exec_is_idle,
+            kill_active,
+            can_place,
+            &*state.store,
+        ).await;
+
+        match auth {
+            crate::authority::AuthorityResult::Blocked(r) => {
+                return redirect_with_err("/authority", &format!("Trade request blocked: {}", r));
+            }
+            crate::authority::AuthorityResult::ProposalCreated(p) => {
+                return redirect_with_ok("/authority", &format!("Trade proposal {} created (ASSIST).", p.id));
+            }
+            crate::authority::AuthorityResult::Proceed => {}
+        }
+
+        let Some(client) = state.client.as_ref() else {
+            return redirect_with_err("/authority", "No exchange client configured.");
+        };
+        let correlation_id = Uuid::new_v4().to_string();
+        let client_order_id = crate::executor::make_client_order_id(
+            (chrono::Utc::now().timestamp_millis() as u64) % 10_000_000_000,
+        );
+        let qty_str = format!("{:.8}", size);
+        state.store.append(crate::events::order_submitted_event(
+            &client_order_id,
+            &side,
+            &qty_str,
+            expected_price,
+            &symbol,
+            &correlation_id,
+        ));
+        let retry_policy = crate::orders::RetryPolicy::default();
+        match state.exec.submit_market_order(
+            &symbol,
+            &side,
+            &qty_str,
+            &client_order_id,
+            client,
+            &state.truth,
+            &state.risk,
+            &retry_policy,
+        ).await {
+            Ok(resp) => {
+                state.store.append(crate::events::StoredEvent::new(
+                    Some(symbol.clone()),
+                    Some(correlation_id.clone()),
+                    Some(resp.client_order_id.clone()),
+                    crate::events::TradingEvent::OrderAcked(crate::events::OrderAckedPayload {
+                        client_order_id: resp.client_order_id.clone(),
+                        exchange_order_id: resp.order_id,
+                        status: resp.status.clone(),
+                    }),
+                ));
+                if resp.status.to_uppercase() == "FILLED" {
+                    state.store.append(crate::events::order_filled_event(&resp, &symbol, &correlation_id));
+                }
+                return redirect_with_ok("/authority", "Trade request executed.");
+            }
+            Err(e) => {
+                state.store.append(crate::events::StoredEvent::new(
+                    Some(symbol.clone()),
+                    Some(correlation_id.clone()),
+                    Some(client_order_id.clone()),
+                    crate::events::TradingEvent::OrderRejected(crate::events::OrderRejectedPayload {
+                        client_order_id,
+                        reason: e.to_string(),
+                    }),
+                ));
+                return redirect_with_err("/authority", &format!("Trade execution failed: {}", e));
+            }
+        }
     }
 
     // POST /strategy/enable/{id} or /strategy/disable/{id}
