@@ -486,8 +486,7 @@ impl NpcAutonomousController {
         match mode {
             AgentMode::Off => {
                 self.stop_trading_loop().await;
-                let mut t = self.telemetry.lock().await;
-                t.status = "Agent OFF".to_string();
+                // stop_trading_loop already sets status via AgentMode::Off.state_label()
             }
             AgentMode::Auto => {
                 // If we were paused, send unpause signal on the existing loop.
@@ -505,13 +504,14 @@ impl NpcAutonomousController {
                     }
                 }
                 let mut t = self.telemetry.lock().await;
-                t.status = "Agent ON — Scanning".to_string();
+                t.status = AgentMode::Auto.state_label().to_string();
             }
             AgentMode::Pause => {
                 if old_mode == AgentMode::Off {
-                    // Can't pause when off; treat as no-op.
+                    // Pausing from Off state is not meaningful — revert and log.
                     let mut control = self.control.lock().await;
                     control.mode = AgentMode::Off;
+                    tracing::warn!("[NPC] set_agent_mode(Pause) called from Off — ignored; agent is not running");
                     return;
                 }
                 let control = self.control.lock().await;
@@ -520,7 +520,7 @@ impl NpcAutonomousController {
                 }
                 drop(control);
                 let mut t = self.telemetry.lock().await;
-                t.status = "Agent Paused".to_string();
+                t.status = AgentMode::Pause.state_label().to_string();
             }
         }
     }
@@ -588,7 +588,7 @@ impl NpcAutonomousController {
             {
                 let mut t = telemetry.lock().await;
                 t.running = true;
-                t.status = "Agent ON — Scanning".to_string();
+                t.status = AgentMode::Auto.state_label().to_string();
             }
             log_npc_event(
                 &*state.store,
@@ -612,7 +612,7 @@ impl NpcAutonomousController {
                         // If paused, log scanning and skip cycle execution.
                         if *pause_rx.borrow() {
                             let mut t = telemetry.lock().await;
-                            t.status = "Agent Paused".to_string();
+                            t.status = AgentMode::Pause.state_label().to_string();
                             t.timestamp = Utc::now().to_rfc3339();
                             continue;
                         }
@@ -624,9 +624,9 @@ impl NpcAutonomousController {
                         t.timestamp = Utc::now().to_rfc3339();
                         t.execution_result = report.execution_result;
                         t.status = match report.status.as_str() {
-                            "blocked"  => "Blocked by safety checks".to_string(),
-                            "running"  => "Agent ON — Scanning".to_string(),
-                            other      => other.to_string(),
+                            "blocked" => "Blocked by safety checks".to_string(),
+                            "running" => AgentMode::Auto.state_label().to_string(),
+                            other     => other.to_string(),
                         };
                     }
                     changed = stop_rx.changed() => {
@@ -639,7 +639,7 @@ impl NpcAutonomousController {
 
             let mut t = telemetry.lock().await;
             t.running = false;
-            t.status = "Agent OFF".to_string();
+            t.status = AgentMode::Off.state_label().to_string();
         }));
     }
 
@@ -657,7 +657,7 @@ impl NpcAutonomousController {
         }
         let mut t = self.telemetry.lock().await;
         t.running = false;
-        t.status = "Agent OFF".to_string();
+        t.status = AgentMode::Off.state_label().to_string();
     }
 }
 
