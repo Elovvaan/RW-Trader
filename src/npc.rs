@@ -13,6 +13,8 @@ use crate::events::{OperatorActionPayload, StoredEvent, TradingEvent};
 use crate::executor::ExecutionState;
 use crate::store::EventStore;
 
+const NPC_STATUS_SCANNING: &str = "scanning market";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum NpcRole {
     Scout,
@@ -419,8 +421,8 @@ impl NpcAutonomousController {
             runtime: Arc::new(Mutex::new(NpcRuntimeState::default())),
             telemetry: Arc::new(Mutex::new(NpcLoopTelemetry {
                 last_action: "NO_ACTION".to_string(),
-                execution_result: "idle".to_string(),
-                status: "idle".to_string(),
+                execution_result: NPC_STATUS_SCANNING.to_string(),
+                status: NPC_STATUS_SCANNING.to_string(),
                 ..NpcLoopTelemetry::default()
             })),
             control: Arc::new(Mutex::new(NpcLoopControl::new(interval_ms, autonomous_mode))),
@@ -528,7 +530,7 @@ impl NpcAutonomousController {
 
             let mut t = telemetry.lock().await;
             t.running = false;
-            t.status = "idle".to_string();
+            t.status = NPC_STATUS_SCANNING.to_string();
         }));
     }
 
@@ -546,7 +548,7 @@ impl NpcAutonomousController {
         let mut t = self.telemetry.lock().await;
         t.running = false;
         if t.status != "blocked" {
-            t.status = "idle".to_string();
+            t.status = NPC_STATUS_SCANNING.to_string();
         }
     }
 }

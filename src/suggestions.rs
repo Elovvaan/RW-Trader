@@ -203,7 +203,7 @@ pub fn get_trade_suggestion(
     let mut blocked: Vec<String> = Vec::new();
 
     if !sys.exec_is_idle {
-        blocked.push("executor is not Idle — an order is already in flight".into());
+        blocked.push("an order is already in flight".into());
     }
     if !sys.can_place_order {
         blocked.push("state is dirty or reconciliation is running".into());
@@ -251,7 +251,7 @@ pub fn get_trade_suggestion(
              Market shows bid {:.2} / ask {:.2} (spread {:.1} bps), \
              5s momentum {:+.5}, 1s imbalance {:+.3}. \
              Risk limits have headroom: position {:.6} of {:.6} max, \
-             no cooldown, executor is Idle.",
+             no cooldown, executor in ready state.",
             snap.bid, snap.ask, snap.spread_bps,
             snap.momentum_5s, snap.imbalance_1s,
             risk.position_size, risk.max_position_qty,
@@ -655,7 +655,7 @@ mod tests {
         sys.exec_is_idle = false;
         let s = get_trade_suggestion(&sys, &open_risk(), &default_sig(), Some(&good_market()));
         assert_eq!(s.kind, SuggestionKind::Wait);
-        assert!(s.blocked_by.iter().any(|b| b.contains("executor") || b.contains("Idle")));
+        assert!(s.blocked_by.iter().any(|b| b.contains("order") || b.contains("flight")));
     }
 
     #[test]

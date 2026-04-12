@@ -58,7 +58,7 @@ impl ExecutionState {
 
     pub fn name(&self) -> &'static str {
         match self {
-            ExecutionState::Idle             => "Idle",
+            ExecutionState::Idle             => "No active trade in progress",
             ExecutionState::Submitting { .. } => "Submitting",
             ExecutionState::WaitingAck { .. } => "WaitingAck",
             ExecutionState::Open { .. }       => "Open",
@@ -94,7 +94,7 @@ impl ExecutionState {
 impl std::fmt::Display for ExecutionState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ExecutionState::Idle => write!(f, "Idle"),
+            ExecutionState::Idle => write!(f, "No active trade in progress"),
             ExecutionState::Submitting { client_order_id } =>
                 write!(f, "Submitting({})", client_order_id),
             ExecutionState::WaitingAck { client_order_id, .. } =>

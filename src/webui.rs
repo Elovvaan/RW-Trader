@@ -322,7 +322,7 @@ async fn handle_post(path: &str, _query: &str, body: &str, state: &AppState) -> 
             return redirect_with_ok("/authority", "Authority mode OFF: trade request logged, no action taken.");
         }
         if !matches!(state.exec.execution_state().await, crate::executor::ExecutionState::Idle) {
-            return redirect_with_err("/authority", "Trade request ignored: executor is not Idle (idempotency guard).");
+            return redirect_with_err("/authority", "Trade request ignored: executor is busy; an order is in progress (idempotency guard).");
         }
         if !state.authority.pending_proposals().await.is_empty() {
             return redirect_with_err("/authority", "Trade request ignored: pending proposal already exists (idempotency guard).");
@@ -1072,7 +1072,7 @@ async fn page_events(state: &AppState, query: &str) -> String {
         esc(&sys_mode.to_string()),
         if kill { "err" } else { "ok" },
         risk_status,
-        if npc_loop.running { "Running" } else { "Idle" },
+        if npc_loop.running { "Running" } else { "OFF" },
         npc_loop.cycle_count,
         esc(&signal_label.to_uppercase()),
         esc(&exec_state.to_string()),
@@ -1465,7 +1465,7 @@ async fn page_assistant(state: &AppState, query: &str) -> String {
         esc(&exec_state.to_string()),
         if kill_active { "err" } else { "ok" },
         if kill_active { "ACTIVE" } else { "OFF" },
-        if npc_loop.running { "Executor Running" } else { "Executor Idle" },
+        if npc_loop.running { "Executor Running" } else { "OFF" },
         npc_loop.cycle_count,
         esc(current_profile.as_str()),
     );
@@ -1506,7 +1506,7 @@ async fn page_assistant(state: &AppState, query: &str) -> String {
       esc(current_profile.as_str()),
       esc(current_profile.label()),
       profile_options,
-      if npc_loop.running { "Executor Running" } else { "Executor Idle" },
+      if npc_loop.running { "Executor Running" } else { "OFF" },
       esc(&npc_loop.last_action),
       esc(&npc_loop.execution_result),
       esc(&npc_loop.timestamp),
