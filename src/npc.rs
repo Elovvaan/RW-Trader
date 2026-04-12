@@ -723,11 +723,11 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         signal.compute_metrics_pub(&feed)
     };
 
-    let (position_size, buy_power, sell_inventory, exposure_notional) = {
+    let (position_size, buy_power, sell_inventory, exposure_notional, total_balance_usd) = {
         let t = state.truth.lock().await;
         let pos = t.position.size.max(0.0);
         let mid = metrics.mid.max(0.0);
-        (pos, t.buy_power.max(0.0), t.sell_inventory.max(0.0), pos * mid)
+        (pos, t.buy_power.max(0.0), t.sell_inventory.max(0.0), pos * mid, t.total_balance_usd.max(0.0))
     };
 
     let mut rt = runtime.lock().await;
@@ -943,6 +943,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         };
     }
 
+    let order_notional = allocation.qty * metrics.mid.max(0.0);
     let guard_reasons = evaluate_guards(
         &effective_cfg,
         &rt,
@@ -951,6 +952,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         position_size,
         &metrics,
         chosen.expected_slippage_bps,
+        total_balance_usd,
+        sell_inventory,
+        order_notional,
     );
     if !guard_reasons.is_empty() {
         lifecycle(
@@ -1507,25 +1511,47 @@ fn evaluate_guards(
     position_size: f64,
     metrics: &crate::signal::SignalMetrics,
     expected_slippage_bps: f64,
+    total_balance_usd: f64,
+    sell_inventory: f64,
+    order_notional: f64,
 ) -> Vec<String> {
     let mut reasons = Vec::new();
     if cfg.guards.kill_switch {
         reasons.push("KILL_SWITCH_ACTIVE".to_string());
     }
-    if metrics.spread_bps > cfg.guards.max_spread_bps {
+
+    // Detect small account mode: total balance below $100.
+    // In small account mode, relax strict liquidity depth checks for SELL
+    // orders when inventory is available and the order has positive notional.
+    let is_sell = side.eq_ignore_ascii_case("SELL");
+    let small_account = total_balance_usd < 100.0 && total_balance_usd > 0.0;
+    let relax_liquidity_guards = small_account && is_sell && sell_inventory > 0.0 && order_notional > 0.0;
+
+    if relax_liquidity_guards {
+        info!(
+            total_balance_usd,
+            sell_inventory,
+            order_notional,
+            "[GUARD] Small account mode: liquidity depth checks relaxed for SELL \
+             (total_balance_usd={:.2} < $100, sell_inventory={:.8}, order_notional={:.4})",
+            total_balance_usd, sell_inventory, order_notional,
+        );
+    }
+
+    if !relax_liquidity_guards && metrics.spread_bps > cfg.guards.max_spread_bps {
         reasons.push(format!(
             "MAX_SPREAD_BPS_EXCEEDED:{:.2}>{:.2}",
             metrics.spread_bps, cfg.guards.max_spread_bps
         ));
     }
     let liquidity_score = metrics.trade_samples as f64;
-    if liquidity_score < cfg.guards.min_liquidity_score {
+    if !relax_liquidity_guards && liquidity_score < cfg.guards.min_liquidity_score {
         reasons.push(format!(
             "LIQUIDITY_TOO_LOW:{:.2}<{:.2}",
             liquidity_score, cfg.guards.min_liquidity_score
         ));
     }
-    if expected_slippage_bps > cfg.guards.max_slippage_bps {
+    if !relax_liquidity_guards && expected_slippage_bps > cfg.guards.max_slippage_bps {
         reasons.push(format!(
             "SLIPPAGE_CEILING_EXCEEDED:{:.2}>{:.2}",
             expected_slippage_bps, cfg.guards.max_slippage_bps
@@ -1948,6 +1974,126 @@ fn env_bool(k: &str, d: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_cfg() -> NpcConfig {
+        NpcConfig::from_trade_cfg(&TradeAgentConfig {
+            enabled: true,
+            trade_size: 1.0,
+            momentum_threshold: 0.001,
+            poll_interval: Duration::from_secs(1),
+            max_spread_bps: 5.0,
+        })
+    }
+
+    fn low_liquidity_metrics() -> crate::signal::SignalMetrics {
+        crate::signal::SignalMetrics {
+            momentum_5s: 0.01,
+            spread_bps: 10.0,    // exceeds max_spread_bps=5.0
+            trade_samples: 1,    // below min_liquidity_score=3.0
+            mid: 50_000.0,
+            ..Default::default()
+        }
+    }
+
+    // ── evaluate_guards: small account SELL bypass ─────────────────────────────
+
+    #[test]
+    fn small_account_sell_bypasses_liquidity_depth_checks() {
+        let cfg = test_cfg();
+        let rt = NpcRuntimeState::default();
+        let metrics = low_liquidity_metrics();
+
+        // Small account (<$100), SELL side, non-zero inventory and notional.
+        let reasons = evaluate_guards(
+            &cfg, &rt, NpcRole::InventoryManager, "SELL",
+            0.0, &metrics, 20.0,
+            /* total_balance_usd */ 50.0,
+            /* sell_inventory    */ 0.001,
+            /* order_notional    */ 50.0,
+        );
+
+        // Liquidity depth guards must be absent.
+        assert!(
+            !reasons.iter().any(|r| r.starts_with("LIQUIDITY_TOO_LOW")),
+            "LIQUIDITY_TOO_LOW must be bypassed in small account mode, got: {:?}", reasons
+        );
+        assert!(
+            !reasons.iter().any(|r| r.starts_with("MAX_SPREAD_BPS_EXCEEDED")),
+            "MAX_SPREAD_BPS_EXCEEDED must be bypassed in small account mode, got: {:?}", reasons
+        );
+        assert!(
+            !reasons.iter().any(|r| r.starts_with("SLIPPAGE_CEILING_EXCEEDED")),
+            "SLIPPAGE_CEILING_EXCEEDED must be bypassed in small account mode, got: {:?}", reasons
+        );
+    }
+
+    #[test]
+    fn large_account_sell_applies_liquidity_depth_checks() {
+        let cfg = test_cfg();
+        let rt = NpcRuntimeState::default();
+        let metrics = low_liquidity_metrics();
+
+        // Large account (>=$100): depth checks must remain active.
+        let reasons = evaluate_guards(
+            &cfg, &rt, NpcRole::InventoryManager, "SELL",
+            0.0, &metrics, 20.0,
+            /* total_balance_usd */ 500.0,
+            /* sell_inventory    */ 0.001,
+            /* order_notional    */ 50.0,
+        );
+
+        assert!(
+            reasons.iter().any(|r| r.starts_with("LIQUIDITY_TOO_LOW")),
+            "LIQUIDITY_TOO_LOW must trigger for large account, got: {:?}", reasons
+        );
+        assert!(
+            reasons.iter().any(|r| r.starts_with("MAX_SPREAD_BPS_EXCEEDED")),
+            "MAX_SPREAD_BPS_EXCEEDED must trigger for large account, got: {:?}", reasons
+        );
+    }
+
+    #[test]
+    fn small_account_no_inventory_does_not_bypass_liquidity_guards() {
+        let cfg = test_cfg();
+        let rt = NpcRuntimeState::default();
+        let metrics = low_liquidity_metrics();
+
+        // Small account but zero sell_inventory: bypass must NOT apply.
+        let reasons = evaluate_guards(
+            &cfg, &rt, NpcRole::InventoryManager, "SELL",
+            0.0, &metrics, 20.0,
+            /* total_balance_usd */ 50.0,
+            /* sell_inventory    */ 0.0,
+            /* order_notional    */ 50.0,
+        );
+
+        assert!(
+            reasons.iter().any(|r| r.starts_with("LIQUIDITY_TOO_LOW")),
+            "LIQUIDITY_TOO_LOW must block when sell_inventory=0, got: {:?}", reasons
+        );
+    }
+
+    #[test]
+    fn kill_switch_always_blocks_even_in_small_account_mode() {
+        let mut cfg = test_cfg();
+        cfg.guards.kill_switch = true;
+        let rt = NpcRuntimeState::default();
+        let metrics = low_liquidity_metrics();
+
+        let reasons = evaluate_guards(
+            &cfg, &rt, NpcRole::InventoryManager, "SELL",
+            0.0, &metrics, 0.0,
+            /* total_balance_usd */ 50.0,
+            /* sell_inventory    */ 0.001,
+            /* order_notional    */ 50.0,
+        );
+
+        assert!(
+            reasons.iter().any(|r| r == "KILL_SWITCH_ACTIVE"),
+            "kill switch must always block, got: {:?}", reasons
+        );
+    }
+
 
     #[test]
     fn dip_lookback_requires_true_horizon() {
