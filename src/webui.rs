@@ -798,6 +798,29 @@ fn stage_tag_class(stage: &LifecycleStage) -> &'static str {
     }
 }
 
+fn system_health_summary(
+    sys_mode: crate::executor::SystemMode,
+    exec_state: crate::executor::ExecutionState,
+    kill_active: bool,
+) -> (&'static str, String) {
+    if kill_active {
+        ("err", "Kill switch active".to_string())
+    } else if matches!(sys_mode, crate::executor::SystemMode::Halted) {
+        ("err", "System halted".to_string())
+    } else if matches!(
+        sys_mode,
+        crate::executor::SystemMode::Booting | crate::executor::SystemMode::Reconciling
+    ) {
+        ("warn", format!("System {}", sys_mode))
+    } else if matches!(sys_mode, crate::executor::SystemMode::Degraded) {
+        ("warn", "System degraded".to_string())
+    } else if !matches!(exec_state, crate::executor::ExecutionState::Idle) {
+        ("warn", format!("Executor busy ({})", exec_state))
+    } else {
+        ("ok", "System healthy".to_string())
+    }
+}
+
 // ── /events ───────────────────────────────────────────────────────────────────
 
 async fn page_events(state: &AppState, query: &str) -> String {
@@ -1211,15 +1234,18 @@ async fn page_assistant(state: &AppState, query: &str) -> String {
     let sys_mode = state.exec.system_mode().await;
     let exec_state = state.exec.execution_state().await;
     let kill_active = state.risk.lock().await.kill_switch_active();
+    let (health_class, health_text) = system_health_summary(sys_mode, exec_state.clone(), kill_active);
     let recent_events = state.store.fetch_recent(10).unwrap_or_default();
 
     let status_body = format!(
         "{flash}<div class='metrics-grid' style='margin-top:8px;grid-template-columns:repeat(4,minmax(140px,1fr))'>\
-          <div class='metric-card'><div class='metric-label'>System Status</div><div class='metric-value'>System healthy</div></div>\
+          <div class='metric-card'><div class='metric-label'>System Status</div><div class='metric-value {}'>{}</div></div>\
           <div class='metric-card'><div class='metric-label'>Mode</div><div class='metric-value'>{}</div></div>\
           <div class='metric-card'><div class='metric-label'>Executor</div><div class='metric-value'>{}</div></div>\
           <div class='metric-card'><div class='metric-label'>Kill Switch</div><div class='metric-value {}'>{}</div></div>\
         </div>",
+        health_class,
+        esc(&health_text),
         esc(&sys_mode.to_string()),
         esc(&exec_state.to_string()),
         if kill_active { "err" } else { "ok" },
@@ -1271,20 +1297,25 @@ async fn page_suggestions(state: &AppState, query: &str) -> String {
     let refresh = r#"<meta http-equiv="refresh" content="10">"#;
     let flash = flash_banner(query);
     let mode = state.authority.mode().await;
-    let (pos_size, open_orders, symbol) = {
+    let (pos_size, open_orders, symbol, tradable_balance) = {
         let t = state.truth.lock().await;
-        (t.position.size, t.open_order_count, t.symbol.clone())
+        (
+            t.position.size,
+            t.open_order_count,
+            t.symbol.clone(),
+            t.tradable_balance,
+        )
     };
 
     let status_body = format!(
         "{flash}<div class='metrics-grid' style='margin-top:8px;grid-template-columns:repeat(4,minmax(140px,1fr))'>\
             <div class='metric-card'><div class='metric-label'>Total Balance</div><div class='metric-value'>Portfolio linked</div></div>\
-            <div class='metric-card'><div class='metric-label'>Available to Trade</div><div class='metric-value'>{:.6}</div></div>\
+            <div class='metric-card'><div class='metric-label'>Free Quote Balance</div><div class='metric-value'>{:.6}</div></div>\
             <div class='metric-card'><div class='metric-label'>Pending Withdrawals</div><div class='metric-value'>Manage in Withdraw</div></div>\
             <div class='metric-card'><div class='metric-label'>Asset Count</div><div class='metric-value'>1+</div></div>\
          </div>\
          <div class='sum' style='margin-top:8px'>Default asset: {} • Authority mode: {}.</div>",
-        pos_size.abs(),
+        tradable_balance,
         esc(&symbol),
         esc(&mode.to_string()),
     );
