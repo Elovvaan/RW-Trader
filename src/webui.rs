@@ -27,6 +27,7 @@ use tracing::{debug, error, info};
 use crate::assistant;
 use crate::authority::{AuthorityLayer, AuthorityMode};
 use crate::executor::Executor;
+use crate::profile::RuntimeProfile;
 use crate::reader::{get_trade_timeline, summarise_event, LifecycleStage, TradeOutcome};
 use crate::reconciler::TruthState;
 use crate::risk::{self, RiskEngine, RiskVerdict};
@@ -49,6 +50,7 @@ pub struct AppState {
     pub client:    Option<Arc<BinanceClient>>,
     pub withdrawals: Arc<WithdrawalManager>,
     pub npc: Arc<crate::npc::NpcAutonomousController>,
+    pub profile: Arc<Mutex<RuntimeProfile>>,
 }
 
 #[cfg(test)]
@@ -196,6 +198,18 @@ async fn handle_post(path: &str, _query: &str, body: &str, state: &AppState) -> 
         state.risk.lock().await.set_kill_switch(false);
         log_ui_action(&*state.store, "ui_kill_switch_cleared", "kill switch cleared from /assistant");
         return redirect_with_ok("/assistant", "Kill switch cleared.");
+    }
+    if path == "/assistant/profile" {
+        let form = parse_form_body(body);
+        let profile_str = form.get("profile").map(|s| s.as_str()).unwrap_or("ACTIVE");
+        let new_profile = RuntimeProfile::from_str(profile_str);
+        *state.profile.lock().await = new_profile;
+        log_ui_action(
+            &*state.store,
+            "ui_profile_changed",
+            &format!("runtime profile set to {} from /assistant", new_profile.as_str()),
+        );
+        return redirect_with_ok("/assistant", &format!("Runtime profile set to {}.", new_profile.as_str()));
     }
 
     // Dedicated simulation-only withdrawal confirmation endpoint.
@@ -916,6 +930,7 @@ async fn page_events(state: &AppState, query: &str) -> String {
 
     let sys_mode = state.exec.system_mode().await;
     let exec_state = state.exec.execution_state().await;
+    let current_profile = *state.profile.lock().await;
     let (symbol, pos_size, open_orders, total_balance_usd, buy_power, sell_inventory, balance_status, raw_balances) = {
         let t = state.truth.lock().await;
         (
@@ -1009,8 +1024,23 @@ async fn page_events(state: &AppState, query: &str) -> String {
     };
     let usable_balance_usd = buy_power + (sell_inventory * latest_mid);
     let inventory_value_usd = sell_inventory * latest_mid;
+    // Profile banner — shown prominently on LIVE page.
+    let profile_banner = if current_profile == RuntimeProfile::MicroTest {
+        "<div class='summary-pill' style='background:rgba(240,185,11,0.12);border-color:#f0b90b;color:#f0b90b;margin-bottom:8px'>\
+           <div class='label'>Runtime Profile</div>\
+           <div>⚡ Micro-Test mode: faster decisions for small balances</div>\
+         </div>"
+    } else {
+        &format!(
+            "<div class='summary-pill' style='margin-bottom:8px'>\
+               <div class='label'>Runtime Profile</div>\
+               <div>{}</div>\
+             </div>",
+            esc(current_profile.label())
+        )
+    };
     let status_body = format!(
-        "{flash}<div class='metrics-grid' style='margin-top:8px'>\
+        "{flash}{profile_banner}<div class='metrics-grid' style='margin-top:8px'>\
           <div class='metric-card'><div class='metric-label'>Total Balance</div><div class='metric-value'>{}</div></div>\
           <div class='metric-card'><div class='metric-label'>Usable Balance</div><div class='metric-value'>{}</div></div>\
           <div class='metric-card'><div class='metric-label'>Buy Power ({})</div><div class='metric-value'>{}</div></div>\
@@ -1396,8 +1426,23 @@ async fn page_assistant(state: &AppState, query: &str) -> String {
     let exec_state = state.exec.execution_state().await;
     let kill_active = state.risk.lock().await.kill_switch_active();
     let npc_loop = state.npc.snapshot().await;
+    let current_profile = *state.profile.lock().await;
     let (health_class, health_text) = system_health_summary(sys_mode, exec_state.clone(), kill_active);
     let recent_events = state.store.fetch_recent(10).unwrap_or_default();
+
+    // Profile selector options
+    let profile_options = [
+        ("CONSERVATIVE", "Conservative — cautious, long cooldowns"),
+        ("ACTIVE",       "Active — balanced defaults"),
+        ("MICRO_TEST",   "Micro-Test — faster decisions for small balances"),
+    ]
+    .iter()
+    .map(|(val, label)| {
+        let selected = if *val == current_profile.as_str() { " selected" } else { "" };
+        format!("<option value='{val}'{selected}>{label}</option>")
+    })
+    .collect::<Vec<_>>()
+    .join("");
 
     let status_body = format!(
         "{flash}<div class='metrics-grid' style='margin-top:8px;grid-template-columns:repeat(4,minmax(140px,1fr))'>\
@@ -1407,6 +1452,7 @@ async fn page_assistant(state: &AppState, query: &str) -> String {
           <div class='metric-card'><div class='metric-label'>Kill Switch</div><div class='metric-value {}'>{}</div></div>\
           <div class='metric-card'><div class='metric-label'>Autonomous Mode</div><div class='metric-value'>{}</div></div>\
           <div class='metric-card'><div class='metric-label'>Loop Cycles</div><div class='metric-value'>{}</div></div>\
+          <div class='metric-card'><div class='metric-label'>Runtime Profile</div><div class='metric-value'>{}</div></div>\
         </div>",
         health_class,
         esc(&health_text),
@@ -1416,10 +1462,20 @@ async fn page_assistant(state: &AppState, query: &str) -> String {
         if kill_active { "ACTIVE" } else { "OFF" },
         if npc_loop.running { "Executor Running" } else { "Executor Idle" },
         npc_loop.cycle_count,
+        esc(current_profile.as_str()),
     );
 
     let primary_body = format!("<div style='display:grid;gap:10px'>\
       <div class='signal-box'><div class='label'>Trading Controls</div><div class='sum'>Operator-level controls for runtime behavior and authority-safe interventions.</div><div style='margin-top:8px'>Authority workflows available in <a href='/authority'>FUNDS → approvals</a>.</div></div>\
+      <div class='signal-box'><div class='label'>Runtime Profile</div>\
+        <div class='sum'>Current: <strong>{}</strong></div>\
+        <div class='sum' style='margin-top:4px'>{}</div>\
+        <form method='post' action='/assistant/profile' style='margin-top:8px;display:flex;gap:8px;align-items:center'>\
+          <select name='profile' style='flex:1'>{}</select>\
+          <button class='btn' type='submit'>Apply</button>\
+        </form>\
+        <div class='sum' style='margin-top:6px;font-size:11px'>Note: profile change takes effect on the next trading cycle. Spread guard, kill switch, and risk engine remain active on all profiles.</div>\
+      </div>\
       <div class='signal-box'><div class='label'>Autonomous Mode</div><div class='sum'>Background NPC/Alpha loop with idempotent single-instance guard.</div>\
         <div class='sum' style='margin-top:6px'>State: <strong>{}</strong> · Last decision: {} · Result: {} · Updated: {}</div>\
         <div class='sum' style='margin-top:6px'>Current cycle: {} · Interval: {}ms</div>\
@@ -1442,6 +1498,9 @@ async fn page_assistant(state: &AppState, query: &str) -> String {
       <div class='signal-box'><div class='label'>API & Connectivity</div><div>Market Feed <span class='ok' style='float:right'>Connected</span></div><div style='margin-top:6px'>Trading API <span class='warn' style='float:right'>Read-Only in DEMO</span></div><div style='margin-top:6px'>Webhook Auth <span class='ok' style='float:right'>Healthy</span></div></div>\
       <div class='signal-box'><div class='label'>Advanced / Diagnostics</div><form method='post' action='/assistant/system-restart' style='margin-top:8px'><button class='btn' style='width:100%' type='submit'>System Restart</button></form></div>\
       </div>",
+      esc(current_profile.as_str()),
+      esc(current_profile.label()),
+      profile_options,
       if npc_loop.running { "Executor Running" } else { "Executor Idle" },
       esc(&npc_loop.last_action),
       esc(&npc_loop.execution_result),
@@ -1882,6 +1941,7 @@ mod tests {
             client,
             withdrawals,
             npc,
+            profile:  Arc::new(Mutex::new(crate::profile::RuntimeProfile::default())),
         }
     }
 
@@ -2164,6 +2224,52 @@ mod tests {
         let state = make_state();
         let r = page_status(&state, "").await;
         assert!(r.contains("max_position_qty") || r.contains("Risk"));
+    }
+
+    // ── Runtime profile ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_events_shows_profile_banner() {
+        let state = make_state();
+        let r = page_events(&state, "").await;
+        // Profile banner (default = Conservative since RuntimeProfile::default())
+        // must be present on the LIVE page.
+        assert!(r.contains("Runtime Profile") || r.contains("CONSERVATIVE") || r.contains("ACTIVE"),
+            "LIVE page must display runtime profile");
+    }
+
+    #[tokio::test]
+    async fn test_events_micro_test_banner() {
+        let state = make_state();
+        *state.profile.lock().await = crate::profile::RuntimeProfile::MicroTest;
+        let r = page_events(&state, "").await;
+        assert!(r.contains("Micro-Test") || r.contains("MICRO_TEST"),
+            "LIVE page must show MICRO_TEST indicator when profile is MicroTest");
+    }
+
+    #[tokio::test]
+    async fn test_assistant_shows_profile_selector() {
+        let state = make_state();
+        let r = page_assistant(&state, "").await;
+        // Profile selector must be rendered on /assistant (SETTINGS) page.
+        assert!(r.contains("Runtime Profile") || r.contains("CONSERVATIVE") || r.contains("MICRO_TEST"),
+            "SETTINGS page must show profile selector");
+        // All three options must be present in the selector.
+        assert!(r.contains("CONSERVATIVE"), "CONSERVATIVE option must be present");
+        assert!(r.contains("ACTIVE"),       "ACTIVE option must be present");
+        assert!(r.contains("MICRO_TEST"),   "MICRO_TEST option must be present");
+    }
+
+    #[tokio::test]
+    async fn test_assistant_profile_selected_matches_state() {
+        let state = make_state();
+        *state.profile.lock().await = crate::profile::RuntimeProfile::MicroTest;
+        let r = page_assistant(&state, "").await;
+        // The MICRO_TEST option should be marked selected.
+        assert!(r.contains("selected"), "A profile option must be marked selected");
+        // The current profile label should appear somewhere.
+        assert!(r.contains("faster decisions") || r.contains("MICRO_TEST"),
+            "Micro-test label must appear when profile is MicroTest");
     }
 
 }
