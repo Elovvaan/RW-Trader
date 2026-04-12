@@ -95,20 +95,58 @@ async fn main() -> Result<()> {
                 max_open_orders:     0,
                 max_slippage_bps:    0.0,
             }, &stub_pos);
-            let stub_exec = executor::Executor::new(
+            let stub_exec = Arc::new(executor::Executor::new(
                 "BTCUSDT".into(),
                 executor::CircuitBreakerConfig::default(),
                 executor::WatchdogConfig::default(),
-            );
+            ));
+            let stub_truth = Arc::new(Mutex::new(reconciler::TruthState::new("BTCUSDT", 0.0)));
+            let stub_feed = Arc::new(Mutex::new(feed::FeedState::new(Duration::from_secs(10))));
+            let stub_signal = Arc::new(Mutex::new(signal::SignalEngine::new(signal::SignalConfig {
+                order_qty: 0.0,
+                momentum_threshold: 0.0,
+                imbalance_threshold: 0.0,
+                max_entry_spread_bps: 0.0,
+                max_feed_staleness: Duration::from_secs(1),
+                stop_loss_pct: 0.0,
+                take_profit_pct: 0.0,
+                max_hold_duration: Duration::from_secs(1),
+                min_mid_samples: 1,
+                min_trade_samples: 1,
+            })));
+            let stub_withdrawals = Arc::new(withdrawal::WithdrawalManager::new(withdrawal::WithdrawalConfig::default()));
+            let authority = Arc::new(authority::AuthorityLayer::new());
+            let npc_controller = Arc::new(npc::NpcAutonomousController::new(
+                npc::NpcConfig::from_trade_cfg(&agent::TradeAgentConfig {
+                    enabled: false,
+                    trade_size: 0.0,
+                    momentum_threshold: 0.0,
+                    poll_interval: Duration::from_millis(1000),
+                    max_spread_bps: 0.0,
+                }),
+                agent::AgentState {
+                    store: Arc::clone(&store),
+                    exec: Arc::clone(&stub_exec),
+                    feed: Arc::clone(&stub_feed),
+                    signal: Arc::clone(&stub_signal),
+                    truth: Arc::clone(&stub_truth),
+                    authority: Arc::clone(&authority),
+                    withdrawals: Arc::clone(&stub_withdrawals),
+                    client: Arc::new(client::BinanceClient::new(String::new(), String::new(), String::new())),
+                    symbol: "BTCUSDT".into(),
+                    web_base_url: None,
+                },
+            ));
             let state = webui::AppState {
                 store:     Arc::clone(&store),
-                exec:      Arc::new(stub_exec),
-                truth:     Arc::new(Mutex::new(reconciler::TruthState::new("BTCUSDT", 0.0))),
+                exec:      Arc::clone(&stub_exec),
+                truth:     Arc::clone(&stub_truth),
                 risk:      Arc::new(Mutex::new(stub_risk)),
-                authority: Arc::new(authority::AuthorityLayer::new()),
+                authority: Arc::clone(&authority),
                 strategy:  Arc::new(Mutex::new(strategy::StrategyEngine::new())),
                 client:    None,
-                withdrawals: Arc::new(withdrawal::WithdrawalManager::new(withdrawal::WithdrawalConfig::default())),
+                withdrawals: Arc::clone(&stub_withdrawals),
+                npc: npc_controller,
             };
             webui::run(&addr, state).await?;
             return Ok(());
@@ -355,6 +393,29 @@ async fn main() -> Result<()> {
         duplicate_window: Duration::from_secs(env_u64("WITHDRAW_DUP_WINDOW_SECS", 600)),
         default_fee: env_f64("WITHDRAW_DEFAULT_FEE", 0.0),
     }));
+    let trade_cfg = agent::TradeAgentConfig {
+        enabled: env_bool("TRADE_ENABLED", false),
+        trade_size: env_f64("TRADE_SIZE", order_qty),
+        momentum_threshold: env_f64("MOMENTUM_THRESHOLD", 0.00005),
+        poll_interval: Duration::from_secs(env_u64("TRADE_INTERVAL_SECS", 1)),
+        max_spread_bps: env_f64("SIGNAL_MAX_SPREAD_BPS", 5.0),
+    };
+    let web_base_url = web_ui_addr.as_ref().map(|addr| format!("http://{}", addr));
+    let npc_controller = Arc::new(npc::NpcAutonomousController::new(
+        npc::NpcConfig::from_trade_cfg(&trade_cfg),
+        agent::AgentState {
+            store: Arc::clone(&event_store),
+            exec: Arc::clone(&exec),
+            feed: Arc::clone(&feed_state),
+            signal: Arc::clone(&signal_engine),
+            truth: Arc::clone(&truth),
+            authority: Arc::clone(&authority),
+            withdrawals: Arc::clone(&withdrawals),
+            client: Arc::clone(&client),
+            symbol: symbol.clone(),
+            web_base_url: web_base_url.clone(),
+        },
+    ));
     if let Some(ref addr) = web_ui_addr {
         let ui_state = webui::AppState {
             store:    Arc::clone(&event_store),
@@ -365,6 +426,7 @@ async fn main() -> Result<()> {
             strategy: Arc::clone(&strategy_engine),
             client: Some(Arc::clone(&client)),
             withdrawals: Arc::clone(&withdrawals),
+            npc: Arc::clone(&npc_controller),
         };
         // Capture the port from the env var directly; fall back to parsing the address.
         let port_str = std::env::var("PORT")
@@ -406,29 +468,7 @@ async fn main() -> Result<()> {
         },
     );
 
-    let trade_cfg = agent::TradeAgentConfig {
-        enabled: env_bool("TRADE_ENABLED", false),
-        trade_size: env_f64("TRADE_SIZE", order_qty),
-        momentum_threshold: env_f64("MOMENTUM_THRESHOLD", 0.00005),
-        poll_interval: Duration::from_secs(env_u64("TRADE_INTERVAL_SECS", 1)),
-        max_spread_bps: env_f64("SIGNAL_MAX_SPREAD_BPS", 5.0),
-    };
-    let web_base_url = web_ui_addr.as_ref().map(|addr| format!("http://{}", addr));
-    npc::spawn_npc_trading_layer(
-        npc::NpcConfig::from_trade_cfg(&trade_cfg),
-        agent::AgentState {
-            store: Arc::clone(&event_store),
-            exec: Arc::clone(&exec),
-            feed: Arc::clone(&feed_state),
-            signal: Arc::clone(&signal_engine),
-            truth: Arc::clone(&truth),
-            authority: Arc::clone(&authority),
-            withdrawals: Arc::clone(&withdrawals),
-            client: Arc::clone(&client),
-            symbol: symbol.clone(),
-            web_base_url,
-        },
-    );
+    npc::spawn_npc_trading_layer(&npc_controller).await;
 
     // ── 7. Spawn reconciliation loop (with executor + event store) ──────────
     let recon_secs = env_u64("RECONCILE_INTERVAL_SECS", 2);
