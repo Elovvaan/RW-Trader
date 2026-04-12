@@ -9,6 +9,7 @@ mod feed;
 mod orders;
 mod portfolio;
 mod position;
+mod profile;
 mod reader;
 mod reconciler;
 mod replay;
@@ -147,6 +148,7 @@ async fn main() -> Result<()> {
                 client:    None,
                 withdrawals: Arc::clone(&stub_withdrawals),
                 npc: npc_controller,
+                profile:   Arc::new(Mutex::new(profile::RuntimeProfile::default())),
             };
             webui::run(&addr, state).await?;
             return Ok(());
@@ -215,6 +217,24 @@ async fn main() -> Result<()> {
         .map(|v| v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     let bnb_price: f64 = env_f64("BNB_PRICE_USD", 0.0);
+
+    // ── Runtime profile ──────────────────────────────────────────────────────
+    // RUNTIME_PROFILE env-var: CONSERVATIVE | ACTIVE | MICRO_TEST (default: ACTIVE)
+    let runtime_profile = profile::RuntimeProfile::from_str(
+        &std::env::var("RUNTIME_PROFILE").unwrap_or_else(|_| "ACTIVE".into()),
+    );
+    let profile_cfg = profile::ProfileConfig::for_profile(runtime_profile);
+    info!(
+        profile = runtime_profile.as_str(),
+        label   = runtime_profile.label(),
+        min_confidence            = profile_cfg.signal_min_confidence,
+        entry_cooldown_secs       = profile_cfg.entry_cooldown_after_exit.as_secs(),
+        failed_breakout_cooldown_secs = profile_cfg.failed_breakout_cooldown.as_secs(),
+        cycle_interval_ms         = profile_cfg.cycle_interval.as_millis() as u64,
+        "=== Runtime profile ==="
+    );
+    // Wrap in Arc<Mutex> so the web UI can update it at runtime.
+    let active_profile = Arc::new(Mutex::new(runtime_profile));
 
     let client = Arc::new(client::BinanceClient::new(api_key, api_secret, rest_url));
 
@@ -299,13 +319,20 @@ async fn main() -> Result<()> {
     }
 
     // ── 4. Risk engine ───────────────────────────────────────────────────────
+    // RISK_COOLDOWN_SECS is overridden by the profile's entry_cooldown_after_exit
+    // unless the operator has explicitly set RISK_COOLDOWN_SECS in the environment.
+    let risk_cooldown_secs = if std::env::var("RISK_COOLDOWN_SECS").is_ok() {
+        env_u64("RISK_COOLDOWN_SECS", 300)
+    } else {
+        profile_cfg.entry_cooldown_after_exit.as_secs()
+    };
     let risk_config = risk::RiskConfig {
         max_position_qty:    env_f64("RISK_MAX_QTY",          0.01),
         max_daily_loss_usd:  env_f64("RISK_MAX_DAILY_LOSS",   50.0),
         max_drawdown_usd:    env_f64("RISK_MAX_DRAWDOWN",      100.0),
         max_consecutive_losses: env_u64("RISK_MAX_CONSECUTIVE_LOSSES", 3) as u32,
         max_spread_bps:      env_f64("RISK_MAX_SPREAD_BPS",    10.0),
-        cooldown_after_loss: Duration::from_secs(env_u64("RISK_COOLDOWN_SECS", 300)),
+        cooldown_after_loss: Duration::from_secs(risk_cooldown_secs),
         max_feed_staleness:  Duration::from_secs(env_u64("RISK_FEED_STALE_SECS", 5)),
         min_order_interval:  Duration::from_secs(1),
         signal_dedup_window: Duration::from_secs(5),
@@ -336,6 +363,12 @@ async fn main() -> Result<()> {
     let signal_engine  = Arc::new(Mutex::new(signal::SignalEngine::new(signal_config)));
     // StrategyEngine replaces direct use of signal_engine for decision-making.
     let strategy_engine = Arc::new(Mutex::new(strategy::StrategyEngine::new()));
+    // min_confidence_normal is overridden by the profile unless explicitly set.
+    let min_conf_normal = if std::env::var("PORTFOLIO_MIN_CONF_NORMAL").is_ok() {
+        env_f64("PORTFOLIO_MIN_CONF_NORMAL", 0.70)
+    } else {
+        profile_cfg.signal_min_confidence
+    };
     let portfolio_config = portfolio::PortfolioConfig {
         initial_equity_usd: env_f64("PORTFOLIO_INITIAL_EQUITY_USD", 10_000.0),
         reserve_cash_buffer: env_f64("PORTFOLIO_RESERVE_BUFFER", 0.20),
@@ -350,7 +383,7 @@ async fn main() -> Result<()> {
         defensive_drawdown: env_f64("PORTFOLIO_DEFENSIVE_DRAWDOWN", 0.04),
         recovery_drawdown: env_f64("PORTFOLIO_RECOVERY_DRAWDOWN", 0.02),
         defensive_hit_rate: env_f64("PORTFOLIO_DEFENSIVE_HIT_RATE", 0.45),
-        min_confidence_normal: env_f64("PORTFOLIO_MIN_CONF_NORMAL", 0.70),
+        min_confidence_normal: min_conf_normal,
         min_confidence_defensive: env_f64("PORTFOLIO_MIN_CONF_DEFENSIVE", 0.82),
         max_concurrent_positions_normal: env_u64("PORTFOLIO_MAX_CONCURRENT_NORMAL", 6) as usize,
         max_concurrent_positions_defensive: env_u64("PORTFOLIO_MAX_CONCURRENT_DEFENSIVE", 3) as usize,
@@ -393,11 +426,18 @@ async fn main() -> Result<()> {
         duplicate_window: Duration::from_secs(env_u64("WITHDRAW_DUP_WINDOW_SECS", 600)),
         default_fee: env_f64("WITHDRAW_DEFAULT_FEE", 0.0),
     }));
+    // TRADE_INTERVAL_SECS is overridden by the profile's cycle_interval unless
+    // the operator has explicitly set TRADE_INTERVAL_SECS.
+    let trade_interval_secs = if std::env::var("TRADE_INTERVAL_SECS").is_ok() {
+        env_u64("TRADE_INTERVAL_SECS", 1)
+    } else {
+        profile_cfg.cycle_interval.as_secs().max(1)
+    };
     let trade_cfg = agent::TradeAgentConfig {
         enabled: env_bool("TRADE_ENABLED", false),
         trade_size: env_f64("TRADE_SIZE", order_qty),
         momentum_threshold: env_f64("MOMENTUM_THRESHOLD", 0.00005),
-        poll_interval: Duration::from_secs(env_u64("TRADE_INTERVAL_SECS", 1)),
+        poll_interval: Duration::from_secs(trade_interval_secs),
         max_spread_bps: env_f64("SIGNAL_MAX_SPREAD_BPS", 5.0),
     };
     let web_base_url = web_ui_addr.as_ref().map(|addr| format!("http://{}", addr));
@@ -427,6 +467,7 @@ async fn main() -> Result<()> {
             client: Some(Arc::clone(&client)),
             withdrawals: Arc::clone(&withdrawals),
             npc: Arc::clone(&npc_controller),
+            profile: Arc::clone(&active_profile),
         };
         // Capture the port from the env var directly; fall back to parsing the address.
         let port_str = std::env::var("PORT")
