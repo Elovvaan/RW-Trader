@@ -413,6 +413,12 @@ pub struct NpcLoopSnapshot {
     pub timestamp: String,
     pub execution_result: String,
     pub status: String,
+    /// Most recent agent decision (e.g. "SELL InventoryManager score=0.85").
+    pub last_agent_decision: String,
+    /// Why no trade was placed on the last no-action cycle (empty string when a trade executed).
+    pub last_no_trade_reason: String,
+    /// Current execution pipeline state label.
+    pub pipeline_state: String,
 }
 
 #[derive(Default)]
@@ -424,6 +430,9 @@ struct NpcLoopTelemetry {
     timestamp: String,
     execution_result: String,
     status: String,
+    last_agent_decision: String,
+    last_no_trade_reason: String,
+    pipeline_state: String,
 }
 
 struct NpcLoopControl {
@@ -467,6 +476,9 @@ impl NpcAutonomousController {
                 last_action: "NO_ACTION".to_string(),
                 execution_result: NPC_STATUS_SCANNING.to_string(),
                 status: NPC_STATUS_SCANNING.to_string(),
+                last_agent_decision: "Waiting for first cycle".to_string(),
+                last_no_trade_reason: String::new(),
+                pipeline_state: "Scanning".to_string(),
                 ..NpcLoopTelemetry::default()
             })),
             control: Arc::new(Mutex::new(NpcLoopControl::new(interval_ms, mode))),
@@ -564,6 +576,9 @@ impl NpcAutonomousController {
             timestamp: telemetry.timestamp.clone(),
             execution_result: telemetry.execution_result.clone(),
             status: telemetry.status.clone(),
+            last_agent_decision: telemetry.last_agent_decision.clone(),
+            last_no_trade_reason: telemetry.last_no_trade_reason.clone(),
+            pipeline_state: telemetry.pipeline_state.clone(),
         }
     }
 
@@ -623,6 +638,9 @@ impl NpcAutonomousController {
                         t.last_action = report.last_action;
                         t.timestamp = Utc::now().to_rfc3339();
                         t.execution_result = report.execution_result;
+                        t.last_agent_decision = report.last_agent_decision;
+                        t.last_no_trade_reason = report.no_trade_reason;
+                        t.pipeline_state = report.pipeline_state;
                         t.status = match report.status.as_str() {
                             "blocked" => "Blocked by safety checks".to_string(),
                             "running" => AgentMode::Auto.state_label().to_string(),
@@ -674,14 +692,23 @@ struct NpcCycleReport {
     last_action: String,
     execution_result: String,
     status: String,
+    /// Human-readable description of the agent's most recent decision.
+    last_agent_decision: String,
+    /// Reason no trade was placed (empty string when a trade executed).
+    no_trade_reason: String,
+    /// Current execution pipeline state label.
+    pipeline_state: String,
 }
 
 async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRuntimeState>>) -> NpcCycleReport {
     let no_action = |cycle_id: u64, execution_result: String, status: String| NpcCycleReport {
         cycle_id,
         last_action: "NO_ACTION".to_string(),
-        execution_result,
+        execution_result: execution_result.clone(),
         status,
+        last_agent_decision: "HOLD — no actionable trigger".to_string(),
+        no_trade_reason: execution_result,
+        pipeline_state: "Scanning".to_string(),
     };
     let mode = state.authority.mode().await;
     if mode == AuthorityMode::Off {
@@ -808,7 +835,18 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         );
         rt.perf.entry(chosen.role).or_default().blocked += 1;
         observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
-        return no_action(cycle_id, reason, "blocked".to_string());
+        return NpcCycleReport {
+            cycle_id,
+            last_action: "NO_ACTION".to_string(),
+            execution_result: reason.clone(),
+            status: "blocked".to_string(),
+            last_agent_decision: format!(
+                "HOLD — {} {} blocked: {}",
+                chosen.side.to_uppercase(), chosen.role.as_str(), reason
+            ),
+            no_trade_reason: format!("Regime mismatch — {}. Try a different market condition.", reason),
+            pipeline_state: "Scanning".to_string(),
+        };
     }
 
     if chosen.score < regime_cutoff {
@@ -824,7 +862,21 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         );
         rt.perf.entry(chosen.role).or_default().blocked += 1;
         observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
-        return no_action(cycle_id, "SCORE_BELOW_THRESHOLD".to_string(), "blocked".to_string());
+        return NpcCycleReport {
+            cycle_id,
+            last_action: "NO_ACTION".to_string(),
+            execution_result: "SCORE_BELOW_THRESHOLD".to_string(),
+            status: "blocked".to_string(),
+            last_agent_decision: format!(
+                "HOLD — {} {} score {:.4} below threshold {:.4}",
+                chosen.side.to_uppercase(), chosen.role.as_str(), chosen.score, regime_cutoff
+            ),
+            no_trade_reason: format!(
+                "Signal score {:.4} below minimum threshold {:.4}. Waiting for stronger trigger.",
+                chosen.score, regime_cutoff
+            ),
+            pipeline_state: "Scanning".to_string(),
+        };
     }
 
     if !portfolio_controls.is_empty() {
@@ -837,10 +889,24 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         );
         rt.perf.entry(chosen.role).or_default().blocked += 1;
         observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
-        return no_action(cycle_id, portfolio_controls.join("|"), "blocked".to_string());
+        return NpcCycleReport {
+            cycle_id,
+            last_action: "NO_ACTION".to_string(),
+            execution_result: portfolio_controls.join("|"),
+            status: "blocked".to_string(),
+            last_agent_decision: format!(
+                "HOLD — {} {} blocked by portfolio controls",
+                chosen.side.to_uppercase(), chosen.role.as_str()
+            ),
+            no_trade_reason: format!(
+                "Portfolio risk controls active: {}",
+                portfolio_controls.join("; ")
+            ),
+            pipeline_state: "Scanning".to_string(),
+        };
     }
 
-    let allocation = allocate_capital(&effective_cfg, &rt, &chosen, position_size, exposure_notional, buy_power, metrics.mid);
+    let allocation = allocate_capital(&effective_cfg, &rt, &chosen, position_size, exposure_notional, buy_power, sell_inventory, metrics.mid);
     if allocation.qty <= 0.0 {
         lifecycle(
             &*state.store,
@@ -851,11 +917,30 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         );
         rt.perf.entry(chosen.role).or_default().blocked += 1;
         observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
-        return no_action(
+        return NpcCycleReport {
             cycle_id,
-            format!("ALLOCATION_REJECTED:{}", allocation.reason),
-            "blocked".to_string(),
-        );
+            last_action: "NO_ACTION".to_string(),
+            execution_result: format!("ALLOCATION_REJECTED:{}", allocation.reason),
+            status: "blocked".to_string(),
+            last_agent_decision: format!(
+                "HOLD — {} {} allocation rejected: {}",
+                chosen.side.to_uppercase(), chosen.role.as_str(), allocation.reason
+            ),
+            no_trade_reason: if chosen.side.eq_ignore_ascii_case("SELL") {
+                format!(
+                    "SELL blocked — insufficient sell inventory (sell_inv={:.8}, alloc_reason={}). \
+                     Ensure base-asset balance is non-zero.",
+                    sell_inventory, allocation.reason
+                )
+            } else {
+                format!(
+                    "BUY blocked — insufficient buy power (buy_power={:.2}, alloc_reason={}). \
+                     Ensure USDT balance is non-zero.",
+                    buy_power, allocation.reason
+                )
+            },
+            pipeline_state: "Scanning".to_string(),
+        };
     }
 
     let guard_reasons = evaluate_guards(
@@ -877,7 +962,21 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         );
         rt.perf.entry(chosen.role).or_default().blocked += 1;
         observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
-        return no_action(cycle_id, guard_reasons.join("|"), "blocked".to_string());
+        return NpcCycleReport {
+            cycle_id,
+            last_action: "NO_ACTION".to_string(),
+            execution_result: guard_reasons.join("|"),
+            status: "blocked".to_string(),
+            last_agent_decision: format!(
+                "HOLD — {} {} blocked by safety guards",
+                chosen.side.to_uppercase(), chosen.role.as_str()
+            ),
+            no_trade_reason: format!(
+                "Safety guard blocked order: {}",
+                guard_reasons.join("; ")
+            ),
+            pipeline_state: "Scanning".to_string(),
+        };
     }
 
     lifecycle(
@@ -901,11 +1000,20 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         );
         rt.perf.entry(chosen.role).or_default().blocked += 1;
         observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
-        return no_action(
+        return NpcCycleReport {
             cycle_id,
-            "LIVE_REQUIRES_PAPER_EXECUTION".to_string(),
-            "blocked".to_string(),
-        );
+            last_action: "NO_ACTION".to_string(),
+            execution_result: "LIVE_REQUIRES_PAPER_EXECUTION".to_string(),
+            status: "blocked".to_string(),
+            last_agent_decision: format!(
+                "HOLD — {} {} authorized but blocked: NPC_TRADING_MODE=live requires one paper execution first",
+                chosen.side.to_uppercase(), chosen.role.as_str()
+            ),
+            no_trade_reason: "Live mode safety gate: set NPC_TRADING_MODE=paper to enable execution. \
+                               One successful paper execution is required before live trades are allowed."
+                .to_string(),
+            pipeline_state: "Trigger Matched — Blocked".to_string(),
+        };
     }
 
     lifecycle(&*state.store, chosen.role, &chosen.action_id, NpcLifecycleState::Queued, "ready for dispatch");
@@ -937,7 +1045,20 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                 "WEB_UI_ADDR missing; cannot dispatch trade request",
             );
             observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
-            return no_action(cycle_id, "WEB_UI_ADDR_MISSING".to_string(), "blocked".to_string());
+            return NpcCycleReport {
+                cycle_id,
+                last_action: "NO_ACTION".to_string(),
+                execution_result: "WEB_UI_ADDR_MISSING".to_string(),
+                status: "blocked".to_string(),
+                last_agent_decision: format!(
+                    "{} {} trigger matched — blocked: WEB_UI_ADDR not configured",
+                    chosen.side.to_uppercase(), chosen.role.as_str()
+                ),
+                no_trade_reason: "WEB_UI_ADDR environment variable is missing. The agent cannot dispatch \
+                                   trade requests without a configured web UI address."
+                    .to_string(),
+                pipeline_state: "Trigger Matched — Blocked".to_string(),
+            };
         };
 
         let mut form = HashMap::new();
@@ -962,7 +1083,10 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             chosen.role,
             &chosen.action_id,
             NpcLifecycleState::Executing,
-            "dispatching trade request to web layer",
+            &format!(
+                "dispatching trade request to web layer side={} qty={:.8} symbol={}",
+                chosen.side, allocation.qty, state.symbol
+            ),
         );
         match reqwest::Client::new().post(&url).form(&form).send().await {
             Ok(resp) if resp.status().is_success() => {
@@ -978,19 +1102,36 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                 rt.paper_executions += 1;
             }
             Ok(resp) => {
+                let status_code = resp.status();
+                let body_preview = resp.text().await.unwrap_or_default();
+                let short_body = if body_preview.len() > 200 {
+                    format!("{}…", &body_preview[..200])
+                } else {
+                    body_preview.clone()
+                };
                 lifecycle(
                     &*state.store,
                     chosen.role,
                     &chosen.action_id,
                     NpcLifecycleState::Rejected,
-                    &format!("http_status={}", resp.status()),
+                    &format!("http_status={} body={}", status_code, short_body),
                 );
                 observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
-                return no_action(
+                return NpcCycleReport {
                     cycle_id,
-                    format!("HTTP_STATUS_{}", resp.status()),
-                    "blocked".to_string(),
-                );
+                    last_action: "NO_ACTION".to_string(),
+                    execution_result: format!("HTTP_STATUS_{}", status_code),
+                    status: "blocked".to_string(),
+                    last_agent_decision: format!(
+                        "{} {} submitted — rejected by executor (HTTP {})",
+                        chosen.side.to_uppercase(), chosen.role.as_str(), status_code
+                    ),
+                    no_trade_reason: format!(
+                        "Trade request rejected by executor (HTTP {}): {}",
+                        status_code, short_body
+                    ),
+                    pipeline_state: "Rejected".to_string(),
+                };
             }
             Err(e) => {
                 lifecycle(
@@ -1001,7 +1142,18 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                     &format!("request_error={}", e),
                 );
                 observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
-                return no_action(cycle_id, format!("REQUEST_ERROR:{}", e), "blocked".to_string());
+                return NpcCycleReport {
+                    cycle_id,
+                    last_action: "NO_ACTION".to_string(),
+                    execution_result: format!("REQUEST_ERROR:{}", e),
+                    status: "blocked".to_string(),
+                    last_agent_decision: format!(
+                        "{} {} dispatch failed — network error",
+                        chosen.side.to_uppercase(), chosen.role.as_str()
+                    ),
+                    no_trade_reason: format!("Network error dispatching trade request: {}", e),
+                    pipeline_state: "Rejected".to_string(),
+                };
             }
         }
     }
@@ -1045,6 +1197,16 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         last_action: chosen.side.to_uppercase(),
         execution_result: "EXECUTED".to_string(),
         status: "running".to_string(),
+        last_agent_decision: format!(
+            "{} {} role={} score={:.4} reason={}",
+            chosen.side.to_uppercase(),
+            state.symbol,
+            chosen.role.as_str(),
+            chosen.score,
+            chosen.reason
+        ),
+        no_trade_reason: String::new(),
+        pipeline_state: "Submitting Order".to_string(),
     }
 }
 
@@ -1447,6 +1609,7 @@ fn allocate_capital(
     _position_size: f64,
     exposure_notional: f64,
     buy_power: f64,
+    sell_inventory: f64,
     mid: f64,
 ) -> AllocationDecision {
     let perf = rt.perf.get(&chosen.role).cloned().unwrap_or_default();
@@ -1468,8 +1631,16 @@ fn allocate_capital(
     let size_multiplier = quality * (1.0 + recent_performance).clamp(0.3, 1.4) * (1.0 - symbol_concentration).clamp(0.1, 1.0) * dd_factor;
     let mut qty = cfg.trade_size * agent_budget * size_multiplier;
 
-    let max_by_buy_power = if mid > 0.0 { buy_power / mid } else { 0.0 };
-    qty = qty.min(max_by_buy_power.max(0.0));
+    // Cap quantity by the available balance for this side:
+    // SELL orders are limited by base-asset inventory; BUY orders by quote buying power.
+    let max_qty = if chosen.side.eq_ignore_ascii_case("SELL") {
+        sell_inventory.max(0.0)
+    } else if mid > 0.0 {
+        buy_power / mid
+    } else {
+        0.0
+    };
+    qty = qty.min(max_qty.max(0.0));
 
     if drawdown >= cfg.alpha.drawdown_hard_stop_pct {
         qty = 0.0;
