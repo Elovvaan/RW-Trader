@@ -48,6 +48,7 @@ pub struct AppState {
     pub strategy:  Arc<Mutex<StrategyEngine>>,
     pub client:    Option<Arc<BinanceClient>>,
     pub withdrawals: Arc<WithdrawalManager>,
+    pub npc: Arc<crate::npc::NpcAutonomousController>,
 }
 
 #[cfg(test)]
@@ -160,6 +161,31 @@ async fn handle_post(path: &str, _query: &str, body: &str, state: &AppState) -> 
     if path == "/assistant/system-restart" {
         log_ui_action(&*state.store, "ui_system_restart", "system restart requested from /assistant");
         return redirect_with_ok("/assistant", "Restart request recorded.");
+    }
+    if path == "/assistant/autonomous/on" {
+        state.npc.set_autonomous_mode(true).await;
+        log_ui_action(&*state.store, "ui_autonomous_mode_on", "autonomous mode enabled from /assistant");
+        return redirect_with_ok("/assistant", "Autonomous Mode enabled.");
+    }
+    if path == "/assistant/autonomous/off" {
+        state.npc.set_autonomous_mode(false).await;
+        log_ui_action(&*state.store, "ui_autonomous_mode_off", "autonomous mode disabled from /assistant");
+        return redirect_with_ok("/assistant", "Autonomous Mode disabled.");
+    }
+    if path == "/assistant/autonomous/interval" {
+        let form = parse_form_body(body);
+        let interval_ms = form
+            .get("interval_ms")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1000)
+            .clamp(500, 2000);
+        state.npc.set_interval_ms(interval_ms).await;
+        log_ui_action(
+            &*state.store,
+            "ui_autonomous_interval_set",
+            &format!("autonomous interval set to {}ms from /assistant", interval_ms),
+        );
+        return redirect_with_ok("/assistant", &format!("Autonomous interval set to {}ms.", interval_ms));
     }
     if path == "/assistant/kill-switch/on" {
         state.risk.lock().await.set_kill_switch(true);
@@ -851,6 +877,7 @@ async fn page_events(state: &AppState, query: &str) -> String {
         )
     };
     let kill = state.risk.lock().await.kill_switch_active();
+    let npc_loop = state.npc.snapshot().await;
 
     let best_summary = events.first().map(summarise_event).unwrap_or_else(|| "No fresh event yet; waiting for next snapshot.".to_string());
     let quote_asset = ["USDT", "USDC", "BUSD", "FDUSD", "TUSD", "BTC", "ETH", "BNB"]
@@ -898,6 +925,8 @@ async fn page_events(state: &AppState, query: &str) -> String {
           <div class='metric-card'><div class='metric-label'>Symbol</div><div class='metric-value'>{}</div></div>\
           <div class='metric-card'><div class='metric-label'>System status</div><div class='metric-value'>{} / {}</div></div>\
           <div class='metric-card'><div class='metric-label'>Risk status</div><div class='metric-value {}'>{}</div></div>\
+          <div class='metric-card'><div class='metric-label'>Autonomous Executor</div><div class='metric-value'>{}</div></div>\
+          <div class='metric-card'><div class='metric-label'>Autonomous Cycles</div><div class='metric-value'>{}</div></div>\
         </div>\
         <div class='summary-strip' style='margin-top:10px'>\
           <div class='summary-pill'><div class='label'>Trading Readiness</div><div>{}</div></div>\
@@ -915,6 +944,8 @@ async fn page_events(state: &AppState, query: &str) -> String {
         esc(&sys_mode.to_string()),
         if kill { "err" } else { "ok" },
         risk_status,
+        if npc_loop.running { "Running" } else { "Idle" },
+        npc_loop.cycle_count,
         esc(&signal_label.to_uppercase()),
         esc(&exec_state.to_string()),
         esc(&balance_note)
@@ -1000,11 +1031,15 @@ async fn page_events(state: &AppState, query: &str) -> String {
         "<div class='soft-title'>Recent activity</div>\
          <table><thead><tr><th>Time</th><th>Type</th><th>Summary</th></tr></thead><tbody>{}</tbody></table>\
          <div class='sum' style='margin-top:8px'>Position {:.6} · Open orders {} · <a href='{}'>Open timeline view</a></div>\
+         <div class='sum' style='margin-top:8px'>Autonomous last decision: {} · cycle {} · {}</div>\
          <details style='margin-top:10px'><summary class='soft-title' style='cursor:pointer'>Advanced / Diagnostics</summary>{}</details>",
         rows,
         pos_size,
         open_orders,
         corr_link,
+        esc(&npc_loop.last_action),
+        npc_loop.cycle_id,
+        esc(&npc_loop.execution_result),
         balances_table,
     );
     let market_body = format!(
@@ -1234,6 +1269,7 @@ async fn page_assistant(state: &AppState, query: &str) -> String {
     let sys_mode = state.exec.system_mode().await;
     let exec_state = state.exec.execution_state().await;
     let kill_active = state.risk.lock().await.kill_switch_active();
+    let npc_loop = state.npc.snapshot().await;
     let (health_class, health_text) = system_health_summary(sys_mode, exec_state.clone(), kill_active);
     let recent_events = state.store.fetch_recent(10).unwrap_or_default();
 
@@ -1243,6 +1279,8 @@ async fn page_assistant(state: &AppState, query: &str) -> String {
           <div class='metric-card'><div class='metric-label'>Mode</div><div class='metric-value'>{}</div></div>\
           <div class='metric-card'><div class='metric-label'>Executor</div><div class='metric-value'>{}</div></div>\
           <div class='metric-card'><div class='metric-label'>Kill Switch</div><div class='metric-value {}'>{}</div></div>\
+          <div class='metric-card'><div class='metric-label'>Autonomous Mode</div><div class='metric-value'>{}</div></div>\
+          <div class='metric-card'><div class='metric-label'>Loop Cycles</div><div class='metric-value'>{}</div></div>\
         </div>",
         health_class,
         esc(&health_text),
@@ -1250,10 +1288,25 @@ async fn page_assistant(state: &AppState, query: &str) -> String {
         esc(&exec_state.to_string()),
         if kill_active { "err" } else { "ok" },
         if kill_active { "ACTIVE" } else { "OFF" },
+        if npc_loop.running { "Executor Running" } else { "Executor Idle" },
+        npc_loop.cycle_count,
     );
 
-    let primary_body = "<div style='display:grid;gap:10px'>\
+    let primary_body = format!("<div style='display:grid;gap:10px'>\
       <div class='signal-box'><div class='label'>Trading Controls</div><div class='sum'>Operator-level controls for runtime behavior and authority-safe interventions.</div><div style='margin-top:8px'>Authority workflows available in <a href='/authority'>FUNDS → approvals</a>.</div></div>\
+      <div class='signal-box'><div class='label'>Autonomous Mode</div><div class='sum'>Background NPC/Alpha loop with idempotent single-instance guard.</div>\
+        <div class='sum' style='margin-top:6px'>State: <strong>{}</strong> · Last decision: {} · Result: {} · Updated: {}</div>\
+        <div class='sum' style='margin-top:6px'>Current cycle: {} · Interval: {}ms</div>\
+        <div style='display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px'>\
+          <form method='post' action='/assistant/autonomous/on'><button class='btn-approve' style='width:100%' type='submit'>Autonomous ON</button></form>\
+          <form method='post' action='/assistant/autonomous/off'><button class='btn-reject' style='width:100%' type='submit'>Autonomous OFF</button></form>\
+        </div>\
+        <form method='post' action='/assistant/autonomous/interval' style='margin-top:8px'>\
+          <label class='dim'>Loop interval (500-2000 ms)</label>\
+          <input type='number' min='500' max='2000' step='100' name='interval_ms' value='{}' style='width:140px;margin-left:8px'>\
+          <button class='btn' type='submit'>Set Interval</button>\
+        </form>\
+      </div>\
       <div class='signal-box'><div class='label'>Safety Controls</div><div class='sum' style='margin-bottom:8px'>Emergency controls with explicit intent.</div>\
         <div style='display:grid;grid-template-columns:1fr 1fr;gap:8px'>\
           <form method='post' action='/assistant/kill-switch/on'><button class='btn-reject' style='width:100%' type='submit'>Engage Kill Switch</button></form>\
@@ -1262,7 +1315,15 @@ async fn page_assistant(state: &AppState, query: &str) -> String {
       </div>\
       <div class='signal-box'><div class='label'>API & Connectivity</div><div>Market Feed <span class='ok' style='float:right'>Connected</span></div><div style='margin-top:6px'>Trading API <span class='warn' style='float:right'>Read-Only in DEMO</span></div><div style='margin-top:6px'>Webhook Auth <span class='ok' style='float:right'>Healthy</span></div></div>\
       <div class='signal-box'><div class='label'>Advanced / Diagnostics</div><form method='post' action='/assistant/system-restart' style='margin-top:8px'><button class='btn' style='width:100%' type='submit'>System Restart</button></form></div>\
-      </div>";
+      </div>",
+      if npc_loop.running { "Executor Running" } else { "Executor Idle" },
+      esc(&npc_loop.last_action),
+      esc(&npc_loop.execution_result),
+      esc(&npc_loop.timestamp),
+      npc_loop.cycle_id,
+      npc_loop.interval_ms,
+      npc_loop.interval_ms,
+    );
 
     let context_rows = recent_events.iter().take(5)
         .map(|e| format!("<tr><td>{}</td><td>{}</td></tr>", e.occurred_at.format("%H:%M:%S"), esc(&summarise_event(e))))
@@ -1279,7 +1340,7 @@ async fn page_assistant(state: &AppState, query: &str) -> String {
         "Admin / Settings",
         &status_body,
         "API Health + Key Controls",
-        primary_body,
+        &primary_body,
         "Platform Context",
         &context_body,
         Some(("Migration Note", details_body)),
@@ -1648,15 +1709,53 @@ mod tests {
             max_slippage_bps:    20.0,
         }, &pos);
         let (client, withdrawals) = test_app_state_extras();
+        let store = InMemoryEventStore::new();
+        let exec = Arc::new(Executor::new("BTCUSDT".into(), CircuitBreakerConfig::default(), WatchdogConfig::default()));
+        let truth = Arc::new(Mutex::new(TruthState::new("BTCUSDT", 0.0)));
+        let authority = Arc::new(crate::authority::AuthorityLayer::new());
+        let signal = Arc::new(Mutex::new(crate::signal::SignalEngine::new(crate::signal::SignalConfig {
+            order_qty: 0.001,
+            momentum_threshold: 0.0,
+            imbalance_threshold: 0.0,
+            max_entry_spread_bps: 5.0,
+            max_feed_staleness: Duration::from_secs(3),
+            stop_loss_pct: 0.0,
+            take_profit_pct: 0.0,
+            max_hold_duration: Duration::from_secs(10),
+            min_mid_samples: 1,
+            min_trade_samples: 1,
+        })));
+        let npc = Arc::new(crate::npc::NpcAutonomousController::new(
+            crate::npc::NpcConfig::from_trade_cfg(&crate::agent::TradeAgentConfig {
+                enabled: false,
+                trade_size: 0.0,
+                momentum_threshold: 0.0,
+                poll_interval: Duration::from_millis(1000),
+                max_spread_bps: 5.0,
+            }),
+            crate::agent::AgentState {
+                store: Arc::clone(&store),
+                exec: Arc::clone(&exec),
+                feed: Arc::new(Mutex::new(crate::feed::FeedState::new(Duration::from_secs(10)))),
+                signal,
+                truth: Arc::clone(&truth),
+                authority: Arc::clone(&authority),
+                withdrawals: Arc::clone(&withdrawals),
+                client: Arc::new(crate::client::BinanceClient::new(String::new(), String::new(), String::new())),
+                symbol: "BTCUSDT".into(),
+                web_base_url: None,
+            },
+        ));
         AppState {
-            store:    InMemoryEventStore::new(),
-            exec:     Arc::new(Executor::new("BTCUSDT".into(), CircuitBreakerConfig::default(), WatchdogConfig::default())),
-            truth:    Arc::new(Mutex::new(TruthState::new("BTCUSDT", 0.0))),
+            store,
+            exec,
+            truth,
             risk:     Arc::new(Mutex::new(risk)),
-            authority: Arc::new(crate::authority::AuthorityLayer::new()),
+            authority,
             strategy:  Arc::new(Mutex::new(crate::strategy::StrategyEngine::new())),
             client,
             withdrawals,
+            npc,
         }
     }
 

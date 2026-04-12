@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chrono::Utc;
 use tokio::sync::Mutex;
 use tracing::info;
 
@@ -357,39 +358,224 @@ struct NpcRuntimeState {
     learner_ranges: Option<LearnerConfigRanges>,
 }
 
-pub fn spawn_npc_trading_layer(cfg: NpcConfig, state: AgentState) {
-    if !cfg.enabled {
+#[derive(Clone, Debug)]
+pub struct NpcLoopSnapshot {
+    pub autonomous_mode: bool,
+    pub running: bool,
+    pub interval_ms: u64,
+    pub cycle_count: u64,
+    pub cycle_id: u64,
+    pub last_action: String,
+    pub timestamp: String,
+    pub execution_result: String,
+    pub status: String,
+}
+
+#[derive(Default)]
+struct NpcLoopTelemetry {
+    running: bool,
+    cycle_count: u64,
+    cycle_id: u64,
+    last_action: String,
+    timestamp: String,
+    execution_result: String,
+    status: String,
+}
+
+struct NpcLoopControl {
+    autonomous_mode: bool,
+    interval_ms: u64,
+    stop_tx: Option<tokio::sync::watch::Sender<bool>>,
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl NpcLoopControl {
+    fn new(interval_ms: u64, autonomous_mode: bool) -> Self {
+        Self {
+            autonomous_mode,
+            interval_ms,
+            stop_tx: None,
+            handle: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct NpcAutonomousController {
+    cfg: NpcConfig,
+    state: AgentState,
+    runtime: Arc<Mutex<NpcRuntimeState>>,
+    telemetry: Arc<Mutex<NpcLoopTelemetry>>,
+    control: Arc<Mutex<NpcLoopControl>>,
+}
+
+impl NpcAutonomousController {
+    pub fn new(cfg: NpcConfig, state: AgentState) -> Self {
+        let interval_ms = cfg.cycle_interval.as_millis().clamp(500, 2000) as u64;
+        let autonomous_mode = cfg.enabled;
+        Self {
+            cfg,
+            state,
+            runtime: Arc::new(Mutex::new(NpcRuntimeState::default())),
+            telemetry: Arc::new(Mutex::new(NpcLoopTelemetry {
+                last_action: "NO_ACTION".to_string(),
+                execution_result: "idle".to_string(),
+                status: "idle".to_string(),
+                ..NpcLoopTelemetry::default()
+            })),
+            control: Arc::new(Mutex::new(NpcLoopControl::new(interval_ms, autonomous_mode))),
+        }
+    }
+
+    pub async fn set_autonomous_mode(&self, enabled: bool) {
+        let mut control = self.control.lock().await;
+        control.autonomous_mode = enabled;
+        drop(control);
+        if enabled {
+            self.spawn_trading_loop().await;
+        } else {
+            self.stop_trading_loop().await;
+        }
+    }
+
+    pub async fn set_interval_ms(&self, interval_ms: u64) {
+        let interval_ms = interval_ms.clamp(500, 2000);
+        let mut control = self.control.lock().await;
+        if control.interval_ms == interval_ms {
+            return;
+        }
+        control.interval_ms = interval_ms;
+        let should_restart = control.autonomous_mode;
+        drop(control);
+        if should_restart {
+            self.stop_trading_loop().await;
+            self.spawn_trading_loop().await;
+        }
+    }
+
+    pub async fn snapshot(&self) -> NpcLoopSnapshot {
+        let telemetry = self.telemetry.lock().await;
+        let control = self.control.lock().await;
+        NpcLoopSnapshot {
+            autonomous_mode: control.autonomous_mode,
+            running: telemetry.running,
+            interval_ms: control.interval_ms,
+            cycle_count: telemetry.cycle_count,
+            cycle_id: telemetry.cycle_id,
+            last_action: telemetry.last_action.clone(),
+            timestamp: telemetry.timestamp.clone(),
+            execution_result: telemetry.execution_result.clone(),
+            status: telemetry.status.clone(),
+        }
+    }
+
+    pub async fn spawn_trading_loop(&self) {
+        let mut control = self.control.lock().await;
+        if let Some(handle) = control.handle.as_ref() {
+            if !handle.is_finished() {
+                return;
+            }
+        }
+
+        let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+        let interval_ms = control.interval_ms;
+        control.stop_tx = Some(stop_tx);
+        let cfg = self.cfg.clone();
+        let state = self.state.clone();
+        let runtime = Arc::clone(&self.runtime);
+        let telemetry = Arc::clone(&self.telemetry);
+        control.handle = Some(tokio::spawn(async move {
+            {
+                let mut t = telemetry.lock().await;
+                t.running = true;
+                t.status = "running".to_string();
+            }
+            log_npc_event(
+                &*state.store,
+                "layer_started",
+                &format!(
+                    "mode={} interval_ms={} trade_size={:.8}",
+                    cfg.mode.as_str(),
+                    interval_ms,
+                    cfg.trade_size
+                ),
+            );
+
+            let mut loop_cfg = cfg.clone();
+            loop_cfg.cycle_interval = Duration::from_millis(interval_ms);
+            let mut interval = tokio::time::interval(loop_cfg.cycle_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let report = run_cycle(&loop_cfg, &state, Arc::clone(&runtime)).await;
+                        let mut t = telemetry.lock().await;
+                        t.cycle_count = t.cycle_count.saturating_add(1);
+                        t.cycle_id = report.cycle_id;
+                        t.last_action = report.last_action;
+                        t.timestamp = Utc::now().to_rfc3339();
+                        t.execution_result = report.execution_result;
+                        t.status = report.status;
+                    }
+                    changed = stop_rx.changed() => {
+                        if changed.is_ok() && *stop_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let mut t = telemetry.lock().await;
+            t.running = false;
+            t.status = "idle".to_string();
+        }));
+    }
+
+    pub async fn stop_trading_loop(&self) {
+        let handle = {
+            let mut control = self.control.lock().await;
+            if let Some(tx) = control.stop_tx.take() {
+                let _ = tx.send(true);
+            }
+            control.handle.take()
+        };
+        if let Some(handle) = handle {
+            let _ = handle.await;
+        }
+        let mut t = self.telemetry.lock().await;
+        t.running = false;
+        if t.status != "blocked" {
+            t.status = "idle".to_string();
+        }
+    }
+}
+
+pub async fn spawn_npc_trading_layer(controller: &NpcAutonomousController) {
+    if !controller.snapshot().await.autonomous_mode {
         info!("[NPC] Trading layer disabled");
         return;
     }
-
-    tokio::spawn(async move {
-        let runtime = Arc::new(Mutex::new(NpcRuntimeState::default()));
-        let mut interval = tokio::time::interval(cfg.cycle_interval);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        log_npc_event(
-            &*state.store,
-            "layer_started",
-            &format!(
-                "mode={} interval_s={} trade_size={:.8}",
-                cfg.mode.as_str(),
-                cfg.cycle_interval.as_secs(),
-                cfg.trade_size
-            ),
-        );
-
-        loop {
-            interval.tick().await;
-            run_cycle(&cfg, &state, Arc::clone(&runtime)).await;
-        }
-    });
+    controller.spawn_trading_loop().await;
 }
 
-async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRuntimeState>>) {
+struct NpcCycleReport {
+    cycle_id: u64,
+    last_action: String,
+    execution_result: String,
+    status: String,
+}
+
+async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRuntimeState>>) -> NpcCycleReport {
+    let no_action = |cycle_id: u64, execution_result: String, status: String| NpcCycleReport {
+        cycle_id,
+        last_action: "NO_ACTION".to_string(),
+        execution_result,
+        status,
+    };
     let mode = state.authority.mode().await;
     if mode == AuthorityMode::Off {
-        return;
+        return no_action(0, "authority_mode_off".to_string(), "blocked".to_string());
     }
 
     let exec_state = state.exec.execution_state().await;
@@ -489,7 +675,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
     let Some(chosen) = candidates.first().cloned() else {
         log_npc_event(&*state.store, "no_action", &format!("cycle={} reason=NO_CANDIDATES", cycle_id));
         observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
-        return;
+        return no_action(cycle_id, "NO_CANDIDATES".to_string(), "running".to_string());
     };
 
     for stale in candidates.iter().skip(1) {
@@ -512,7 +698,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         );
         rt.perf.entry(chosen.role).or_default().blocked += 1;
         observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
-        return;
+        return no_action(cycle_id, reason, "blocked".to_string());
     }
 
     if chosen.score < regime_cutoff {
@@ -528,7 +714,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         );
         rt.perf.entry(chosen.role).or_default().blocked += 1;
         observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
-        return;
+        return no_action(cycle_id, "SCORE_BELOW_THRESHOLD".to_string(), "blocked".to_string());
     }
 
     if !portfolio_controls.is_empty() {
@@ -541,7 +727,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         );
         rt.perf.entry(chosen.role).or_default().blocked += 1;
         observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
-        return;
+        return no_action(cycle_id, portfolio_controls.join("|"), "blocked".to_string());
     }
 
     let allocation = allocate_capital(&effective_cfg, &rt, &chosen, position_size, exposure_notional, buy_power, metrics.mid);
@@ -555,7 +741,11 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         );
         rt.perf.entry(chosen.role).or_default().blocked += 1;
         observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
-        return;
+        return no_action(
+            cycle_id,
+            format!("ALLOCATION_REJECTED:{}", allocation.reason),
+            "blocked".to_string(),
+        );
     }
 
     let guard_reasons = evaluate_guards(
@@ -577,7 +767,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         );
         rt.perf.entry(chosen.role).or_default().blocked += 1;
         observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
-        return;
+        return no_action(cycle_id, guard_reasons.join("|"), "blocked".to_string());
     }
 
     lifecycle(
@@ -601,7 +791,11 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         );
         rt.perf.entry(chosen.role).or_default().blocked += 1;
         observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
-        return;
+        return no_action(
+            cycle_id,
+            "LIVE_REQUIRES_PAPER_EXECUTION".to_string(),
+            "blocked".to_string(),
+        );
     }
 
     lifecycle(&*state.store, chosen.role, &chosen.action_id, NpcLifecycleState::Queued, "ready for dispatch");
@@ -633,7 +827,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                 "WEB_UI_ADDR missing; cannot dispatch trade request",
             );
             observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
-            return;
+            return no_action(cycle_id, "WEB_UI_ADDR_MISSING".to_string(), "blocked".to_string());
         };
 
         let mut form = HashMap::new();
@@ -682,7 +876,11 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                     &format!("http_status={}", resp.status()),
                 );
                 observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
-                return;
+                return no_action(
+                    cycle_id,
+                    format!("HTTP_STATUS_{}", resp.status()),
+                    "blocked".to_string(),
+                );
             }
             Err(e) => {
                 lifecycle(
@@ -693,7 +891,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                     &format!("request_error={}", e),
                 );
                 observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
-                return;
+                return no_action(cycle_id, format!("REQUEST_ERROR:{}", e), "blocked".to_string());
             }
         }
     }
@@ -732,6 +930,12 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
     );
 
     observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
+    NpcCycleReport {
+        cycle_id,
+        last_action: chosen.side.to_uppercase(),
+        execution_result: "EXECUTED".to_string(),
+        status: "running".to_string(),
+    }
 }
 
 fn default_learner_ranges(cfg: &NpcConfig) -> LearnerConfigRanges {
