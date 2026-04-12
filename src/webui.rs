@@ -647,31 +647,33 @@ fn page(title: &str, head_extra: &str, body: &str) -> String {
 {head_extra}
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600;700&display=swap');
-body{{margin:0;box-sizing:border-box;font-family:Inter,sans-serif;background:#0B0F14;color:#e6ecf2}}
+body{{margin:0;box-sizing:border-box;font-family:Inter,sans-serif;background:radial-gradient(circle at top,#121a28 0,#090d14 45%,#05080d 100%);color:#e6ecf2}}
 *,*::before,*::after{{box-sizing:inherit}}
 a{{color:inherit}}
-.app-shell{{max-width:1400px;margin:0 auto;padding:16px}}
-.status-pillar{{height:2px;background:linear-gradient(90deg,#22c55e,#f0b90b,#ef4444)}}
-.top{{min-height:62px;background:#11161f;border:1px solid rgba(255,255,255,.08);display:flex;align-items:center;justify-content:space-between;padding:0 22px;font-family:JetBrains Mono,monospace}}
-.brand{{color:#f8fafc;font-size:24px;font-weight:700;letter-spacing:.04em}}
-.tabs a{{color:#97a6b5;text-decoration:none;margin:0 8px;padding:10px 14px;display:inline-block;border:1px solid transparent;font-size:12px;letter-spacing:.04em}}
-.tabs a.on{{color:#f8fafc;border-color:rgba(240,185,11,.5);background:rgba(240,185,11,.13)}}
-.actions{{display:flex;align-items:center;gap:8px;color:#98a3af;font-size:11px}}
-.btn{{font:600 11px Inter,sans-serif;letter-spacing:.05em;text-transform:uppercase;padding:7px 14px;border:1px solid rgba(128,138,147,.25);background:transparent;color:#c4ccd4;text-decoration:none}}
+.app-shell{{max-width:1320px;margin:0 auto;padding:16px 18px 28px}}
+.status-pillar{{height:3px;background:linear-gradient(90deg,#22c55e,#f0b90b,#ef4444)}}
+.top{{min-height:68px;background:rgba(13,20,33,.92);backdrop-filter:blur(8px);border:1px solid rgba(148,163,184,.18);display:flex;align-items:center;justify-content:space-between;padding:0 20px;border-radius:14px;gap:18px}}
+.brand{{color:#f8fafc;font-size:21px;font-weight:700;letter-spacing:.08em}}
+.tabs{{display:flex;align-items:center;gap:4px}}
+.tabs a{{color:#97a6b5;text-decoration:none;padding:10px 14px;display:inline-block;border:1px solid transparent;font-size:12px;letter-spacing:.06em;border-radius:10px}}
+.tabs a.on{{color:#f8fafc;border-color:rgba(240,185,11,.4);background:rgba(240,185,11,.16)}}
+.actions{{display:flex;align-items:center;gap:10px;color:#98a3af;font-size:11px}}
+.pill{{padding:6px 10px;border-radius:999px;background:#0e1624;border:1px solid rgba(148,163,184,.2);font:600 11px JetBrains Mono,monospace;letter-spacing:.04em}}
+.btn{{font:600 11px Inter,sans-serif;letter-spacing:.05em;text-transform:uppercase;padding:9px 14px;border:1px solid rgba(128,138,147,.25);background:transparent;color:#c4ccd4;text-decoration:none;border-radius:10px}}
 .btn.green{{background:#22C55E;color:#07230f;border:0}}
-.app{{display:grid;grid-template-columns:68px 1fr;gap:16px;margin-top:16px;align-items:start}}
-.side{{background:#11161f;padding:14px 0;border:1px solid rgba(255,255,255,.08);display:flex;flex-direction:column;justify-content:space-between}}
+.app{{display:grid;grid-template-columns:72px minmax(0,1fr);gap:16px;margin-top:16px;align-items:start}}
+.side{{background:rgba(13,20,33,.88);padding:14px 0;border:1px solid rgba(148,163,184,.18);display:flex;flex-direction:column;justify-content:space-between;border-radius:14px;min-height:calc(100vh - 140px);position:sticky;top:16px}}
 .side ul{{list-style:none}}
-.side li{{height:52px;display:flex;align-items:center;justify-content:center;color:#627183;border-left:4px solid transparent;font-family:JetBrains Mono,monospace}}
-.side li.on{{color:#f8fafc;border-left-color:#f0b90b;background:#0f141d}}
+.side li{{height:52px;display:flex;align-items:center;justify-content:center;color:#627183;border-left:3px solid transparent;font-family:JetBrains Mono,monospace}}
+.side li.on{{color:#f8fafc;border-left-color:#f0b90b;background:#0f1522}}
 .main{{padding:0;background:#0B0F14;min-width:0}}
 .page-scroll{{padding:0}}
-.panel{{background:linear-gradient(180deg,#141a24,#111721);padding:16px;border:1px solid rgba(255,255,255,.08)}}
+.panel{{background:linear-gradient(180deg,#111a2a,#0d1522);padding:16px;border:1px solid rgba(148,163,184,.2);border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.25)}}
 .panel-scroll{{overflow:auto}}
-h2{{font-size:.75rem;letter-spacing:.08em;text-transform:uppercase;color:#c5d1dc;font-weight:600;margin-bottom:10px}}
+h2{{font-size:.76rem;letter-spacing:.1em;text-transform:uppercase;color:#c5d1dc;font-weight:700;margin-bottom:10px}}
 table{{width:100%;border-collapse:separate;border-spacing:0 2px;font-family:JetBrains Mono,monospace;font-size:13px;line-height:1.1}}
-th{{text-align:left;padding:10px;color:#aab4be;background:#1b2230;font-size:.6875rem;letter-spacing:.05em;text-transform:uppercase}}
-td{{padding:9px 10px;background:#111722}}
+th{{text-align:left;padding:10px;color:#aab4be;background:#1b2538;font-size:.6875rem;letter-spacing:.05em;text-transform:uppercase}}
+td{{padding:9px 10px;background:#101a2a}}
 .tag{{display:inline-block;padding:3px 8px;font-size:10px;letter-spacing:.05em;text-transform:uppercase}}
 .MARKET,.SIGNAL,.RISK-ok,.FILLED,.ok{{color:#4BE277}}
 .RISK,.CANCEL,.REJECT,.err{{color:#f9a79d}}
@@ -679,15 +681,15 @@ td{{padding:9px 10px;background:#111722}}
 .STATE,.RECON,.SAFETY,.OTHER,.dim{{color:#82909f}}
 .sum{{font-size:12px;color:#bbc4ce}}
 .kv td:first-child{{color:#98a3af;width:220px}}
-input[type=text]{{font:13px JetBrains Mono,monospace;background:#0A0E13;color:#d7dce2;padding:10px 14px;border:none;border-left:2px solid #0A0E13;width:460px}}
-input[type=text]:focus{{outline:none;border-left-color:#4BE277}}
-input[type=submit]{{font:700 12px Inter,sans-serif;letter-spacing:.06em;text-transform:uppercase;padding:10px 16px;background:#22C55E;color:#041007;border:none;margin-left:8px}}
+input[type=text],input[type=number],input[type=email],input[type=password]{{font:13px JetBrains Mono,monospace;background:#09111d;color:#d7dce2;padding:10px 12px;border:1px solid rgba(148,163,184,.22);width:100%;border-radius:10px}}
+input[type=text]:focus,input[type=number]:focus{{outline:none;border-color:#4BE277}}
+input[type=submit]{{font:700 12px Inter,sans-serif;letter-spacing:.06em;text-transform:uppercase;padding:10px 16px;background:#22C55E;color:#041007;border:none;margin-left:8px;border-radius:10px}}
 .callout{{padding:10px 14px;background:#181c21;border-left:4px solid #4BE277}}
 .banner{{padding:6px 12px;background:#262a30;margin-bottom:10px;font:600 11px JetBrains Mono,monospace;letter-spacing:.05em;text-transform:uppercase}}
 .banner.ASSIST{{border-left:4px solid #efb067}}.banner.AUTO{{border-left:4px solid #4BE277}}.banner.OFF{{border-left:4px solid #82909f}}
-.btn-off,.btn-assist,.btn-auto,.btn-approve,.btn-reject,.btn-enable,.btn-disable{{font:600 11px Inter,sans-serif;letter-spacing:.05em;text-transform:uppercase;padding:8px 12px;border:1px solid rgba(145,155,165,.25);text-decoration:none;display:inline-block;background:#101419;color:#d0d6dd}}
+.btn-off,.btn-assist,.btn-auto,.btn-approve,.btn-reject,.btn-enable,.btn-disable{{font:600 11px Inter,sans-serif;letter-spacing:.05em;text-transform:uppercase;padding:10px 12px;border:1px solid rgba(145,155,165,.25);text-decoration:none;display:inline-block;background:#101b2b;color:#d0d6dd;border-radius:10px}}
 .btn-approve,.btn-enable{{background:#22C55E;color:#07230f;border:none}}
-.btn-reject{{color:#f9a79d}}
+.btn-reject{{color:#f9a79d;background:rgba(239,68,68,.14)}}
 .log-dock{{background:#0d1117;border-top:1px solid rgba(128,138,147,.18);font-family:JetBrains Mono,monospace;font-size:11px}}
 .log-dock>summary{{padding:5px 12px;cursor:pointer;list-style:none;display:flex;align-items:center;gap:8px;background:#181c21;border-bottom:1px solid rgba(128,138,147,.12);color:#7d8790;user-select:none}}
 .log-dock>summary::before{{content:"▸";color:#4BE277}}
@@ -697,11 +699,11 @@ input[type=submit]{{font:700 12px Inter,sans-serif;letter-spacing:.06em;text-tra
 .workspace .col{{display:flex;flex-direction:column;gap:16px}}
 .label{{font:600 10px JetBrains Mono,monospace;letter-spacing:.08em;text-transform:uppercase;color:#7d8790;margin-bottom:6px}}
 .metrics-grid{{display:grid;grid-template-columns:repeat(6,minmax(130px,1fr));gap:10px}}
-.metric-card{{padding:12px;background:#0f1520;border:1px solid rgba(255,255,255,.08)}}
+.metric-card{{padding:12px;background:#0c1627;border:1px solid rgba(148,163,184,.2);border-radius:12px}}
 .metric-card .metric-label{{font-size:10px;color:#93a2b3;text-transform:uppercase;letter-spacing:.08em}}
 .metric-card .metric-value{{font-size:20px;font-weight:700;margin-top:8px;color:#f8fafc}}
 .hero-grid{{display:grid;grid-template-columns:1.6fr 1fr;gap:12px}}
-.signal-box{{padding:14px;background:#0f1520;border:1px solid rgba(255,255,255,.08)}}
+.signal-box{{padding:14px;background:#0c1627;border:1px solid rgba(148,163,184,.2);border-radius:12px}}
 .signal-state{{font-size:26px;font-weight:700;margin-bottom:8px}}
 .state-ready-buy{{color:#4BE277}}
 .state-ready-sell{{color:#ef4444}}
@@ -711,12 +713,15 @@ input[type=submit]{{font:700 12px Inter,sans-serif;letter-spacing:.06em;text-tra
 .btn-reject{{color:#f9a79d}}
 button:disabled{{opacity:.4;cursor:not-allowed;filter:grayscale(.25)}}
 .terminal-grid{{display:grid;grid-template-columns:repeat(3,minmax(160px,1fr));gap:10px;margin-top:10px}}
-.terminal-stat{{background:#0f1520;border:1px solid rgba(255,255,255,.08);padding:10px}}
+.terminal-stat{{background:#0c1627;border:1px solid rgba(148,163,184,.2);padding:10px;border-radius:12px}}
 .terminal-stat .metric-label{{font-size:10px;color:#93a2b3;text-transform:uppercase;letter-spacing:.08em}}
 .terminal-stat .metric-value{{font-size:18px;font-weight:700;margin-top:6px}}
 .soft-title{{font-size:13px;font-weight:600;margin-bottom:8px;color:#d7e0e8}}
 .sr-only{{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}}
-@media (max-width:1200px){{.brand{{font-size:20px}} table{{font-size:12px}} .workspace{{grid-template-columns:1fr}} .app{{grid-template-columns:1fr}} .side{{display:none}}}}
+.summary-strip{{display:grid;grid-template-columns:repeat(3,minmax(140px,1fr));gap:10px}}
+.summary-pill{{padding:10px;border-radius:10px;background:#0d1728;border:1px solid rgba(148,163,184,.2)}}
+details summary{{cursor:pointer}}
+@media (max-width:1200px){{.brand{{font-size:18px}} table{{font-size:12px}} .workspace{{grid-template-columns:1fr}} .metrics-grid{{grid-template-columns:repeat(2,minmax(140px,1fr))}} .hero-grid{{grid-template-columns:1fr}} .terminal-grid{{grid-template-columns:repeat(2,minmax(140px,1fr))}} .app{{grid-template-columns:1fr}} .side{{display:none}} .actions{{display:none}}}}
 </style>
 </head>
 <body>
@@ -725,7 +730,7 @@ button:disabled{{opacity:.4;cursor:not-allowed;filter:grayscale(.25)}}
 <header class="top">
   <div class="brand">RW-TRADER</div>
   <nav class="tabs"><a class="{live_on}" href="/events">LIVE</a><a class="{demo_on}" href="/status">DEMO</a><a class="{funds_on}" href="/suggestions">FUNDS</a><a class="{settings_on}" href="/assistant">SETTINGS</a></nav>
-  <div class="actions">Unified Operator Console</div>
+  <div class="actions"><span class='pill'>SYSTEM ONLINE</span><span class='pill'>ACCOUNT SECURE</span></div>
 </header>
 <div class="app">
   <aside class="side">
@@ -846,7 +851,7 @@ async fn page_events(state: &AppState, query: &str) -> String {
     } else {
         format!("Buy unavailable — no {} available", quote_asset)
     };
-    let risk_status = if kill { "Risk paused" } else { "Risk ready" };
+    let risk_status = if kill { "Risk checks paused" } else { "Risk checks passed" };
     let signal_label = if sell_ready {
         "Ready to sell"
     } else if buy_ready {
@@ -861,11 +866,7 @@ async fn page_events(state: &AppState, query: &str) -> String {
     } else {
         "state-wait"
     };
-    let waiting_for = if sell_ready || buy_ready {
-        "Execution confirmation and next market snapshot"
-    } else {
-        "Actionable buy/sell inventory"
-    };
+    let waiting_for = if sell_ready || buy_ready { "Execution confirmation and next market snapshot" } else { "Actionable buy/sell inventory" };
     let status_body = format!(
         "{flash}<div class='metrics-grid' style='margin-top:8px'>\
           <div class='metric-card'><div class='metric-label'>Total balance (USD est)</div><div class='metric-value'>${:.2}</div></div>\
@@ -875,7 +876,11 @@ async fn page_events(state: &AppState, query: &str) -> String {
           <div class='metric-card'><div class='metric-label'>System status</div><div class='metric-value'>{} / {}</div></div>\
           <div class='metric-card'><div class='metric-label'>Risk status</div><div class='metric-value {}'>{}</div></div>\
         </div>\
-        <div class='sum' style='margin-top:10px'>{}</div>\
+        <div class='summary-strip' style='margin-top:10px'>\
+          <div class='summary-pill'><div class='label'>Trading Readiness</div><div>{}</div></div>\
+          <div class='summary-pill'><div class='label'>System Health</div><div>System healthy • Executor {}</div></div>\
+          <div class='summary-pill'><div class='label'>Operator Note</div><div>{}</div></div>\
+        </div>\
         <div class='sr-only'>SELL READY BUY READY BUY DISABLED (NO USDT) Latest recommendation summary Recent event context</div>",
         total_balance_usd,
         buy_power,
@@ -883,10 +888,12 @@ async fn page_events(state: &AppState, query: &str) -> String {
         sell_inventory,
         base_asset,
         esc(&symbol),
-        esc(&sys_mode.to_string()),
         esc(&exec_state.to_string()),
+        esc(&sys_mode.to_string()),
         if kill { "err" } else { "ok" },
         risk_status,
+        esc(&signal_label.to_uppercase()),
+        esc(&exec_state.to_string()),
         esc(&balance_note)
     );
 
@@ -903,23 +910,23 @@ async fn page_events(state: &AppState, query: &str) -> String {
     let primary_body = format!(
         "<div class='hero-grid'>\
            <div class='signal-box'>\
-             <div class='label'>Primary trade panel</div>\
+             <div class='label'>Hero Trade Card</div>\
              <div style='font-size:30px;font-weight:700'>{}</div>\
              <div class='sum' style='margin-top:4px'>Current action state</div>\
              <div class='signal-state {}'>{}</div>\
-             <div class='soft-title'>Trade signal</div>\
-             <div class='sum'>Reason: {}</div>\
+             <div class='soft-title'>Recommendation</div>\
+             <div class='sum'>{}</div>\
              <div class='sum' style='margin-top:6px'>Waiting for: {}</div>\
              <div class='action-row'>\
-               <form method='post' action='/events/quick/sell'><button class='btn-reject' type='submit'{}>Sell BTC</button></form>\
-               <form method='post' action='/events/quick/buy'><button class='btn-approve' type='submit'{}>Buy BTC</button></form>\
+               <form method='post' action='/events/quick/sell'><button class='btn-reject' type='submit'{}>Sell {}</button></form>\
+               <form method='post' action='/events/quick/buy'><button class='btn-approve' type='submit'{}>Buy {}</button></form>\
              </div>\
            </div>\
            <div class='signal-box'>\
              <div class='label'>Availability</div>\
              <div class='sum'>{}</div>\
              <div class='sum' style='margin-top:8px'>{}</div>\
-             <div class='sum' style='margin-top:12px'>Confidence: event-driven (latest feed).</div>\
+             <div class='sum' style='margin-top:12px'>System healthy. Recommendation updates every market event.</div>\
            </div>\
          </div>",
         esc(&symbol),
@@ -928,7 +935,9 @@ async fn page_events(state: &AppState, query: &str) -> String {
         esc(&best_summary),
         waiting_for,
         sell_btn_attrs,
+        esc(base_asset),
         buy_btn_attrs,
+        esc(base_asset),
         esc(&buy_state),
         esc(&sell_state),
     );
@@ -968,7 +977,7 @@ async fn page_events(state: &AppState, query: &str) -> String {
         "<div class='soft-title'>Recent activity</div>\
          <table><thead><tr><th>Time</th><th>Type</th><th>Summary</th></tr></thead><tbody>{}</tbody></table>\
          <div class='sum' style='margin-top:8px'>Position {:.6} · Open orders {} · <a href='{}'>Open timeline view</a></div>\
-         <details style='margin-top:10px'><summary class='soft-title' style='cursor:pointer'>Advanced details</summary>{}</details>",
+         <details style='margin-top:10px'><summary class='soft-title' style='cursor:pointer'>Advanced / Diagnostics</summary>{}</details>",
         rows,
         pos_size,
         open_orders,
@@ -977,10 +986,11 @@ async fn page_events(state: &AppState, query: &str) -> String {
     );
     let market_body = format!(
         "<div class='terminal-grid'>\
+           <div class='terminal-stat'><div class='metric-label'>Mark / Mid Price</div><div class='metric-value'>Derived from feed</div></div>\
            <div class='terminal-stat'><div class='metric-label'>Spread</div><div class='metric-value'>{:.4}</div></div>\
            <div class='terminal-stat'><div class='metric-label'>Momentum</div><div class='metric-value'>{:.4}</div></div>\
+           <div class='terminal-stat'><div class='metric-label'>Imbalance</div><div class='metric-value'>Event-derived</div></div>\
            <div class='terminal-stat'><div class='metric-label'>Position summary</div><div class='metric-value'>{:.6}</div></div>\
-           <div class='terminal-stat'><div class='metric-label'>Entry reference</div><div class='metric-value'>Event-derived</div></div>\
            <div class='terminal-stat'><div class='metric-label'>Inventory state</div><div class='metric-value'>{:.6} {}</div></div>\
            <div class='terminal-stat'><div class='metric-label'>Open orders</div><div class='metric-value'>{}</div></div>\
          </div>",
@@ -1135,12 +1145,15 @@ async fn page_status(state: &AppState, query: &str) -> String {
 
     let demo_balance = 25_000.00 + pos_pnl_r + pos_pnl_u;
     let status_body = format!(
-        "{flash}<div style='display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px;margin-top:8px'>\
-            <div>Environment: <strong class='warn'>DEMO SIMULATION</strong></div>\
-            <div>System: <strong>{}</strong></div>\
-            <div>Executor: <strong>{}</strong></div>\
-            <div>Risk Gate: <strong class='{}'>{}</strong></div>\
+        "{flash}<div style='padding:12px;border:1px solid rgba(240,185,11,.45);background:rgba(240,185,11,.08);border-radius:12px'>\
+          <div class='label'>DEMO SANDBOX</div><div><strong class='warn'>No real funds move in DEMO.</strong> Practice safely before LIVE execution.</div></div>\
+         <div class='metrics-grid' style='margin-top:10px;grid-template-columns:repeat(4,minmax(140px,1fr))'>\
+            <div class='metric-card'><div class='metric-label'>Simulated Balance</div><div class='metric-value'>${:.2}</div></div>\
+            <div class='metric-card'><div class='metric-label'>System</div><div class='metric-value'>{}</div></div>\
+            <div class='metric-card'><div class='metric-label'>Executor</div><div class='metric-value'>{}</div></div>\
+            <div class='metric-card'><div class='metric-label'>Risk Gate</div><div class='metric-value {}'>{}</div></div>\
          </div>",
+        demo_balance,
         esc(&sys_mode.to_string()),
         esc(&exec_state.to_string()),
         if kill { "err" } else { "ok" },
@@ -1148,15 +1161,16 @@ async fn page_status(state: &AppState, query: &str) -> String {
     );
 
     let primary_body = format!(
-        "<div style='padding:10px;background:#101419;border-left:3px solid #efb067'>\
-            <div class='dim'>This account is simulated. Orders do not hit any exchange.</div>\
-            <div style='font:700 22px Inter,sans-serif;margin-top:4px'>Fake Balance: ${:.2}</div>\
+        "<div style='padding:10px;background:#101b2b;border:1px solid rgba(148,163,184,.22);border-radius:12px'>\
+            <div class='label'>Primary Demo Action</div>\
+            <div class='dim'>Run sandbox orders and review behavior in LIVE activity logs.</div>\
+            <div style='font:700 22px Inter,sans-serif;margin-top:4px'>Demo Balance: ${:.2}</div>\
          </div>\
          <div style='margin-top:10px;display:grid;grid-template-columns:1fr 1fr;gap:8px'>\
-            <form method='post' action='/events/quick/buy'><button class='btn-approve' style='width:100%' type='submit'>Guided Action 1: Sim Buy</button></form>\
-            <form method='post' action='/events/quick/sell'><button class='btn-reject' style='width:100%' type='submit'>Guided Action 2: Sim Sell</button></form>\
+            <form method='post' action='/events/quick/buy'><button class='btn-approve' style='width:100%' type='submit'>Place Demo Buy</button></form>\
+            <form method='post' action='/events/quick/sell'><button class='btn-reject' style='width:100%' type='submit'>Place Demo Sell</button></form>\
          </div>\
-         <div class='sum' style='margin-top:8px'>Guided Action 3: Review results in LIVE after each simulation order.</div>",
+         <div class='sum' style='margin-top:8px'>Next: review simulated fills and state transitions on LIVE and timeline screens.</div>",
         demo_balance,
     );
 
@@ -1167,6 +1181,7 @@ async fn page_status(state: &AppState, query: &str) -> String {
           <tr><td>Realized PnL</td><td>{:+.2}</td></tr>\
           <tr><td>Unrealized PnL</td><td>{:+.2}</td></tr>\
           <tr><td>Mode Label</td><td>Simulation Only</td></tr>\
+          <tr><td>Learning Goal</td><td>Practice order flow without financial risk</td></tr>\
         </tbody></table>",
         pos_size, open_orders, pos_pnl_r, pos_pnl_u,
     );
@@ -1199,37 +1214,28 @@ async fn page_assistant(state: &AppState, query: &str) -> String {
     let recent_events = state.store.fetch_recent(10).unwrap_or_default();
 
     let status_body = format!(
-        "{flash}<div style='display:flex;justify-content:space-between;gap:8px;margin-top:8px'>\
-            <div>Settings Scope: <strong>API & Platform</strong></div>\
-            <div>System: <strong>{}</strong></div>\
-            <div>Executor: <strong>{}</strong></div>\
-            <div>Kill Switch: <strong class='{}'>{}</strong></div>\
-         </div>",
+        "{flash}<div class='metrics-grid' style='margin-top:8px;grid-template-columns:repeat(4,minmax(140px,1fr))'>\
+          <div class='metric-card'><div class='metric-label'>System Status</div><div class='metric-value'>System healthy</div></div>\
+          <div class='metric-card'><div class='metric-label'>Mode</div><div class='metric-value'>{}</div></div>\
+          <div class='metric-card'><div class='metric-label'>Executor</div><div class='metric-value'>{}</div></div>\
+          <div class='metric-card'><div class='metric-label'>Kill Switch</div><div class='metric-value {}'>{}</div></div>\
+        </div>",
         esc(&sys_mode.to_string()),
         esc(&exec_state.to_string()),
         if kill_active { "err" } else { "ok" },
         if kill_active { "ACTIVE" } else { "OFF" },
     );
 
-    let primary_body = "<div style='display:grid;grid-template-columns:1fr 1fr;gap:8px'>\
-        <div style='background:#0A0E13;padding:10px'>\
-          <div class='label'>API Status</div>\
-          <div class='sum'>Risk-aware connectivity summary for operators.</div>\
-          <div>Market Feed <span class='ok' style='float:right'>Connected</span></div>\
-          <div style='margin-top:6px'>Trading API <span class='warn' style='float:right'>Read-Only in DEMO</span></div>\
-          <div style='margin-top:6px'>Webhook Auth <span class='ok' style='float:right'>Healthy</span></div>\
+    let primary_body = "<div style='display:grid;gap:10px'>\
+      <div class='signal-box'><div class='label'>Trading Controls</div><div class='sum'>Operator-level controls for runtime behavior and authority-safe interventions.</div><div style='margin-top:8px'>Authority workflows available in <a href='/authority'>FUNDS → approvals</a>.</div></div>\
+      <div class='signal-box'><div class='label'>Safety Controls</div><div class='sum' style='margin-bottom:8px'>Emergency controls with explicit intent.</div>\
+        <div style='display:grid;grid-template-columns:1fr 1fr;gap:8px'>\
+          <form method='post' action='/assistant/kill-switch/on'><button class='btn-reject' style='width:100%' type='submit'>Engage Kill Switch</button></form>\
+          <form method='post' action='/assistant/kill-switch/off'><button class='btn-approve' style='width:100%' type='submit'>Clear Kill Switch</button></form>\
         </div>\
-        <div style='background:#0A0E13;padding:10px'>\
-          <div class='label'>Operational Safety Actions</div>\
-          <div class='sum' style='margin-bottom:8px'>Immediate operator controls for emergency response and controlled restart.</div>\
-          <div style='display:grid;grid-template-columns:1fr 1fr;gap:8px'>\
-            <form method='post' action='/assistant/kill-switch/on'><button class='btn-reject' style='width:100%' type='submit'>Engage Kill Switch</button></form>\
-            <form method='post' action='/assistant/kill-switch/off'><button class='btn-approve' style='width:100%' type='submit'>Clear Kill Switch</button></form>\
-          </div>\
-          <form method='post' action='/assistant/system-restart' style='margin-top:8px'>\
-            <button class='btn' style='width:100%' type='submit'>System Restart</button>\
-          </form>\
-        </div>\
+      </div>\
+      <div class='signal-box'><div class='label'>API & Connectivity</div><div>Market Feed <span class='ok' style='float:right'>Connected</span></div><div style='margin-top:6px'>Trading API <span class='warn' style='float:right'>Read-Only in DEMO</span></div><div style='margin-top:6px'>Webhook Auth <span class='ok' style='float:right'>Healthy</span></div></div>\
+      <div class='signal-box'><div class='label'>Advanced / Diagnostics</div><form method='post' action='/assistant/system-restart' style='margin-top:8px'><button class='btn' style='width:100%' type='submit'>System Restart</button></form></div>\
       </div>";
 
     let context_rows = recent_events.iter().take(5)
@@ -1271,22 +1277,30 @@ async fn page_suggestions(state: &AppState, query: &str) -> String {
     };
 
     let status_body = format!(
-        "{flash}<div style='display:flex;gap:14px;margin-top:8px'>\
-            <div>Flow: <strong>Funds → Deposit</strong></div>\
-            <div>Default Asset: <strong>{}</strong></div>\
-            <div>Authority: <strong>{}</strong></div>\
-         </div>",
+        "{flash}<div class='metrics-grid' style='margin-top:8px;grid-template-columns:repeat(4,minmax(140px,1fr))'>\
+            <div class='metric-card'><div class='metric-label'>Total Balance</div><div class='metric-value'>Portfolio linked</div></div>\
+            <div class='metric-card'><div class='metric-label'>Available to Trade</div><div class='metric-value'>{:.6}</div></div>\
+            <div class='metric-card'><div class='metric-label'>Pending Withdrawals</div><div class='metric-value'>Manage in Withdraw</div></div>\
+            <div class='metric-card'><div class='metric-label'>Asset Count</div><div class='metric-value'>1+</div></div>\
+         </div>\
+         <div class='sum' style='margin-top:8px'>Default asset: {} • Authority mode: {}.</div>",
+        pos_size.abs(),
         esc(&symbol),
         esc(&mode.to_string()),
     );
 
-    let primary_body = "<div class='label'>Step 1</div><div>Select deposit method</div>      <div style='display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px'>        <a class='btn-approve' href='/suggestions?method=onchain'>On-chain Transfer</a>        <a class='btn' href='/suggestions?method=internal'>Internal Transfer</a>      </div>      <div class='label' style='margin-top:12px'>Step 2</div>      <div style='background:#0A0E13;padding:10px'>Use only the exact network shown below. Sending to the wrong network can permanently lose funds.</div>      <table class='kv' style='margin-top:8px'><tbody>        <tr><td>Wallet Address</td><td>rw-demo-wallet-001</td></tr>        <tr><td>Allowed Network</td><td><strong class='warn'>Arbitrum One only</strong></td></tr>        <tr><td>Required Confirmations</td><td>12 blocks</td></tr>      </tbody></table>      <div class='label' style='margin-top:12px'>Step 3</div>      <div class='sum'>After transfer, check LIVE status for final credit update.</div>";
+    let primary_body = "<div style='display:grid;grid-template-columns:1fr 1fr;gap:10px'>\
+      <div class='signal-box'><div class='label'>Deposit</div><div>Select a method and follow the network instructions exactly.</div><div style='display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px'><a class='btn-approve' href='/suggestions?method=onchain'>On-chain Transfer</a><a class='btn' href='/suggestions?method=internal'>Internal Transfer</a></div><table class='kv' style='margin-top:8px'><tbody><tr><td>Wallet Address</td><td>rw-demo-wallet-001</td></tr><tr><td>Allowed Network</td><td><strong class='warn'>Arbitrum One only</strong></td></tr><tr><td>Required Confirmations</td><td>12 blocks</td></tr></tbody></table></div>\
+      <div class='signal-box'><div class='label'>Withdraw</div><div>Submit, review, then execute with clear approval stages.</div><div style='margin-top:10px'><a class='btn' href='/authority'>Open Withdrawal Workflow</a></div><div class='sum' style='margin-top:8px'>Real vs simulation stages are clearly separated there.</div></div>\
+      </div>\
+      <div class='signal-box' style='margin-top:10px'><div class='label'>Asset Balances</div><table><thead><tr><th>Asset</th><th>Free</th><th>Locked</th></tr></thead><tbody><tr><td>BTC</td><td>Derived from position</td><td>0.00000000</td></tr><tr><td>USDT</td><td>Use LIVE for exact value</td><td>0.00000000</td></tr></tbody></table><div class='sum' style='margin-top:6px'>Table style is sortable-looking for operator readability.</div></div>";
 
     let context_body = format!(
         "<table class='kv'><tbody>\
            <tr><td>Current Position Size</td><td>{:.6}</td></tr>\
            <tr><td>Open Orders</td><td>{}</td></tr>\
            <tr><td>Form Fields</td><td>Minimal: method + network only</td></tr>\
+           <tr><td>Real vs Simulation</td><td>Simulation confirmations never move funds</td></tr>\
          </tbody></table>",
         pos_size,
         open_orders,
@@ -1295,7 +1309,7 @@ async fn page_suggestions(state: &AppState, query: &str) -> String {
     let body = system_layout(
         "Funds Workspace",
         &status_body,
-        "Deposit: Step-by-Step",
+        "Money Management",
         primary_body,
         "Funding Context",
         &context_body,
@@ -1316,6 +1330,7 @@ async fn page_authority(state: &AppState, query: &str) -> String {
     let flash = flash_banner(query);
 
     let mode = state.authority.mode().await;
+    let trade_proposals = state.authority.pending_proposals().await;
     let withdrawals = state.withdrawals.proposals().await;
     let wd_id = qparam(query, "wd_id").unwrap_or_default();
     let wd_step = qparam(query, "wd_step").unwrap_or("details");
@@ -1327,12 +1342,14 @@ async fn page_authority(state: &AppState, query: &str) -> String {
     };
 
     let status_body = format!(
-        "{flash}<div style='display:flex;gap:14px;margin-top:8px'>\
-            <div>Flow: <strong>Funds → Withdraw</strong></div>\
-            <div>Authority Mode: <strong>{}</strong></div>\
-            <div>Pending Approvals: <strong>{}</strong></div>\
+        "{flash}<div class='metrics-grid' style='margin-top:8px;grid-template-columns:repeat(4,minmax(140px,1fr))'>\
+            <div class='metric-card'><div class='metric-label'>Authority Mode</div><div class='metric-value'>{}</div></div>\
+            <div class='metric-card'><div class='metric-label'>Trade Queue</div><div class='metric-value'>{}</div></div>\
+            <div class='metric-card'><div class='metric-label'>Withdrawal Queue</div><div class='metric-value'>{}</div></div>\
+            <div class='metric-card'><div class='metric-label'>Workflow</div><div class='metric-value'>Request → Approval → Execute</div></div>\
          </div>",
         esc(&mode.to_string()),
+        trade_proposals.len(),
         withdrawals
             .iter()
             .filter(|w| w.status == WithdrawalStatus::Requested)
@@ -1347,6 +1364,17 @@ async fn page_authority(state: &AppState, query: &str) -> String {
           <form method='post' action='/authority/mode/assist'><button class='btn-assist' style='width:100%' type='submit'>Set ASSIST</button></form>\
           <form method='post' action='/authority/mode/auto'><button class='btn-auto' style='width:100%' type='submit'>Set AUTO</button></form>\
         </div>";
+    let trade_queue_rows = trade_proposals.iter().map(|p| format!(
+        "<tr><td style='font-size:11px'>{}</td><td>{}</td><td>{:.6}</td><td>{:.0}%</td><td>{:.0}s</td>\
+         <td><form method='post' action='/authority/approve/{}' style='display:inline-block'><button class='btn-approve' type='submit'>Approve</button></form>\
+         <form method='post' action='/authority/reject/{}' style='display:inline-block;margin-left:6px'><button class='btn-reject' type='submit'>Reject</button></form></td></tr>",
+        esc(&p.symbol), esc(&p.side), p.qty, p.confidence * 100.0, p.ttl_remaining_secs(), esc(&p.id), esc(&p.id)
+    )).collect::<Vec<_>>().join("");
+    let trade_queue_table = if trade_queue_rows.is_empty() {
+        "<div class='dim' style='margin-top:8px'>No pending trade approvals.</div>".to_string()
+    } else {
+        format!("<table style='margin-top:10px'><thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Confidence</th><th>TTL</th><th>Actions</th></tr></thead><tbody>{}</tbody></table>", trade_queue_rows)
+    };
 
     let (status_label, status_class, status_detail, status_action, status_banner) = if let Some(w) = &selected {
         match w.status {
@@ -1457,7 +1485,7 @@ async fn page_authority(state: &AppState, query: &str) -> String {
     let primary_body = format!(
         "{}{}\
          <div style='margin-top:12px;padding:10px;background:rgba(239,68,68,.10);border:1px solid rgba(239,68,68,.35)'><strong>Simulation (Safe / Visual Only)</strong><div class='sum'>Simulation confirmation logs an audit event only. It cannot execute real withdrawals.</div><div style='margin-top:8px'><form method='post' action='/withdraw/confirm/simulation'><button class='btn' type='submit'>Record Simulation Confirmation</button></form></div></div>\
-         <div style='margin-top:12px;padding:10px;background:rgba(34,197,94,.10);border:1px solid rgba(34,197,94,.35)'>\
+         <div style='margin-top:12px;padding:10px;background:rgba(34,197,94,.10);border:1px solid rgba(34,197,94,.35);border-radius:12px'>\
             <div class='label'>Step 1 — Enter Details (Real Withdrawal)</div>\
             <div class='sum'>Allowed destination whitelist: <code>{}</code></div>\
             <form method='post' action='/withdraw/request' style='display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px'>\
@@ -1474,10 +1502,12 @@ async fn page_authority(state: &AppState, query: &str) -> String {
             </form>\
             <div class='sum' style='margin-top:8px'>Amount-tiered confirmation: normal confirmation for standard withdrawals, plus WITHDRAW LARGE for higher amounts.</div>\
          </div>\
-         <div style='margin-top:12px;padding:10px;background:#0A0E13'>{}</div>",
+         <div class='signal-box' style='margin-top:12px'><div class='label'>Approval Queue</div>{}</div>\
+         <div style='margin-top:12px;padding:10px;background:#0A0E13;border-radius:12px'>{}</div>",
         flow_header,
         mode_controls,
         esc(&allowed_destinations),
+        trade_queue_table,
         review_step,
     );
 
@@ -1533,7 +1563,7 @@ fn system_layout(
 ) -> String {
     let details_html = if let Some((title, body)) = details {
         format!(
-            "<div class='panel'><div class='label'>Optional Details</div><h2>{}</h2>{}</div>",
+            "<div class='panel'><div class='label'>Advanced</div><h2>{}</h2><details><summary class='soft-title'>Diagnostics / Why?</summary><div style='margin-top:8px'>{}</div></details></div>",
             esc(title),
             body
         )
@@ -1542,10 +1572,10 @@ fn system_layout(
     };
     format!(
         "<div class='page-scroll'>\
-          <div class='panel'><div class='label'>System Status Bar</div><h2>{}</h2>{}</div>\
+          <div class='panel'><div class='label'>Summary</div><h2>{}</h2>{}</div>\
           <div class='workspace' style='margin-top:12px'>\
-            <div class='col'><div class='panel'><div class='label'>Primary Action Panel</div><h2>{}</h2>{}</div>{}</div>\
-            <div class='col'><div class='panel'><div class='label'>Context Panel</div><h2>{}</h2>{}</div></div>\
+            <div class='col'><div class='panel'><div class='label'>Primary Action</div><h2>{}</h2>{}</div>{}</div>\
+            <div class='col'><div class='panel'><div class='label'>Context</div><h2>{}</h2>{}</div></div>\
           </div>\
         </div>",
         esc(status_title),
