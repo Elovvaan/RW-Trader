@@ -728,14 +728,26 @@ input[type=submit]{{font:700 12px Inter,sans-serif;letter-spacing:.06em;text-tra
 .metric-card{{padding:12px;background:#0c1627;border:1px solid rgba(148,163,184,.2);border-radius:12px}}
 .metric-card .metric-label{{font-size:10px;color:#93a2b3;text-transform:uppercase;letter-spacing:.08em}}
 .metric-card .metric-value{{font-size:20px;font-weight:700;margin-top:8px;color:#f8fafc}}
-.hero-grid{{display:grid;grid-template-columns:1.6fr 1fr;gap:12px}}
+.hero-grid{{display:grid;grid-template-columns:1fr;gap:12px}}
+.market-header{{padding:16px;background:linear-gradient(140deg,rgba(240,185,11,.2),rgba(12,22,39,.95));border:1px solid rgba(240,185,11,.45);border-radius:12px}}
+.market-top{{display:flex;justify-content:space-between;align-items:flex-end;gap:10px;flex-wrap:wrap}}
+.market-price{{font-size:42px;font-weight:800;line-height:1;color:#f8fafc}}
+.market-change{{font-size:18px;font-weight:700}}
+.pos{{color:#4BE277}}
+.neg{{color:#ef4444}}
+.neutral{{color:#f0b90b}}
+.market-meta{{display:grid;grid-template-columns:repeat(3,minmax(120px,1fr));gap:10px;margin-top:12px}}
+.market-sparkline{{font:700 24px JetBrains Mono,monospace;letter-spacing:.04em;color:#f8fafc;background:#0b1320;border:1px solid rgba(148,163,184,.24);padding:8px 10px;border-radius:10px;margin-top:12px;overflow:hidden}}
 .signal-box{{padding:14px;background:#0c1627;border:1px solid rgba(148,163,184,.2);border-radius:12px}}
-.signal-state{{font-size:26px;font-weight:700;margin-bottom:8px}}
+.signal-state{{font-size:38px;font-weight:800;margin:10px 0 8px;letter-spacing:.02em}}
 .state-ready-buy{{color:#4BE277}}
 .state-ready-sell{{color:#ef4444}}
 .state-wait{{color:#f0b90b}}
 .action-row{{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}}
-.action-row button{{width:100%;padding:14px 12px;font-size:14px}}
+.action-row button{{width:100%;padding:16px 12px;font-size:18px;font-weight:800;border-radius:12px;border:0}}
+.btn-buy{{background:#22C55E;color:#05200d}}
+.btn-sell{{background:#ef4444;color:#2a0909}}
+.disabled-note{{font-size:12px;color:#93a2b3;margin-top:6px}}
 .btn-reject{{color:#f9a79d}}
 button:disabled{{opacity:.4;cursor:not-allowed;filter:grayscale(.25)}}
 .terminal-grid{{display:grid;grid-template-columns:repeat(3,minmax(160px,1fr));gap:10px;margin-top:10px}}
@@ -743,6 +755,13 @@ button:disabled{{opacity:.4;cursor:not-allowed;filter:grayscale(.25)}}
 .terminal-stat .metric-label{{font-size:10px;color:#93a2b3;text-transform:uppercase;letter-spacing:.08em}}
 .terminal-stat .metric-value{{font-size:18px;font-weight:700;margin-top:6px}}
 .soft-title{{font-size:13px;font-weight:600;margin-bottom:8px;color:#d7e0e8}}
+.event-list{{display:flex;flex-direction:column;gap:8px}}
+.event-item{{padding:10px;border-radius:10px;background:#0c1627;border:1px solid rgba(148,163,184,.16)}}
+.event-item .time{{font:600 11px JetBrains Mono,monospace;color:#8fa0b2}}
+.event-item .summary{{font-size:13px;color:#d9e2ec;margin-top:4px}}
+.tier-2{{border-color:rgba(148,163,184,.22)}}
+.tier-3{{opacity:.88}}
+.tier-3 .sum,.tier-3 .dim{{font-size:11px;color:#8a97a5}}
 .sr-only{{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}}
 .summary-strip{{display:grid;grid-template-columns:repeat(3,minmax(140px,1fr));gap:10px}}
 .summary-pill{{padding:10px;border-radius:10px;background:#0d1728;border:1px solid rgba(148,163,184,.2)}}
@@ -847,6 +866,40 @@ fn system_health_summary(
     }
 }
 
+fn format_usd(amount: f64) -> String {
+    let sign = if amount < 0.0 { "-" } else { "" };
+    let abs = amount.abs();
+    let whole = abs.trunc() as i64;
+    let cents = ((abs.fract() * 100.0).round() as i64).clamp(0, 99);
+    let mut grouped = String::new();
+    let digits = whole.to_string();
+    for (idx, ch) in digits.chars().rev().enumerate() {
+        if idx > 0 && idx % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(ch);
+    }
+    let grouped = grouped.chars().rev().collect::<String>();
+    format!("{sign}${grouped}.{cents:02}")
+}
+
+fn sparkline(values: &[f64]) -> String {
+    if values.is_empty() {
+        return "—".to_string();
+    }
+    let glyphs: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let min = values.iter().fold(f64::INFINITY, |a, b| a.min(*b));
+    let max = values.iter().fold(f64::NEG_INFINITY, |a, b| a.max(*b));
+    let span = (max - min).max(f64::EPSILON);
+    values
+        .iter()
+        .map(|v| {
+            let idx = (((*v - min) / span) * (glyphs.len() as f64 - 1.0)).round() as usize;
+            glyphs[idx.min(glyphs.len() - 1)]
+        })
+        .collect()
+}
+
 // ── /events ───────────────────────────────────────────────────────────────────
 
 async fn page_events(state: &AppState, query: &str) -> String {
@@ -880,6 +933,37 @@ async fn page_events(state: &AppState, query: &str) -> String {
     let npc_loop = state.npc.snapshot().await;
 
     let best_summary = events.first().map(summarise_event).unwrap_or_else(|| "No fresh event yet; waiting for next snapshot.".to_string());
+    let market_ticks = events
+        .iter()
+        .filter_map(|e| match &e.payload {
+            crate::events::TradingEvent::MarketSnapshot(p) => Some(p.mid),
+            crate::events::TradingEvent::SignalDecision(p) => Some(p.metrics.mid),
+            _ => None,
+        })
+        .take(16)
+        .collect::<Vec<_>>();
+    let latest_spread_bps = events
+        .iter()
+        .find_map(|e| match &e.payload {
+            crate::events::TradingEvent::MarketSnapshot(p) => Some(p.spread_bps),
+            crate::events::TradingEvent::SignalDecision(p) => Some(p.metrics.spread_bps),
+            _ => None,
+        })
+        .unwrap_or(0.0);
+    let latest_mid = market_ticks.first().copied().unwrap_or(0.0);
+    let oldest_mid = market_ticks.last().copied().unwrap_or(latest_mid);
+    let market_change_pct = if oldest_mid > 0.0 {
+        ((latest_mid - oldest_mid) / oldest_mid) * 100.0
+    } else {
+        0.0
+    };
+    let market_change_class = if market_change_pct > 0.0 {
+        "pos"
+    } else if market_change_pct < 0.0 {
+        "neg"
+    } else {
+        "neutral"
+    };
     let quote_asset = ["USDT", "USDC", "BUSD", "FDUSD", "TUSD", "BTC", "ETH", "BNB"]
         .iter()
         .find(|q| symbol.ends_with(**q))
@@ -892,22 +976,22 @@ async fn page_events(state: &AppState, query: &str) -> String {
     let sell_ready = sell_inventory > 0.0;
     let buy_ready = buy_power > 0.0;
     let sell_state = if sell_ready {
-        format!("Ready to sell ({:.8} {})", sell_inventory, base_asset)
+        format!("SELL AVAILABLE — {:.8} {} ready", sell_inventory, base_asset)
     } else {
-        format!("Sell unavailable — no {} available", base_asset)
+        format!("SELL UNAVAILABLE — No {} inventory", base_asset)
     };
     let buy_state = if buy_ready {
-        format!("Ready to buy ({:.8} {})", buy_power, quote_asset)
+        format!("BUY AVAILABLE — {} usable", format_usd(buy_power))
     } else {
-        format!("Buy unavailable — no {} available", quote_asset)
+        "BUY UNAVAILABLE — No USDT balance".to_string()
     };
     let risk_status = if kill { "Risk checks paused" } else { "Risk checks passed" };
     let signal_label = if sell_ready {
-        "Ready to sell"
+        "SELL AVAILABLE"
     } else if buy_ready {
-        "Ready to buy"
+        "BUY AVAILABLE"
     } else {
-        "Wait"
+        "HOLD"
     };
     let signal_class = if sell_ready {
         "state-ready-sell"
@@ -916,12 +1000,21 @@ async fn page_events(state: &AppState, query: &str) -> String {
     } else {
         "state-wait"
     };
-    let waiting_for = if sell_ready || buy_ready { "Execution confirmation and next market snapshot" } else { "Actionable buy/sell inventory" };
+    let waiting_for = if sell_ready {
+        "Inventory available to reduce exposure quickly."
+    } else if buy_ready {
+        "USDT available to add exposure when signal aligns."
+    } else {
+        "No immediate inventory edge; wait for funding or new signal."
+    };
+    let usable_balance_usd = buy_power + (sell_inventory * latest_mid);
+    let inventory_value_usd = sell_inventory * latest_mid;
     let status_body = format!(
         "{flash}<div class='metrics-grid' style='margin-top:8px'>\
-          <div class='metric-card'><div class='metric-label'>Total balance (USD est)</div><div class='metric-value'>${:.2}</div></div>\
-          <div class='metric-card'><div class='metric-label'>Available buy power</div><div class='metric-value'>{:.6} {}</div></div>\
-          <div class='metric-card'><div class='metric-label'>Available sell inventory</div><div class='metric-value'>{:.6} {}</div></div>\
+          <div class='metric-card'><div class='metric-label'>Total Balance</div><div class='metric-value'>{}</div></div>\
+          <div class='metric-card'><div class='metric-label'>Usable Balance</div><div class='metric-value'>{}</div></div>\
+          <div class='metric-card'><div class='metric-label'>Buy Power ({})</div><div class='metric-value'>{}</div></div>\
+          <div class='metric-card'><div class='metric-label'>Inventory Value (est)</div><div class='metric-value'>{}</div></div>\
           <div class='metric-card'><div class='metric-label'>Symbol</div><div class='metric-value'>{}</div></div>\
           <div class='metric-card'><div class='metric-label'>System status</div><div class='metric-value'>{} / {}</div></div>\
           <div class='metric-card'><div class='metric-label'>Risk status</div><div class='metric-value {}'>{}</div></div>\
@@ -934,11 +1027,11 @@ async fn page_events(state: &AppState, query: &str) -> String {
           <div class='summary-pill'><div class='label'>Operator Note</div><div>{}</div></div>\
         </div>\
         <div class='sr-only'>SELL READY BUY READY BUY DISABLED (NO USDT) Latest recommendation summary Recent event context</div>",
-        total_balance_usd,
-        buy_power,
-        quote_asset,
-        sell_inventory,
-        base_asset,
+        format_usd(total_balance_usd),
+        format_usd(usable_balance_usd),
+        esc(quote_asset),
+        format_usd(buy_power),
+        format_usd(inventory_value_usd),
         esc(&symbol),
         esc(&exec_state.to_string()),
         esc(&sys_mode.to_string()),
@@ -954,54 +1047,78 @@ async fn page_events(state: &AppState, query: &str) -> String {
     let buy_btn_attrs = if buy_ready {
         ""
     } else {
-        " disabled title='Buy unavailable — no quote balance available'"
+        " disabled title='BUY UNAVAILABLE — No USDT balance'"
     };
     let sell_btn_attrs = if sell_ready {
         ""
     } else {
-        " disabled title='Sell unavailable — no base inventory available'"
+        " disabled title='SELL UNAVAILABLE — No base inventory available'"
     };
+    let sparkline = sparkline(&market_ticks.iter().rev().copied().collect::<Vec<_>>());
     let primary_body = format!(
         "<div class='hero-grid'>\
+           <div class='market-header'>\
+             <div class='label'>Market Header</div>\
+             <div class='market-top'>\
+                <div><div class='dim'>{}</div><div class='market-price'>{}</div></div>\
+                <div class='market-change {}'>{:+.2}%</div>\
+             </div>\
+             <div class='market-meta'>\
+               <div class='summary-pill'><div class='label'>Spread</div><div>{:.2} bps</div></div>\
+               <div class='summary-pill'><div class='label'>Last Tick</div><div>{}</div></div>\
+               <div class='summary-pill'><div class='label'>Tick Count</div><div>{}</div></div>\
+             </div>\
+             <div class='market-sparkline' title='Last market ticks'>{}</div>\
+           </div>\
            <div class='signal-box'>\
              <div class='label'>Hero Trade Card</div>\
              <div style='font-size:30px;font-weight:700'>{}</div>\
-             <div class='sum' style='margin-top:4px'>Current action state</div>\
+             <div class='sum' style='margin-top:4px'>Action State</div>\
              <div class='signal-state {}'>{}</div>\
-             <div class='soft-title'>Recommendation</div>\
+             <div class='soft-title'>Trader Guidance</div>\
              <div class='sum'>{}</div>\
-             <div class='sum' style='margin-top:6px'>Waiting for: {}</div>\
+             <div class='sum' style='margin-top:6px'>{}</div>\
              <div class='action-row'>\
-               <form method='post' action='/events/quick/sell'><button class='btn-reject' type='submit'{}>Sell {}</button></form>\
-               <form method='post' action='/events/quick/buy'><button class='btn-approve' type='submit'{}>Buy {}</button></form>\
+               <form method='post' action='/events/quick/buy'><button class='btn-buy' type='submit'{}>BUY</button></form>\
+               <form method='post' action='/events/quick/sell'><button class='btn-sell' type='submit'{}>SELL</button></form>\
              </div>\
+             <div class='disabled-note'>{}</div>\
            </div>\
-           <div class='signal-box'>\
+           <div class='signal-box tier-2'>\
              <div class='label'>Availability</div>\
              <div class='sum'>{}</div>\
              <div class='sum' style='margin-top:8px'>{}</div>\
-             <div class='sum' style='margin-top:12px'>System healthy. Recommendation updates every market event.</div>\
+             <div class='sum' style='margin-top:12px'>Recommendation refreshes each market event.</div>\
            </div>\
          </div>",
+        esc(&symbol),
+        if latest_mid > 0.0 { format!("{:.2}", latest_mid) } else { "Waiting…".to_string() },
+        market_change_class,
+        market_change_pct,
+        latest_spread_bps,
+        if latest_mid > 0.0 { format_usd(latest_mid) } else { "No tick".to_string() },
+        market_ticks.len(),
+        esc(&sparkline),
         esc(&symbol),
         signal_class,
         signal_label,
         esc(&best_summary),
         waiting_for,
-        sell_btn_attrs,
-        esc(base_asset),
         buy_btn_attrs,
-        esc(base_asset),
+        sell_btn_attrs,
+        if buy_ready && sell_ready {
+            "Both BUY and SELL are executable now."
+        } else if buy_ready {
+            "SELL disabled — no base inventory ready."
+        } else if sell_ready {
+            "BUY disabled — No USDT balance available."
+        } else {
+            "BUY disabled — No USDT balance. SELL disabled — No base inventory."
+        },
         esc(&buy_state),
         esc(&sell_state),
     );
 
-    let rows = events.iter().take(10).map(|e| format!(
-        "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
-        e.occurred_at.format("%H:%M:%S"),
-        esc(&e.event_type),
-        esc(&summarise_event(e)),
-    )).collect::<Vec<_>>().join("");
     let corr_link = events
         .first()
         .and_then(|e| e.correlation_id.as_ref())
@@ -1027,13 +1144,22 @@ async fn page_events(state: &AppState, query: &str) -> String {
             balances_rows
         )
     };
+    let event_feed = events.iter().take(10).map(|e| format!(
+        "<div class='event-item'><div class='time'>{} · {}</div><div class='summary'>{}</div>\
+         <details style='margin-top:6px'><summary class='dim'>Details</summary><div class='dim' style='margin-top:4px'>type={} · event_id={}</div></details></div>",
+        e.occurred_at.format("%H:%M:%S"),
+        esc(e.symbol.as_deref().unwrap_or("SYSTEM")),
+        esc(&summarise_event(e)),
+        esc(&e.event_type),
+        esc(&e.event_id),
+    )).collect::<Vec<_>>().join("");
     let context_body = format!(
-        "<div class='soft-title'>Recent activity</div>\
-         <table><thead><tr><th>Time</th><th>Type</th><th>Summary</th></tr></thead><tbody>{}</tbody></table>\
+        "<div class='soft-title'>Recent Activity</div>\
+         <div class='event-list tier-3'>{}</div>\
          <div class='sum' style='margin-top:8px'>Position {:.6} · Open orders {} · <a href='{}'>Open timeline view</a></div>\
          <div class='sum' style='margin-top:8px'>Autonomous last decision: {} · cycle {} · {}</div>\
          <details style='margin-top:10px'><summary class='soft-title' style='cursor:pointer'>Advanced / Diagnostics</summary>{}</details>",
-        rows,
+        event_feed,
         pos_size,
         open_orders,
         corr_link,
@@ -1065,7 +1191,7 @@ async fn page_events(state: &AppState, query: &str) -> String {
         &status_body,
         "Primary Trading Action",
         &format!("{}{}", primary_body, market_body),
-        "Recent Activity & Context",
+        "Recent Activity",
         &context_body,
         Some(("Market / Position Panel", "<div class='sum'>Snapshot view keeps routing and safety behavior unchanged.</div>")),
     );
@@ -1709,7 +1835,7 @@ mod tests {
             max_slippage_bps:    20.0,
         }, &pos);
         let (client, withdrawals) = test_app_state_extras();
-        let store = InMemoryEventStore::new();
+        let store: Arc<dyn EventStore> = InMemoryEventStore::new();
         let exec = Arc::new(Executor::new("BTCUSDT".into(), CircuitBreakerConfig::default(), WatchdogConfig::default()));
         let truth = Arc::new(Mutex::new(TruthState::new("BTCUSDT", 0.0)));
         let authority = Arc::new(crate::authority::AuthorityLayer::new());
