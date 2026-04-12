@@ -1025,18 +1025,23 @@ async fn page_events(state: &AppState, query: &str) -> String {
     let usable_balance_usd = buy_power + (sell_inventory * latest_mid);
     let inventory_value_usd = sell_inventory * latest_mid;
     // Profile banner — shown prominently on LIVE page.
-    let profile_banner = if current_profile == RuntimeProfile::MicroTest {
-        "<div class='summary-pill' style='background:rgba(240,185,11,0.12);border-color:#f0b90b;color:#f0b90b;margin-bottom:8px'>\
-           <div class='label'>Runtime Profile</div>\
-           <div>⚡ Micro-Test mode: faster decisions for small balances</div>\
-         </div>"
-    } else {
-        &format!(
-            "<div class='summary-pill' style='margin-bottom:8px'>\
+    let profile_banner = {
+        let (extra_style, text) = if current_profile == RuntimeProfile::MicroTest {
+            (
+                "background:rgba(240,185,11,0.12);border-color:#f0b90b;color:#f0b90b;",
+                format!("⚡ {}", esc(current_profile.label())),
+            )
+        } else {
+            (
+                "",
+                esc(current_profile.label()),
+            )
+        };
+        format!(
+            "<div class='summary-pill' style='{extra_style}margin-bottom:8px'>\
                <div class='label'>Runtime Profile</div>\
-               <div>{}</div>\
-             </div>",
-            esc(current_profile.label())
+               <div>{text}</div>\
+             </div>"
         )
     };
     let status_body = format!(
@@ -2231,11 +2236,14 @@ mod tests {
     #[tokio::test]
     async fn test_events_shows_profile_banner() {
         let state = make_state();
+        // Default profile is Conservative; banner must contain both the label
+        // and the "Runtime Profile" heading.
         let r = page_events(&state, "").await;
-        // Profile banner (default = Conservative since RuntimeProfile::default())
-        // must be present on the LIVE page.
-        assert!(r.contains("Runtime Profile") || r.contains("CONSERVATIVE") || r.contains("ACTIVE"),
-            "LIVE page must display runtime profile");
+        assert!(r.contains("Runtime Profile"), "LIVE page must show 'Runtime Profile' heading");
+        assert!(
+            r.contains("CONSERVATIVE") || r.contains("Conservative") || r.contains("cautious"),
+            "LIVE page must show the current profile value"
+        );
     }
 
     #[tokio::test]
@@ -2243,21 +2251,27 @@ mod tests {
         let state = make_state();
         *state.profile.lock().await = crate::profile::RuntimeProfile::MicroTest;
         let r = page_events(&state, "").await;
-        assert!(r.contains("Micro-Test") || r.contains("MICRO_TEST"),
-            "LIVE page must show MICRO_TEST indicator when profile is MicroTest");
+        assert!(r.contains("Runtime Profile"), "LIVE page must show 'Runtime Profile' heading");
+        assert!(
+            r.contains("⚡") || r.contains("Micro-Test") || r.contains("MICRO_TEST"),
+            "LIVE page must show MICRO_TEST highlighted indicator"
+        );
+        assert!(
+            r.contains("faster decisions") || r.contains("small balances"),
+            "LIVE page must include MICRO_TEST plain-language description"
+        );
     }
 
     #[tokio::test]
     async fn test_assistant_shows_profile_selector() {
         let state = make_state();
         let r = page_assistant(&state, "").await;
-        // Profile selector must be rendered on /assistant (SETTINGS) page.
-        assert!(r.contains("Runtime Profile") || r.contains("CONSERVATIVE") || r.contains("MICRO_TEST"),
-            "SETTINGS page must show profile selector");
-        // All three options must be present in the selector.
-        assert!(r.contains("CONSERVATIVE"), "CONSERVATIVE option must be present");
-        assert!(r.contains("ACTIVE"),       "ACTIVE option must be present");
-        assert!(r.contains("MICRO_TEST"),   "MICRO_TEST option must be present");
+        // The interactive selector element must be present.
+        assert!(r.contains("name='profile'"), "SETTINGS page must render profile <select> element");
+        assert!(r.contains("value='CONSERVATIVE'"), "CONSERVATIVE option must be present");
+        assert!(r.contains("value='ACTIVE'"),       "ACTIVE option must be present");
+        assert!(r.contains("value='MICRO_TEST'"),   "MICRO_TEST option must be present");
+        assert!(r.contains("Apply"),                "Apply button must be present");
     }
 
     #[tokio::test]
@@ -2265,11 +2279,15 @@ mod tests {
         let state = make_state();
         *state.profile.lock().await = crate::profile::RuntimeProfile::MicroTest;
         let r = page_assistant(&state, "").await;
-        // The MICRO_TEST option should be marked selected.
-        assert!(r.contains("selected"), "A profile option must be marked selected");
-        // The current profile label should appear somewhere.
-        assert!(r.contains("faster decisions") || r.contains("MICRO_TEST"),
-            "Micro-test label must appear when profile is MicroTest");
+        // MICRO_TEST option must carry the `selected` attribute.
+        assert!(
+            r.contains("value='MICRO_TEST' selected") || r.contains("value='MICRO_TEST'  selected"),
+            "MICRO_TEST option must be marked as selected"
+        );
+        assert!(
+            r.contains("faster decisions") || r.contains("small balances"),
+            "Micro-test label must appear in the profile description"
+        );
     }
 
 }
