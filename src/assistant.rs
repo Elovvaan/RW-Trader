@@ -340,7 +340,7 @@ fn explain_order_rejected(tl: &TradeTimeline, sym: &str) -> String {
          Exchange reason: {} \
          This may indicate a configuration issue (e.g. insufficient balance, \
          invalid quantity step, or a stale order ID). \
-         The bot returned to Idle; the next valid signal will retry.",
+         No active trade in progress; the next valid signal will retry.",
         exchange_reason,
         signal = signal,
     )
