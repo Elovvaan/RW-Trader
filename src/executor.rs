@@ -58,10 +58,10 @@ impl ExecutionState {
 
     pub fn name(&self) -> &'static str {
         match self {
-            ExecutionState::Idle             => "No active trade in progress",
-            ExecutionState::Submitting { .. } => "Submitting",
-            ExecutionState::WaitingAck { .. } => "WaitingAck",
-            ExecutionState::Open { .. }       => "Open",
+            ExecutionState::Idle             => "Monitoring for trigger",
+            ExecutionState::Submitting { .. } => "Submitting Order",
+            ExecutionState::WaitingAck { .. } => "Order Working",
+            ExecutionState::Open { .. }       => "Order Working",
             ExecutionState::Canceling { .. }  => "Canceling",
             ExecutionState::Replacing { .. }  => "Replacing",
             ExecutionState::Recovery { .. }   => "Recovery",
@@ -94,13 +94,13 @@ impl ExecutionState {
 impl std::fmt::Display for ExecutionState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ExecutionState::Idle => write!(f, "No active trade in progress"),
+            ExecutionState::Idle => write!(f, "Monitoring for trigger"),
             ExecutionState::Submitting { client_order_id } =>
-                write!(f, "Submitting({})", client_order_id),
+                write!(f, "Submitting Order({})", client_order_id),
             ExecutionState::WaitingAck { client_order_id, .. } =>
-                write!(f, "WaitingAck({})", client_order_id),
+                write!(f, "Order Working({})", client_order_id),
             ExecutionState::Open { exchange_order_id, .. } =>
-                write!(f, "Open({})", exchange_order_id),
+                write!(f, "Order Working({})", exchange_order_id),
             ExecutionState::Canceling { exchange_order_id, .. } =>
                 write!(f, "Canceling({})", exchange_order_id),
             ExecutionState::Replacing { .. } => write!(f, "Replacing"),

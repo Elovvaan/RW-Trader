@@ -703,8 +703,11 @@ async fn agent_status_json(state: &AppState) -> String {
     let last_action = snap.last_action.replace('"', "\\\"");
     let last_reason = snap.execution_result.replace('"', "\\\"");
     let status_str  = snap.status.replace('"', "\\\"");
+    let last_decision = snap.last_agent_decision.replace('"', "\\\"");
+    let no_trade_reason = snap.last_no_trade_reason.replace('"', "\\\"");
+    let pipeline = snap.pipeline_state.replace('"', "\\\"");
     let body = format!(
-        r#"{{"mode":"{mode_str}","state":"{state_label}","agent_state":"{status_str}","last_action":"{last_action}","last_reason":"{last_reason}","cycle_count":{cycle_count},"running":{running}}}"#,
+        r#"{{"mode":"{mode_str}","state":"{state_label}","agent_state":"{status_str}","last_action":"{last_action}","last_reason":"{last_reason}","last_agent_decision":"{last_decision}","last_no_trade_reason":"{no_trade_reason}","pipeline_state":"{pipeline}","cycle_count":{cycle_count},"running":{running}}}"#,
         cycle_count = snap.cycle_count,
         running     = snap.running,
     );
@@ -1153,6 +1156,44 @@ async fn page_events(state: &AppState, query: &str) -> String {
         crate::npc::AgentMode::Auto =>
             "width:100%;padding:14px;font-size:16px;font-weight:700;border-radius:12px;border:0;background:rgba(240,185,11,.22);color:#f0b90b;cursor:pointer",
     };
+
+    // Pipeline stage display — translate internal state to human-readable labels
+    let pipeline_stage = if agent_mode == crate::npc::AgentMode::Off {
+        "<span style='color:#82909f'>Agent OFF</span>".to_string()
+    } else if agent_mode == crate::npc::AgentMode::Pause {
+        "<span style='color:#f0b90b'>Agent Paused</span>".to_string()
+    } else {
+        let ps = &npc_loop.pipeline_state;
+        let (color, label) = if ps.starts_with("Submitting") || ps.starts_with("Order Working") {
+            ("#f0b90b", ps.as_str())
+        } else if ps.starts_with("Rejected") {
+            ("#ef4444", ps.as_str())
+        } else if ps.starts_with("Trigger Matched") {
+            ("#22C55E", ps.as_str())
+        } else {
+            ("#82909f", if ps.is_empty() { "Scanning" } else { ps.as_str() })
+        };
+        format!("<span style='color:{}'>{}</span>", color, esc(label))
+    };
+
+    // SELL_AVAILABLE but no trade diagnostic banner
+    let sell_blocked_banner = if sell_ready
+        && agent_mode == crate::npc::AgentMode::Auto
+        && matches!(exec_state, crate::executor::ExecutionState::Idle)
+        && !npc_loop.last_no_trade_reason.is_empty()
+    {
+        format!(
+            "<div style='margin-top:8px;padding:8px 10px;background:rgba(239,68,68,.10);\
+             border:1px solid rgba(239,68,68,.35);border-radius:10px;font-size:11px'>\
+             <span style='color:#ef4444;font-weight:700'>⚠ SELL AVAILABLE — order not submitted</span>\
+             <div style='margin-top:4px;color:#d0d6dd'>{}</div>\
+             </div>",
+            esc(&npc_loop.last_no_trade_reason)
+        )
+    } else {
+        String::new()
+    };
+
     let agent_control_card = format!(
         "<div class='signal-box' style='margin-bottom:12px;{agent_card_glow}'>\
            <div style='display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px'>\
@@ -1162,9 +1203,12 @@ async fn page_events(state: &AppState, query: &str) -> String {
            <div style='display:grid;grid-template-columns:repeat(2,1fr);gap:6px;margin-top:6px;font-size:12px'>\
              <div><span class='dim'>State: </span>{state_label}</div>\
              <div><span class='dim'>Cycles: </span>{cycle_count}</div>\
-             <div><span class='dim'>Last Action: </span>{last_action}</div>\
-             <div><span class='dim'>Last Result: </span>{last_reason}</div>\
+             <div><span class='dim'>Pipeline: </span>{pipeline_stage}</div>\
+             <div><span class='dim'>Executor: </span>{exec_label}</div>\
+             <div style='grid-column:1/-1'><span class='dim'>Last decision: </span>{last_decision}</div>\
+             <div style='grid-column:1/-1'><span class='dim'>No-trade reason: </span>{no_trade_reason}</div>\
            </div>\
+           {sell_blocked_banner}\
            <div style='display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:10px'>\
              <form method='post' action='/agent/mode'><input type='hidden' name='mode' value='off'>\
                <button type='submit' style='width:100%;padding:9px 4px;border-radius:10px;border:1px solid rgba(130,144,159,.3);background:{off_bg};color:{off_fg};font-weight:600;font-size:11px;cursor:pointer'>OFF</button></form>\
@@ -1178,17 +1222,22 @@ async fn page_events(state: &AppState, query: &str) -> String {
              <button type='submit' style='{cta_style}'>{cta_label}</button>\
            </form>\
          </div>",
-        mode_upper   = esc(agent_mode.as_str().to_uppercase().as_str()),
-        state_label  = esc(npc_loop.agent_mode.state_label()),
-        cycle_count  = npc_loop.cycle_count,
-        last_action  = esc(&npc_loop.last_action),
-        last_reason  = esc(&npc_loop.execution_result),
-        off_bg   = if agent_mode == crate::npc::AgentMode::Off   { "rgba(130,144,159,.22)" } else { "transparent" },
-        off_fg   = if agent_mode == crate::npc::AgentMode::Off   { "#e6ecf2" }              else { "#82909f" },
-        auto_bg  = if agent_mode == crate::npc::AgentMode::Auto  { "rgba(34,197,94,.22)" }  else { "transparent" },
-        auto_fg  = if agent_mode == crate::npc::AgentMode::Auto  { "#22C55E" }              else { "#82909f" },
-        pause_bg = if agent_mode == crate::npc::AgentMode::Pause { "rgba(240,185,11,.22)" } else { "transparent" },
-        pause_fg = if agent_mode == crate::npc::AgentMode::Pause { "#f0b90b" }              else { "#82909f" },
+        mode_upper    = esc(agent_mode.as_str().to_uppercase().as_str()),
+        state_label   = esc(npc_loop.agent_mode.state_label()),
+        cycle_count   = npc_loop.cycle_count,
+        exec_label    = esc(&exec_state.to_string()),
+        last_decision = esc(&npc_loop.last_agent_decision),
+        no_trade_reason = if npc_loop.last_no_trade_reason.is_empty() {
+            "—".to_string()
+        } else {
+            esc(&npc_loop.last_no_trade_reason)
+        },
+        off_bg    = if agent_mode == crate::npc::AgentMode::Off   { "rgba(130,144,159,.22)" } else { "transparent" },
+        off_fg    = if agent_mode == crate::npc::AgentMode::Off   { "#e6ecf2" }              else { "#82909f" },
+        auto_bg   = if agent_mode == crate::npc::AgentMode::Auto  { "rgba(34,197,94,.22)" }  else { "transparent" },
+        auto_fg   = if agent_mode == crate::npc::AgentMode::Auto  { "#22C55E" }              else { "#82909f" },
+        pause_bg  = if agent_mode == crate::npc::AgentMode::Pause { "rgba(240,185,11,.22)" } else { "transparent" },
+        pause_fg  = if agent_mode == crate::npc::AgentMode::Pause { "#f0b90b" }              else { "#82909f" },
     );
     let primary_body = format!(
         "<div class='hero-grid'>\
@@ -1292,15 +1341,24 @@ async fn page_events(state: &AppState, query: &str) -> String {
         "<div class='soft-title'>Recent Activity</div>\
          <div class='event-list tier-3'>{}</div>\
          <div class='sum' style='margin-top:8px'>Position {:.6} · Open orders {} · <a href='{}'>Open timeline view</a></div>\
-         <div class='sum' style='margin-top:8px'>Autonomous last decision: {} · cycle {} · {}</div>\
+         <div class='sum' style='margin-top:8px'>\
+           <strong>Last agent decision:</strong> {} · cycle {}\
+         </div>\
+         <div class='sum' style='margin-top:4px'>\
+           <strong>Last no-trade reason:</strong> {}\
+         </div>\
          <details style='margin-top:10px'><summary class='soft-title' style='cursor:pointer'>Advanced / Diagnostics</summary>{}</details>",
         event_feed,
         pos_size,
         open_orders,
         corr_link,
-        esc(&npc_loop.last_action),
+        esc(&npc_loop.last_agent_decision),
         npc_loop.cycle_id,
-        esc(&npc_loop.execution_result),
+        if npc_loop.last_no_trade_reason.is_empty() {
+            "—".to_string()
+        } else {
+            esc(&npc_loop.last_no_trade_reason)
+        },
         balances_table,
     );
     let market_body = format!(
