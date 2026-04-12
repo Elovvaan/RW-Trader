@@ -84,6 +84,45 @@ impl NpcLifecycleState {
     }
 }
 
+/// Runtime control mode for the autonomous trading agent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentMode {
+    /// Agent is fully stopped — no loop runs.
+    Off,
+    /// Agent is actively running continuous trading cycles.
+    Auto,
+    /// Agent loop is running but cycles are skipped (paused).
+    Pause,
+}
+
+impl AgentMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Off   => "off",
+            Self::Auto  => "auto",
+            Self::Pause => "pause",
+        }
+    }
+
+    /// Human-readable state label shown in the UI.
+    pub fn state_label(&self) -> &'static str {
+        match self {
+            Self::Off   => "Agent OFF",
+            Self::Auto  => "Agent ON — Scanning",
+            Self::Pause => "Agent Paused",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "off"               => Some(Self::Off),
+            "auto"              => Some(Self::Auto),
+            "pause" | "paused"  => Some(Self::Pause),
+            _                   => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NpcTradingMode {
     Simulation,
@@ -362,6 +401,9 @@ struct NpcRuntimeState {
 
 #[derive(Clone, Debug)]
 pub struct NpcLoopSnapshot {
+    /// New 3-state mode (preferred field).
+    pub agent_mode: AgentMode,
+    /// Kept for backward-compatibility — derived from `agent_mode`.
     pub autonomous_mode: bool,
     pub running: bool,
     pub interval_ms: u64,
@@ -385,18 +427,20 @@ struct NpcLoopTelemetry {
 }
 
 struct NpcLoopControl {
-    autonomous_mode: bool,
+    mode: AgentMode,
     interval_ms: u64,
     stop_tx: Option<tokio::sync::watch::Sender<bool>>,
+    pause_tx: Option<tokio::sync::watch::Sender<bool>>,
     handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl NpcLoopControl {
-    fn new(interval_ms: u64, autonomous_mode: bool) -> Self {
+    fn new(interval_ms: u64, mode: AgentMode) -> Self {
         Self {
-            autonomous_mode,
+            mode,
             interval_ms,
             stop_tx: None,
+            pause_tx: None,
             handle: None,
         }
     }
@@ -414,7 +458,7 @@ pub struct NpcAutonomousController {
 impl NpcAutonomousController {
     pub fn new(cfg: NpcConfig, state: AgentState) -> Self {
         let interval_ms = cfg.cycle_interval.as_millis().clamp(500, 2000) as u64;
-        let autonomous_mode = cfg.enabled;
+        let mode = if cfg.enabled { AgentMode::Auto } else { AgentMode::Off };
         Self {
             cfg,
             state,
@@ -425,18 +469,68 @@ impl NpcAutonomousController {
                 status: NPC_STATUS_SCANNING.to_string(),
                 ..NpcLoopTelemetry::default()
             })),
-            control: Arc::new(Mutex::new(NpcLoopControl::new(interval_ms, autonomous_mode))),
+            control: Arc::new(Mutex::new(NpcLoopControl::new(interval_ms, mode))),
         }
     }
 
+    /// Set the agent to a new mode, starting or stopping the loop as needed.
+    pub async fn set_agent_mode(&self, mode: AgentMode) {
+        // Capture old mode and update atomically.
+        let old_mode = {
+            let mut control = self.control.lock().await;
+            let old = control.mode;
+            control.mode = mode;
+            old
+        };
+
+        match mode {
+            AgentMode::Off => {
+                self.stop_trading_loop().await;
+                let mut t = self.telemetry.lock().await;
+                t.status = "Agent OFF".to_string();
+            }
+            AgentMode::Auto => {
+                // If we were paused, send unpause signal on the existing loop.
+                {
+                    let control = self.control.lock().await;
+                    if let Some(tx) = control.pause_tx.as_ref() {
+                        let _ = tx.send(false);
+                    }
+                    let loop_running = control.handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false);
+                    drop(control);
+                    if !loop_running {
+                        // Loop was not running (came from Off); start it.
+                        self.spawn_trading_loop().await;
+                        return;
+                    }
+                }
+                let mut t = self.telemetry.lock().await;
+                t.status = "Agent ON — Scanning".to_string();
+            }
+            AgentMode::Pause => {
+                if old_mode == AgentMode::Off {
+                    // Can't pause when off; treat as no-op.
+                    let mut control = self.control.lock().await;
+                    control.mode = AgentMode::Off;
+                    return;
+                }
+                let control = self.control.lock().await;
+                if let Some(tx) = control.pause_tx.as_ref() {
+                    let _ = tx.send(true);
+                }
+                drop(control);
+                let mut t = self.telemetry.lock().await;
+                t.status = "Agent Paused".to_string();
+            }
+        }
+    }
+
+    /// Legacy helper — delegates to `set_agent_mode`.
     pub async fn set_autonomous_mode(&self, enabled: bool) {
-        let mut control = self.control.lock().await;
-        control.autonomous_mode = enabled;
-        drop(control);
         if enabled {
-            self.spawn_trading_loop().await;
+            self.set_agent_mode(AgentMode::Auto).await;
         } else {
-            self.stop_trading_loop().await;
+            self.set_agent_mode(AgentMode::Off).await;
         }
     }
 
@@ -447,7 +541,7 @@ impl NpcAutonomousController {
             return;
         }
         control.interval_ms = interval_ms;
-        let should_restart = control.autonomous_mode;
+        let should_restart = control.mode == AgentMode::Auto;
         drop(control);
         if should_restart {
             self.stop_trading_loop().await;
@@ -458,8 +552,10 @@ impl NpcAutonomousController {
     pub async fn snapshot(&self) -> NpcLoopSnapshot {
         let telemetry = self.telemetry.lock().await;
         let control = self.control.lock().await;
+        let agent_mode = control.mode;
         NpcLoopSnapshot {
-            autonomous_mode: control.autonomous_mode,
+            agent_mode,
+            autonomous_mode: agent_mode != AgentMode::Off,
             running: telemetry.running,
             interval_ms: control.interval_ms,
             cycle_count: telemetry.cycle_count,
@@ -480,8 +576,10 @@ impl NpcAutonomousController {
         }
 
         let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+        let (pause_tx, mut pause_rx) = tokio::sync::watch::channel(false);
         let interval_ms = control.interval_ms;
         control.stop_tx = Some(stop_tx);
+        control.pause_tx = Some(pause_tx);
         let cfg = self.cfg.clone();
         let state = self.state.clone();
         let runtime = Arc::clone(&self.runtime);
@@ -490,7 +588,7 @@ impl NpcAutonomousController {
             {
                 let mut t = telemetry.lock().await;
                 t.running = true;
-                t.status = "running".to_string();
+                t.status = "Agent ON — Scanning".to_string();
             }
             log_npc_event(
                 &*state.store,
@@ -511,6 +609,13 @@ impl NpcAutonomousController {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
+                        // If paused, log scanning and skip cycle execution.
+                        if *pause_rx.borrow() {
+                            let mut t = telemetry.lock().await;
+                            t.status = "Agent Paused".to_string();
+                            t.timestamp = Utc::now().to_rfc3339();
+                            continue;
+                        }
                         let report = run_cycle(&loop_cfg, &state, Arc::clone(&runtime)).await;
                         let mut t = telemetry.lock().await;
                         t.cycle_count = t.cycle_count.saturating_add(1);
@@ -518,7 +623,11 @@ impl NpcAutonomousController {
                         t.last_action = report.last_action;
                         t.timestamp = Utc::now().to_rfc3339();
                         t.execution_result = report.execution_result;
-                        t.status = report.status;
+                        t.status = match report.status.as_str() {
+                            "blocked"  => "Blocked by safety checks".to_string(),
+                            "running"  => "Agent ON — Scanning".to_string(),
+                            other      => other.to_string(),
+                        };
                     }
                     changed = stop_rx.changed() => {
                         if changed.is_ok() && *stop_rx.borrow() {
@@ -530,7 +639,7 @@ impl NpcAutonomousController {
 
             let mut t = telemetry.lock().await;
             t.running = false;
-            t.status = NPC_STATUS_SCANNING.to_string();
+            t.status = "Agent OFF".to_string();
         }));
     }
 
@@ -540,6 +649,7 @@ impl NpcAutonomousController {
             if let Some(tx) = control.stop_tx.take() {
                 let _ = tx.send(true);
             }
+            control.pause_tx = None;
             control.handle.take()
         };
         if let Some(handle) = handle {
@@ -547,14 +657,12 @@ impl NpcAutonomousController {
         }
         let mut t = self.telemetry.lock().await;
         t.running = false;
-        if t.status != "blocked" {
-            t.status = NPC_STATUS_SCANNING.to_string();
-        }
+        t.status = "Agent OFF".to_string();
     }
 }
 
 pub async fn spawn_npc_trading_layer(controller: &NpcAutonomousController) {
-    if !controller.snapshot().await.autonomous_mode {
+    if controller.snapshot().await.agent_mode == AgentMode::Off {
         info!("[NPC] Trading layer disabled");
         return;
     }
@@ -1735,5 +1843,48 @@ mod tests {
 
         assert!(candidates.iter().any(|c| c.action_id == "c42-scout"));
         assert!(candidates.iter().any(|c| c.action_id == "c42-dip_buyer"));
+    }
+
+    // ── AgentMode ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn agent_mode_round_trip_str() {
+        for (s, expected) in [("off", AgentMode::Off), ("auto", AgentMode::Auto), ("pause", AgentMode::Pause)] {
+            let m = AgentMode::from_str(s).expect("parse failed");
+            assert_eq!(m, expected);
+            assert_eq!(m.as_str(), s);
+        }
+    }
+
+    #[test]
+    fn agent_mode_from_str_case_insensitive() {
+        assert_eq!(AgentMode::from_str("OFF"),   Some(AgentMode::Off));
+        assert_eq!(AgentMode::from_str("AUTO"),  Some(AgentMode::Auto));
+        assert_eq!(AgentMode::from_str("PAUSE"), Some(AgentMode::Pause));
+        assert_eq!(AgentMode::from_str("paused"), Some(AgentMode::Pause));
+        assert_eq!(AgentMode::from_str("xyz"),   None);
+    }
+
+    #[test]
+    fn agent_mode_state_labels_not_idle() {
+        // No state label should contain the word "Idle" (requirement: remove passive idle state).
+        for mode in [AgentMode::Off, AgentMode::Auto, AgentMode::Pause] {
+            let label = mode.state_label();
+            assert!(!label.contains("Idle"), "mode {:?} must not use Idle label, got: {}", mode, label);
+        }
+    }
+
+    #[test]
+    fn npc_controller_initial_mode_off_when_disabled() {
+        let cfg = NpcConfig::from_trade_cfg(&TradeAgentConfig {
+            enabled: false,
+            trade_size: 0.0,
+            momentum_threshold: 0.0,
+            poll_interval: Duration::from_secs(1),
+            max_spread_bps: 5.0,
+        });
+        // We can't easily construct AgentState in a unit test, so test the enum logic only.
+        let mode = if cfg.enabled { AgentMode::Auto } else { AgentMode::Off };
+        assert_eq!(mode, AgentMode::Off);
     }
 }

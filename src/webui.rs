@@ -124,6 +124,8 @@ async fn handle(mut stream: TcpStream, state: Arc<AppState>) -> Result<()> {
         page_authority(&state, query).await
     } else if path == "/health" {
         plain("OK")
+    } else if path == "/agent/status" {
+        agent_status_json(&state).await
     } else {
         not_found()
     };
@@ -173,6 +175,26 @@ async fn handle_post(path: &str, _query: &str, body: &str, state: &AppState) -> 
         state.npc.set_autonomous_mode(false).await;
         log_ui_action(&*state.store, "ui_autonomous_mode_off", "autonomous mode disabled from /assistant");
         return redirect_with_ok("/assistant", "Autonomous Mode disabled.");
+    }
+
+    // POST /agent/mode — set agent mode (off | auto | pause)
+    if path == "/agent/mode" {
+        let form = parse_form_body(body);
+        let mode_str = form.get("mode").map(|s| s.as_str()).unwrap_or("off");
+        match crate::npc::AgentMode::from_str(mode_str) {
+            Some(mode) => {
+                state.npc.set_agent_mode(mode).await;
+                log_ui_action(
+                    &*state.store,
+                    &format!("ui_agent_mode_{}", mode.as_str()),
+                    &format!("agent mode set to {} from /agent/mode", mode.as_str()),
+                );
+                return redirect_with_ok("/events", &format!("Agent mode set to {}.", mode.as_str().to_uppercase()));
+            }
+            None => {
+                return redirect_with_err("/events", &format!("Unknown agent mode: {}", esc(mode_str)));
+            }
+        }
     }
     if path == "/assistant/autonomous/interval" {
         let form = parse_form_body(body);
@@ -653,14 +675,14 @@ fn respond(status: &str, ct: &str, body: &str) -> String {
 
 fn html_resp(body: &str) -> String { respond("200 OK", "text/html; charset=utf-8", body) }
 fn plain(body: &str)     -> String { respond("200 OK", "text/plain; charset=utf-8", body) }
+fn json_resp(body: &str) -> String { respond("200 OK", "application/json; charset=utf-8", body) }
 fn not_found()           -> String { respond("404 Not Found", "text/plain; charset=utf-8", "404 Not Found") }
 fn csv_resp(body: &str)  -> String { respond("200 OK", "text/csv; charset=utf-8", body) }
 fn redirect(loc: &str)   -> String {
     format!("HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", loc)
 }
 
-async fn export_positions_csv(state: &AppState) -> String {
-    let t = state.truth.lock().await;
+async fn export_positions_csv(state: &AppState) -> String {    let t = state.truth.lock().await;
     let csv = format!(
         "asset,size,avg_entry,unrealized_pnl,realized_pnl,open_orders\nBTCUSDT,{:.6},{:.2},{:.4},{:.4},{}\n",
         t.position.size,
@@ -670,6 +692,23 @@ async fn export_positions_csv(state: &AppState) -> String {
         t.open_order_count
     );
     csv_resp(&csv)
+}
+
+// ── GET /agent/status ─────────────────────────────────────────────────────────
+
+async fn agent_status_json(state: &AppState) -> String {
+    let snap = state.npc.snapshot().await;
+    let mode_str = snap.agent_mode.as_str();
+    let state_label = snap.agent_mode.state_label();
+    let last_action = snap.last_action.replace('"', "\\\"");
+    let last_reason = snap.execution_result.replace('"', "\\\"");
+    let status_str  = snap.status.replace('"', "\\\"");
+    let body = format!(
+        r#"{{"mode":"{mode_str}","state":"{state_label}","agent_state":"{status_str}","last_action":"{last_action}","last_reason":"{last_reason}","cycle_count":{cycle_count},"running":{running}}}"#,
+        cycle_count = snap.cycle_count,
+        running     = snap.running,
+    );
+    json_resp(&body)
 }
 
 // ── Shared HTML chrome ────────────────────────────────────────────────────────
@@ -1053,8 +1092,8 @@ async fn page_events(state: &AppState, query: &str) -> String {
           <div class='metric-card'><div class='metric-label'>Symbol</div><div class='metric-value'>{}</div></div>\
           <div class='metric-card'><div class='metric-label'>System status</div><div class='metric-value'>{} / {}</div></div>\
           <div class='metric-card'><div class='metric-label'>Risk status</div><div class='metric-value {}'>{}</div></div>\
-          <div class='metric-card'><div class='metric-label'>Autonomous Executor</div><div class='metric-value'>{}</div></div>\
-          <div class='metric-card'><div class='metric-label'>Autonomous Cycles</div><div class='metric-value'>{}</div></div>\
+          <div class='metric-card'><div class='metric-label'>Agent Mode</div><div class='metric-value'>{}</div></div>\
+          <div class='metric-card'><div class='metric-label'>Agent Cycles</div><div class='metric-value'>{}</div></div>\
         </div>\
         <div class='summary-strip' style='margin-top:10px'>\
           <div class='summary-pill'><div class='label'>Trading Readiness</div><div>{}</div></div>\
@@ -1072,7 +1111,7 @@ async fn page_events(state: &AppState, query: &str) -> String {
         esc(&sys_mode.to_string()),
         if kill { "err" } else { "ok" },
         risk_status,
-        if npc_loop.running { "Running" } else { "OFF" },
+        esc(npc_loop.agent_mode.as_str().to_uppercase().as_str()),
         npc_loop.cycle_count,
         esc(&signal_label.to_uppercase()),
         esc(&exec_state.to_string()),
@@ -1090,6 +1129,67 @@ async fn page_events(state: &AppState, query: &str) -> String {
         " disabled title='SELL UNAVAILABLE — No base inventory available'"
     };
     let sparkline = sparkline(&market_ticks.iter().rev().copied().collect::<Vec<_>>());
+
+    // ── Agent Control card (placed above primary trading action) ─────────────
+    let agent_mode = npc_loop.agent_mode;
+    let agent_card_glow = if agent_mode == crate::npc::AgentMode::Auto {
+        "border-color:rgba(34,197,94,.55);box-shadow:0 0 18px rgba(34,197,94,.18);"
+    } else {
+        ""
+    };
+    let agent_mode_badge_style = match agent_mode {
+        crate::npc::AgentMode::Auto  => "background:rgba(34,197,94,.18);color:#22C55E;padding:3px 10px;border-radius:999px;font-weight:700",
+        crate::npc::AgentMode::Pause => "background:rgba(240,185,11,.16);color:#f0b90b;padding:3px 10px;border-radius:999px;font-weight:700",
+        crate::npc::AgentMode::Off   => "background:rgba(130,144,159,.14);color:#82909f;padding:3px 10px;border-radius:999px;font-weight:700",
+    };
+    let (cta_label, cta_mode) = match agent_mode {
+        crate::npc::AgentMode::Off   => ("Turn Agent ON",  "auto"),
+        crate::npc::AgentMode::Auto  => ("Pause Agent",    "pause"),
+        crate::npc::AgentMode::Pause => ("Resume Agent",   "auto"),
+    };
+    let cta_style = match agent_mode {
+        crate::npc::AgentMode::Off | crate::npc::AgentMode::Pause =>
+            "width:100%;padding:14px;font-size:16px;font-weight:700;border-radius:12px;border:0;background:#22C55E;color:#05200d;cursor:pointer",
+        crate::npc::AgentMode::Auto =>
+            "width:100%;padding:14px;font-size:16px;font-weight:700;border-radius:12px;border:0;background:rgba(240,185,11,.22);color:#f0b90b;cursor:pointer",
+    };
+    let agent_control_card = format!(
+        "<div class='signal-box' style='margin-bottom:12px;{agent_card_glow}'>\
+           <div style='display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px'>\
+             <div class='label'>Agent Control</div>\
+             <span style='{agent_mode_badge_style}'>{mode_upper}</span>\
+           </div>\
+           <div style='display:grid;grid-template-columns:repeat(2,1fr);gap:6px;margin-top:6px;font-size:12px'>\
+             <div><span class='dim'>State: </span>{state_label}</div>\
+             <div><span class='dim'>Cycles: </span>{cycle_count}</div>\
+             <div><span class='dim'>Last Action: </span>{last_action}</div>\
+             <div><span class='dim'>Last Result: </span>{last_reason}</div>\
+           </div>\
+           <div style='display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:10px'>\
+             <form method='post' action='/agent/mode'><input type='hidden' name='mode' value='off'>\
+               <button type='submit' style='width:100%;padding:9px 4px;border-radius:10px;border:1px solid rgba(130,144,159,.3);background:{off_bg};color:{off_fg};font-weight:600;font-size:11px;cursor:pointer'>OFF</button></form>\
+             <form method='post' action='/agent/mode'><input type='hidden' name='mode' value='auto'>\
+               <button type='submit' style='width:100%;padding:9px 4px;border-radius:10px;border:1px solid rgba(34,197,94,.35);background:{auto_bg};color:{auto_fg};font-weight:600;font-size:11px;cursor:pointer'>AUTO</button></form>\
+             <form method='post' action='/agent/mode'><input type='hidden' name='mode' value='pause'>\
+               <button type='submit' style='width:100%;padding:9px 4px;border-radius:10px;border:1px solid rgba(240,185,11,.3);background:{pause_bg};color:{pause_fg};font-weight:600;font-size:11px;cursor:pointer'>PAUSE</button></form>\
+           </div>\
+           <form method='post' action='/agent/mode' style='margin-top:8px'>\
+             <input type='hidden' name='mode' value='{cta_mode}'>\
+             <button type='submit' style='{cta_style}'>{cta_label}</button>\
+           </form>\
+         </div>",
+        mode_upper   = esc(agent_mode.as_str().to_uppercase().as_str()),
+        state_label  = esc(npc_loop.agent_mode.state_label()),
+        cycle_count  = npc_loop.cycle_count,
+        last_action  = esc(&npc_loop.last_action),
+        last_reason  = esc(&npc_loop.execution_result),
+        off_bg   = if agent_mode == crate::npc::AgentMode::Off   { "rgba(130,144,159,.22)" } else { "transparent" },
+        off_fg   = if agent_mode == crate::npc::AgentMode::Off   { "#e6ecf2" }              else { "#82909f" },
+        auto_bg  = if agent_mode == crate::npc::AgentMode::Auto  { "rgba(34,197,94,.22)" }  else { "transparent" },
+        auto_fg  = if agent_mode == crate::npc::AgentMode::Auto  { "#22C55E" }              else { "#82909f" },
+        pause_bg = if agent_mode == crate::npc::AgentMode::Pause { "rgba(240,185,11,.22)" } else { "transparent" },
+        pause_fg = if agent_mode == crate::npc::AgentMode::Pause { "#f0b90b" }              else { "#82909f" },
+    );
     let primary_body = format!(
         "<div class='hero-grid'>\
            <div class='market-header'>\
@@ -1225,7 +1325,7 @@ async fn page_events(state: &AppState, query: &str) -> String {
         "LIVE Workspace",
         &status_body,
         "Primary Trading Action",
-        &format!("{}{}", primary_body, market_body),
+        &format!("{}{}{}", agent_control_card, primary_body, market_body),
         "Recent Activity",
         &context_body,
         Some(("Market / Position Panel", "<div class='sum'>Snapshot view keeps routing and safety behavior unchanged.</div>")),
@@ -1455,7 +1555,7 @@ async fn page_assistant(state: &AppState, query: &str) -> String {
           <div class='metric-card'><div class='metric-label'>Mode</div><div class='metric-value'>{}</div></div>\
           <div class='metric-card'><div class='metric-label'>Executor</div><div class='metric-value'>{}</div></div>\
           <div class='metric-card'><div class='metric-label'>Kill Switch</div><div class='metric-value {}'>{}</div></div>\
-          <div class='metric-card'><div class='metric-label'>Autonomous Mode</div><div class='metric-value'>{}</div></div>\
+          <div class='metric-card'><div class='metric-label'>Agent Mode</div><div class='metric-value'>{}</div></div>\
           <div class='metric-card'><div class='metric-label'>Loop Cycles</div><div class='metric-value'>{}</div></div>\
           <div class='metric-card'><div class='metric-label'>Runtime Profile</div><div class='metric-value'>{}</div></div>\
         </div>",
@@ -1465,13 +1565,13 @@ async fn page_assistant(state: &AppState, query: &str) -> String {
         esc(&exec_state.to_string()),
         if kill_active { "err" } else { "ok" },
         if kill_active { "ACTIVE" } else { "OFF" },
-        if npc_loop.running { "Executor Running" } else { "OFF" },
+        esc(npc_loop.agent_mode.state_label()),
         npc_loop.cycle_count,
         esc(current_profile.as_str()),
     );
 
     let primary_body = format!("<div style='display:grid;gap:10px'>\
-      <div class='signal-box'><div class='label'>Trading Controls</div><div class='sum'>Operator-level controls for runtime behavior and authority-safe interventions.</div><div style='margin-top:8px'>Authority workflows available in <a href='/authority'>FUNDS → approvals</a>.</div></div>\
+      <div class='signal-box'><div class='label'>Trading Controls</div><div class='sum'>Operator-level controls for runtime behavior and authority-safe interventions.</div><div style='margin-top:8px'>Authority workflows available in <a href='/authority'>FUNDS → approvals</a>. Agent control panel available on <a href='/events'>LIVE</a>.</div></div>\
       <div class='signal-box'><div class='label'>Runtime Profile</div>\
         <div class='sum'>Current: <strong>{}</strong></div>\
         <div class='sum' style='margin-top:4px'>{}</div>\
@@ -1481,12 +1581,13 @@ async fn page_assistant(state: &AppState, query: &str) -> String {
         </form>\
         <div class='sum' style='margin-top:6px;font-size:11px'>Note: profile change takes effect on the next trading cycle. Spread guard, kill switch, and risk engine remain active on all profiles.</div>\
       </div>\
-      <div class='signal-box'><div class='label'>Autonomous Mode</div><div class='sum'>Background NPC/Alpha loop with idempotent single-instance guard.</div>\
+      <div class='signal-box'><div class='label'>Agent Mode</div><div class='sum'>Background autonomous trading loop with idempotent single-instance guard.</div>\
         <div class='sum' style='margin-top:6px'>State: <strong>{}</strong> · Last decision: {} · Result: {} · Updated: {}</div>\
         <div class='sum' style='margin-top:6px'>Current cycle: {} · Interval: {}ms</div>\
-        <div style='display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px'>\
-          <form method='post' action='/assistant/autonomous/on'><button class='btn-approve' style='width:100%' type='submit'>Autonomous ON</button></form>\
-          <form method='post' action='/assistant/autonomous/off'><button class='btn-reject' style='width:100%' type='submit'>Autonomous OFF</button></form>\
+        <div style='display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:8px'>\
+          <form method='post' action='/agent/mode'><input type='hidden' name='mode' value='off'><button class='btn-off' style='width:100%' type='submit'>Agent OFF</button></form>\
+          <form method='post' action='/agent/mode'><input type='hidden' name='mode' value='auto'><button class='btn-auto' style='width:100%' type='submit'>Agent AUTO</button></form>\
+          <form method='post' action='/agent/mode'><input type='hidden' name='mode' value='pause'><button class='btn-assist' style='width:100%' type='submit'>PAUSE</button></form>\
         </div>\
         <form method='post' action='/assistant/autonomous/interval' style='margin-top:8px'>\
           <label class='dim'>Loop interval (500-2000 ms)</label>\
@@ -1506,7 +1607,7 @@ async fn page_assistant(state: &AppState, query: &str) -> String {
       esc(current_profile.as_str()),
       esc(current_profile.label()),
       profile_options,
-      if npc_loop.running { "Executor Running" } else { "OFF" },
+      esc(npc_loop.agent_mode.state_label()),
       esc(&npc_loop.last_action),
       esc(&npc_loop.execution_result),
       esc(&npc_loop.timestamp),
@@ -2288,6 +2389,43 @@ mod tests {
             r.contains("faster decisions") || r.contains("small balances"),
             "Micro-test label must appear in the profile description"
         );
+    }
+
+    // ── Agent Control Panel ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_agent_control_card_visible_on_events() {
+        let state = make_state();
+        let r = page_events(&state, "").await;
+        assert!(r.contains("Agent Control"), "Events page must show Agent Control card");
+        assert!(r.contains("/agent/mode"), "Events page must include /agent/mode form action");
+        assert!(r.contains("Turn Agent ON") || r.contains("Pause Agent") || r.contains("Resume Agent"),
+            "Events page must show primary CTA button");
+    }
+
+    #[tokio::test]
+    async fn test_agent_status_json_returns_json() {
+        let state = make_state();
+        let r = agent_status_json(&state).await;
+        assert!(r.contains("application/json"), "agent_status must return JSON content-type");
+        assert!(r.contains("\"mode\""), "JSON must contain mode field");
+        assert!(r.contains("\"cycle_count\""), "JSON must contain cycle_count field");
+    }
+
+    #[tokio::test]
+    async fn test_agent_mode_off_shows_turn_on_cta() {
+        let state = make_state();
+        // Default mode is off (enabled=false in make_state TradeAgentConfig).
+        let r = page_events(&state, "").await;
+        assert!(r.contains("Turn Agent ON"), "OFF mode must show 'Turn Agent ON' CTA");
+    }
+
+    #[tokio::test]
+    async fn test_agent_mode_label_no_idle() {
+        // "Idle" must not appear anywhere on the events page.
+        let state = make_state();
+        let r = page_events(&state, "").await;
+        assert!(!r.contains(">Idle<"), "Page must not display raw 'Idle' state");
     }
 
 }
