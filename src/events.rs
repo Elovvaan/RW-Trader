@@ -288,10 +288,15 @@ pub struct ReconcileMismatchPayload {
 }
 
 /// Summary of a single fill discovered during reconciliation.
+///
+/// Note: `qty` is the raw exchange-reported fill quantity. It is not necessarily
+/// the same as the effective quantity applied to the rebuilt position after fee
+/// handling (for example, when BUY commission is charged in the base asset).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FillDetail {
     pub fill_id: i64,
     pub side:    String,
+    /// Raw exchange-reported fill quantity, before any fee-based position adjustment.
     pub qty:     f64,
     pub price:   f64,
 }
@@ -303,7 +308,7 @@ pub struct ReconcileAppliedPayload {
     pub cycle:       u64,
     /// Number of new fills processed.
     pub fills_count: usize,
-    /// Per-fill detail (side, qty, price) for each new fill discovered.
+    /// Per-fill summary (side, raw exchange qty, price) for each new fill discovered.
     pub fills:       Vec<FillDetail>,
 }
 
