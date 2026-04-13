@@ -607,18 +607,20 @@ fn qparam<'a>(query: &'a str, key: &str) -> Option<&'a str> {
 }
 
 fn flash_banner(query: &str) -> String {
-    let ok = qparam(query, "ok").unwrap_or_default();
-    let err = qparam(query, "err").unwrap_or_default();
+    let ok_raw  = qparam(query, "ok").unwrap_or_default();
+    let err_raw = qparam(query, "err").unwrap_or_default();
+    let ok  = url_decode(ok_raw);
+    let err = url_decode(err_raw);
     if !err.is_empty() {
         return format!(
             "<div class='callout err' style='margin-bottom:10px'><p>{}</p></div>",
-            esc(err)
+            esc(&err)
         );
     }
     if !ok.is_empty() {
         return format!(
             "<div class='callout ok' style='margin-bottom:10px'><p>{}</p></div>",
-            esc(ok)
+            esc(&ok)
         );
     }
     String::new()
@@ -706,8 +708,16 @@ async fn agent_status_json(state: &AppState) -> String {
     let last_decision = snap.last_agent_decision.replace('"', "\\\"");
     let no_trade_reason = snap.last_no_trade_reason.replace('"', "\\\"");
     let pipeline = snap.pipeline_state.replace('"', "\\\"");
+    let final_decision = snap.final_decision.replace('"', "\\\"");
+    let balance_block = snap.balance_block_reason.replace('"', "\\\"");
+    let risk_block = snap.risk_block_reason.replace('"', "\\\"");
+    let exec_block = snap.execution_block_reason.replace('"', "\\\"");
     let body = format!(
-        r#"{{"mode":"{mode_str}","state":"{state_label}","agent_state":"{status_str}","last_action":"{last_action}","last_reason":"{last_reason}","last_agent_decision":"{last_decision}","last_no_trade_reason":"{no_trade_reason}","pipeline_state":"{pipeline}","cycle_count":{cycle_count},"running":{running}}}"#,
+        r#"{{"mode":"{mode_str}","state":"{state_label}","agent_state":"{status_str}","last_action":"{last_action}","last_reason":"{last_reason}","last_agent_decision":"{last_decision}","last_no_trade_reason":"{no_trade_reason}","pipeline_state":"{pipeline}","final_decision":"{final_decision}","balance_block_reason":"{balance_block}","risk_block_reason":"{risk_block}","execution_block_reason":"{exec_block}","current_equity":{current_equity},"peak_equity":{peak_equity},"drawdown_pct":{drawdown_pct},"drawdown_limit":{drawdown_limit},"cycle_count":{cycle_count},"running":{running}}}"#,
+        current_equity  = snap.current_equity,
+        peak_equity     = snap.peak_equity,
+        drawdown_pct    = snap.drawdown_pct,
+        drawdown_limit  = snap.drawdown_limit,
         cycle_count = snap.cycle_count,
         running     = snap.running,
     );
@@ -1043,12 +1053,17 @@ async fn page_events(state: &AppState, query: &str) -> String {
         "BUY UNAVAILABLE — No USDT balance".to_string()
     };
     let risk_status = if kill { "Risk checks paused" } else { "Risk checks passed" };
-    let signal_label = if sell_ready {
-        "SELL AVAILABLE"
+
+    // Balance-side availability is separate from strategy/risk recommendation.
+    // signal_label reflects balance availability only; agent decision is shown separately.
+    let signal_label = if sell_ready && buy_ready {
+        "SELL + BUY BALANCE READY"
+    } else if sell_ready {
+        "SELL BALANCE READY"
     } else if buy_ready {
-        "BUY AVAILABLE"
+        "BUY BALANCE READY"
     } else {
-        "HOLD"
+        "NO BALANCE"
     };
     let signal_class = if sell_ready {
         "state-ready-sell"
@@ -1057,13 +1072,23 @@ async fn page_events(state: &AppState, query: &str) -> String {
     } else {
         "state-wait"
     };
-    let waiting_for = if sell_ready {
-        "Inventory available to reduce exposure quickly."
+    let waiting_for = if sell_ready && buy_ready {
+        "Both sides funded. Agent decision and risk approval determine if an order is placed."
+    } else if sell_ready {
+        "Inventory available. BUY requires USDT funding."
     } else if buy_ready {
-        "USDT available to add exposure when signal aligns."
+        "USDT available. SELL requires base-asset inventory."
     } else {
         "No immediate inventory edge; wait for funding or new signal."
     };
+    // Whether the agent is actively blocking execution (AUTO mode, last cycle didn't trade).
+    let agent_blocking = npc_loop.agent_mode == crate::npc::AgentMode::Auto
+        && !npc_loop.last_no_trade_reason.is_empty();
+    // Buttons enabled when balance is available AND agent is not blocking (or not in AUTO).
+    let buy_btn_enabled = buy_ready
+        && !(npc_loop.agent_mode == crate::npc::AgentMode::Auto && agent_blocking);
+    let sell_btn_enabled = sell_ready
+        && !(npc_loop.agent_mode == crate::npc::AgentMode::Auto && agent_blocking);
     let usable_balance_usd = buy_power + (sell_inventory * latest_mid);
     let inventory_value_usd = sell_inventory * latest_mid;
     // Profile banner — shown prominently on LIVE page.
@@ -1121,15 +1146,19 @@ async fn page_events(state: &AppState, query: &str) -> String {
         esc(&balance_note)
     );
 
-    let buy_btn_attrs = if buy_ready {
+    let buy_btn_attrs = if buy_btn_enabled {
         ""
-    } else {
+    } else if !buy_ready {
         " disabled title='BUY UNAVAILABLE — No USDT balance'"
-    };
-    let sell_btn_attrs = if sell_ready {
-        ""
     } else {
+        " disabled title='BUY possible from quote balance, but agent is blocking execution'"
+    };
+    let sell_btn_attrs = if sell_btn_enabled {
+        ""
+    } else if !sell_ready {
         " disabled title='SELL UNAVAILABLE — No base inventory available'"
+    } else {
+        " disabled title='SELL possible from inventory, but agent is blocking execution'"
     };
     let sparkline = sparkline(&market_ticks.iter().rev().copied().collect::<Vec<_>>());
 
@@ -1176,7 +1205,7 @@ async fn page_events(state: &AppState, query: &str) -> String {
         format!("<span style='color:{}'>{}</span>", color, esc(label))
     };
 
-    // SELL_AVAILABLE but no trade diagnostic banner
+    // SELL balance available but agent blocking — diagnostic banner
     let sell_blocked_banner = if sell_ready
         && agent_mode == crate::npc::AgentMode::Auto
         && matches!(exec_state, crate::executor::ExecutionState::Idle)
@@ -1185,13 +1214,60 @@ async fn page_events(state: &AppState, query: &str) -> String {
         format!(
             "<div style='margin-top:8px;padding:8px 10px;background:rgba(239,68,68,.10);\
              border:1px solid rgba(239,68,68,.35);border-radius:10px;font-size:11px'>\
-             <span style='color:#ef4444;font-weight:700'>⚠ SELL AVAILABLE — order not submitted</span>\
+             <span style='color:#ef4444;font-weight:700'>⚠ SELL possible from inventory, but agent is blocking execution</span>\
              <div style='margin-top:4px;color:#d0d6dd'>{}</div>\
              </div>",
             esc(&npc_loop.last_no_trade_reason)
         )
     } else {
         String::new()
+    };
+    // BUY balance available but agent blocking — diagnostic banner
+    let buy_blocked_banner = if buy_ready
+        && agent_mode == crate::npc::AgentMode::Auto
+        && matches!(exec_state, crate::executor::ExecutionState::Idle)
+        && !npc_loop.last_no_trade_reason.is_empty()
+    {
+        format!(
+            "<div style='margin-top:8px;padding:8px 10px;background:rgba(240,185,11,.10);\
+             border:1px solid rgba(240,185,11,.35);border-radius:10px;font-size:11px'>\
+             <span style='color:#f0b90b;font-weight:700'>⚠ BUY possible from quote balance, but agent is blocking execution</span>\
+             <div style='margin-top:4px;color:#d0d6dd'>{}</div>\
+             </div>",
+            esc(&npc_loop.last_no_trade_reason)
+        )
+    } else {
+        String::new()
+    };
+    // Decision transparency: show per-category block reasons when available
+    let decision_transparency = {
+        let final_dec = esc(&npc_loop.final_decision);
+        let bal_block = esc(&npc_loop.balance_block_reason);
+        let risk_block = esc(&npc_loop.risk_block_reason);
+        let exec_block = esc(&npc_loop.execution_block_reason);
+        let dd_info = if npc_loop.peak_equity > 0.0 {
+            format!(
+                "equity={:.4} peak={:.4} drawdown={:.1}% limit={:.1}%",
+                npc_loop.current_equity,
+                npc_loop.peak_equity,
+                npc_loop.drawdown_pct * 100.0,
+                npc_loop.drawdown_limit * 100.0,
+            )
+        } else {
+            "no equity history yet".to_string()
+        };
+        format!(
+            "<div style='display:grid;grid-template-columns:repeat(2,1fr);gap:6px;margin-top:6px;font-size:11px'>\
+               <div><span class='dim'>Final decision: </span>{final_dec}</div>\
+               <div><span class='dim'>Drawdown: </span>{dd_info}</div>\
+               <div style='grid-column:1/-1'><span class='dim'>Balance block: </span>{}</div>\
+               <div style='grid-column:1/-1'><span class='dim'>Risk block: </span>{}</div>\
+               <div style='grid-column:1/-1'><span class='dim'>Execution block: </span>{}</div>\
+             </div>",
+            if bal_block.is_empty() { "—".to_string() } else { bal_block },
+            if risk_block.is_empty() { "—".to_string() } else { risk_block },
+            if exec_block.is_empty() { "—".to_string() } else { exec_block },
+        )
     };
 
     let agent_control_card = format!(
@@ -1209,6 +1285,8 @@ async fn page_events(state: &AppState, query: &str) -> String {
              <div style='grid-column:1/-1'><span class='dim'>No-trade reason: </span>{no_trade_reason}</div>\
            </div>\
            {sell_blocked_banner}\
+           {buy_blocked_banner}\
+           <details style='margin-top:6px'><summary class='dim' style='cursor:pointer;font-size:11px'>Decision transparency</summary>{decision_transparency}</details>\
            <div style='display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:10px'>\
              <form method='post' action='/agent/mode'><input type='hidden' name='mode' value='off'>\
                <button type='submit' style='width:100%;padding:9px 4px;border-radius:10px;border:1px solid rgba(130,144,159,.3);background:{off_bg};color:{off_fg};font-weight:600;font-size:11px;cursor:pointer'>OFF</button></form>\
@@ -1239,6 +1317,27 @@ async fn page_events(state: &AppState, query: &str) -> String {
         pause_bg  = if agent_mode == crate::npc::AgentMode::Pause { "rgba(240,185,11,.22)" } else { "transparent" },
         pause_fg  = if agent_mode == crate::npc::AgentMode::Pause { "#f0b90b" }              else { "#82909f" },
     );
+    // Compose the disabled-note: only claim "fully executable" when balance exists AND agent is not blocking.
+    let disabled_note = if buy_btn_enabled && sell_btn_enabled {
+        "Both BUY and SELL pass balance and agent checks.".to_string()
+    } else if buy_btn_enabled && !sell_btn_enabled {
+        if sell_ready {
+            "SELL possible from inventory, but agent is blocking execution.".to_string()
+        } else {
+            "SELL disabled — no base inventory ready.".to_string()
+        }
+    } else if sell_btn_enabled && !buy_btn_enabled {
+        if buy_ready {
+            "BUY possible from quote balance, but agent is blocking execution.".to_string()
+        } else {
+            "BUY disabled — No USDT balance available.".to_string()
+        }
+    } else {
+        // Both disabled
+        let buy_note = if buy_ready { "BUY blocked by agent." } else { "BUY disabled — No USDT balance." };
+        let sell_note = if sell_ready { "SELL blocked by agent." } else { "SELL disabled — No base inventory." };
+        format!("{} {}", buy_note, sell_note)
+    };
     let primary_body = format!(
         "<div class='hero-grid'>\
            <div class='market-header'>\
@@ -1290,15 +1389,7 @@ async fn page_events(state: &AppState, query: &str) -> String {
         waiting_for,
         buy_btn_attrs,
         sell_btn_attrs,
-        if buy_ready && sell_ready {
-            "Both BUY and SELL are executable now."
-        } else if buy_ready {
-            "SELL disabled — no base inventory ready."
-        } else if sell_ready {
-            "BUY disabled — No USDT balance available."
-        } else {
-            "BUY disabled — No USDT balance. SELL disabled — No base inventory."
-        },
+        esc(&disabled_note),
         esc(&buy_state),
         esc(&sell_state),
     );
@@ -2484,6 +2575,154 @@ mod tests {
         let state = make_state();
         let r = page_events(&state, "").await;
         assert!(!r.contains(">Idle<"), "Page must not display raw 'Idle' state");
+    }
+
+    // ── Flash banner URL decode ────────────────────────────────────────────────
+
+    #[test]
+    fn test_flash_banner_decodes_percent_encoded_ok() {
+        // "Agent mode set to AUTO." is URL-encoded as "Agent+mode+set+to+AUTO."
+        // or "Agent%20mode%20set%20to%20AUTO."
+        let banner = flash_banner("ok=Agent%20mode%20set%20to%20AUTO.");
+        assert!(
+            banner.contains("Agent mode set to AUTO."),
+            "ok flash banner must URL-decode the message; got: {banner}"
+        );
+        assert!(!banner.contains("%20"), "Banner must not contain raw percent-encoding");
+    }
+
+    #[test]
+    fn test_flash_banner_decodes_plus_as_space() {
+        let banner = flash_banner("ok=Agent+mode+set+to+AUTO.");
+        assert!(
+            banner.contains("Agent mode set to AUTO."),
+            "ok flash banner must decode '+' as space; got: {banner}"
+        );
+    }
+
+    #[test]
+    fn test_flash_banner_decodes_err_param() {
+        let banner = flash_banner("err=Risk%20check%20failed%3A%20spread%20too%20wide");
+        assert!(
+            banner.contains("Risk check failed: spread too wide"),
+            "err flash banner must URL-decode the message; got: {banner}"
+        );
+        assert!(!banner.contains("%20"), "Banner must not contain raw percent-encoding");
+        assert!(banner.contains("callout err"), "Must use error callout style");
+    }
+
+    #[test]
+    fn test_flash_banner_empty_when_no_params() {
+        assert!(flash_banner("").is_empty(), "Empty query must produce empty banner");
+        assert!(flash_banner("other=value").is_empty(), "Unrelated params must produce empty banner");
+    }
+
+    // ── Balance available but blocked by agent ────────────────────────────────
+
+    #[tokio::test]
+    async fn test_events_sell_balance_available_but_agent_blocking() {
+        let state = make_state();
+        // Set sell inventory so balance is available.
+        {
+            let mut truth = state.truth.lock().await;
+            truth.sell_inventory = 0.001;
+        }
+        // Put agent in AUTO mode and inject a no-trade reason (simulating agent blocking).
+        state.npc.set_agent_mode(crate::npc::AgentMode::Auto).await;
+        state.npc.set_no_trade_reason_for_test("SCORE_BELOW_THRESHOLD").await;
+        let r = page_events(&state, "").await;
+        // SELL button must be disabled since agent is blocking.
+        assert!(
+            r.contains("SELL possible from inventory, but agent is blocking execution")
+            || (r.contains("SELL") && r.contains("blocking")),
+            "Must show SELL blocked by agent message; got page containing: sell_blocked_banner"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_events_buy_balance_available_but_agent_blocking() {
+        let state = make_state();
+        // Set buy power so balance is available.
+        {
+            let mut truth = state.truth.lock().await;
+            truth.buy_power = 100.0;
+        }
+        // Put agent in AUTO mode and inject a no-trade reason.
+        state.npc.set_agent_mode(crate::npc::AgentMode::Auto).await;
+        state.npc.set_no_trade_reason_for_test("Signal score 0.05 below minimum threshold 0.10").await;
+        let r = page_events(&state, "").await;
+        assert!(
+            r.contains("BUY possible from quote balance, but agent is blocking execution")
+            || (r.contains("BUY") && r.contains("blocking")),
+            "Must show BUY blocked by agent message"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_events_true_executable_state_no_blocking_message() {
+        let state = make_state();
+        // Set both sides funded.
+        {
+            let mut truth = state.truth.lock().await;
+            truth.buy_power = 200.0;
+            truth.sell_inventory = 0.002;
+        }
+        // Agent in AUTO, no blocking reason (last cycle traded successfully).
+        state.npc.set_agent_mode(crate::npc::AgentMode::Auto).await;
+        // Do NOT inject a no-trade reason — telemetry.last_no_trade_reason stays empty.
+        let r = page_events(&state, "").await;
+        // Should NOT show the blocking messages.
+        assert!(
+            !r.contains("but agent is blocking execution"),
+            "When agent is not blocking, must not show blocking message"
+        );
+        // Disabled-note should reflect that both sides are enabled.
+        assert!(
+            r.contains("pass balance and agent checks") || r.contains("Both BUY"),
+            "Disabled note must reflect both sides pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_events_buy_disabled_no_balance() {
+        let state = make_state();
+        // No buy power, no sell inventory.
+        let r = page_events(&state, "").await;
+        assert!(
+            r.contains("No USDT balance") || r.contains("disabled") || r.contains("UNAVAILABLE"),
+            "Must indicate BUY is unavailable when no USDT balance"
+        );
+    }
+
+    // ── Small-account drawdown initialization ─────────────────────────────────
+
+    #[tokio::test]
+    async fn test_agent_status_json_drawdown_fields_present() {
+        let state = make_state();
+        let r = agent_status_json(&state).await;
+        assert!(r.contains("\"current_equity\""), "JSON must contain current_equity");
+        assert!(r.contains("\"peak_equity\""), "JSON must contain peak_equity");
+        assert!(r.contains("\"drawdown_pct\""), "JSON must contain drawdown_pct");
+        assert!(r.contains("\"drawdown_limit\""), "JSON must contain drawdown_limit");
+    }
+
+    #[tokio::test]
+    async fn test_agent_status_json_decision_transparency_fields() {
+        let state = make_state();
+        let r = agent_status_json(&state).await;
+        assert!(r.contains("\"final_decision\""), "JSON must contain final_decision");
+        assert!(r.contains("\"balance_block_reason\""), "JSON must contain balance_block_reason");
+        assert!(r.contains("\"risk_block_reason\""), "JSON must contain risk_block_reason");
+        assert!(r.contains("\"execution_block_reason\""), "JSON must contain execution_block_reason");
+    }
+
+    #[tokio::test]
+    async fn test_events_shows_decision_transparency_section() {
+        let state = make_state();
+        let r = page_events(&state, "").await;
+        assert!(r.contains("Decision transparency"), "Events page must show decision transparency section");
+        assert!(r.contains("Final decision") || r.contains("final_decision") || r.contains("Drawdown"),
+            "Events page must show decision fields");
     }
 
 }
