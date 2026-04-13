@@ -713,13 +713,15 @@ async fn agent_status_json(state: &AppState) -> String {
     let risk_block = snap.risk_block_reason.replace('"', "\\\"");
     let exec_block = snap.execution_block_reason.replace('"', "\\\"");
     let body = format!(
-        r#"{{"mode":"{mode_str}","state":"{state_label}","agent_state":"{status_str}","last_action":"{last_action}","last_reason":"{last_reason}","last_agent_decision":"{last_decision}","last_no_trade_reason":"{no_trade_reason}","pipeline_state":"{pipeline}","final_decision":"{final_decision}","balance_block_reason":"{balance_block}","risk_block_reason":"{risk_block}","execution_block_reason":"{exec_block}","current_equity":{current_equity},"peak_equity":{peak_equity},"drawdown_pct":{drawdown_pct},"drawdown_limit":{drawdown_limit},"cycle_count":{cycle_count},"running":{running}}}"#,
+        r#"{{"mode":"{mode_str}","state":"{state_label}","agent_state":"{status_str}","last_action":"{last_action}","last_reason":"{last_reason}","last_agent_decision":"{last_decision}","last_no_trade_reason":"{no_trade_reason}","pipeline_state":"{pipeline}","final_decision":"{final_decision}","balance_block_reason":"{balance_block}","risk_block_reason":"{risk_block}","execution_block_reason":"{exec_block}","current_equity":{current_equity},"peak_equity":{peak_equity},"drawdown_pct":{drawdown_pct},"drawdown_limit":{drawdown_limit},"cycle_count":{cycle_count},"running":{running},"cooldown_active":{cooldown_active},"cooldown_remaining_ms":{cooldown_remaining_ms}}}"#,
         current_equity  = snap.current_equity,
         peak_equity     = snap.peak_equity,
         drawdown_pct    = snap.drawdown_pct,
         drawdown_limit  = snap.drawdown_limit,
         cycle_count = snap.cycle_count,
         running     = snap.running,
+        cooldown_active       = snap.cooldown_active,
+        cooldown_remaining_ms = snap.cooldown_remaining_ms,
     );
     json_resp(&body)
 }
@@ -1209,16 +1211,28 @@ async fn page_events(state: &AppState, query: &str) -> String {
     let sell_blocked_banner = if sell_ready
         && agent_mode == crate::npc::AgentMode::Auto
         && matches!(exec_state, crate::executor::ExecutionState::Idle)
-        && !npc_loop.last_no_trade_reason.is_empty()
     {
-        format!(
-            "<div style='margin-top:8px;padding:8px 10px;background:rgba(239,68,68,.10);\
-             border:1px solid rgba(239,68,68,.35);border-radius:10px;font-size:11px'>\
-             <span style='color:#ef4444;font-weight:700'>⚠ SELL possible from inventory, but agent is blocking execution</span>\
-             <div style='margin-top:4px;color:#d0d6dd'>{}</div>\
-             </div>",
-            esc(&npc_loop.last_no_trade_reason)
-        )
+        if npc_loop.cooldown_active && npc_loop.cooldown_remaining_ms > 0 {
+            format!(
+                "<div style='margin-top:8px;padding:8px 10px;background:rgba(240,185,11,.10);\
+                 border:1px solid rgba(240,185,11,.35);border-radius:10px;font-size:11px'>\
+                 <span style='color:#f0b90b;font-weight:700'>⏳ Cooldown active ({} ms remaining)</span>\
+                 <div style='margin-top:4px;color:#d0d6dd'>Per-role cooldown in effect. Execution resumes automatically.</div>\
+                 </div>",
+                npc_loop.cooldown_remaining_ms
+            )
+        } else if !npc_loop.last_no_trade_reason.is_empty() {
+            format!(
+                "<div style='margin-top:8px;padding:8px 10px;background:rgba(239,68,68,.10);\
+                 border:1px solid rgba(239,68,68,.35);border-radius:10px;font-size:11px'>\
+                 <span style='color:#ef4444;font-weight:700'>⚠ SELL possible from inventory, but agent is blocking execution</span>\
+                 <div style='margin-top:4px;color:#d0d6dd'>{}</div>\
+                 </div>",
+                esc(&npc_loop.last_no_trade_reason)
+            )
+        } else {
+            String::new()
+        }
     } else {
         String::new()
     };
@@ -1226,16 +1240,28 @@ async fn page_events(state: &AppState, query: &str) -> String {
     let buy_blocked_banner = if buy_ready
         && agent_mode == crate::npc::AgentMode::Auto
         && matches!(exec_state, crate::executor::ExecutionState::Idle)
-        && !npc_loop.last_no_trade_reason.is_empty()
     {
-        format!(
-            "<div style='margin-top:8px;padding:8px 10px;background:rgba(240,185,11,.10);\
-             border:1px solid rgba(240,185,11,.35);border-radius:10px;font-size:11px'>\
-             <span style='color:#f0b90b;font-weight:700'>⚠ BUY possible from quote balance, but agent is blocking execution</span>\
-             <div style='margin-top:4px;color:#d0d6dd'>{}</div>\
-             </div>",
-            esc(&npc_loop.last_no_trade_reason)
-        )
+        if npc_loop.cooldown_active && npc_loop.cooldown_remaining_ms > 0 {
+            format!(
+                "<div style='margin-top:8px;padding:8px 10px;background:rgba(240,185,11,.10);\
+                 border:1px solid rgba(240,185,11,.35);border-radius:10px;font-size:11px'>\
+                 <span style='color:#f0b90b;font-weight:700'>⏳ Cooldown active ({} ms remaining)</span>\
+                 <div style='margin-top:4px;color:#d0d6dd'>Per-role cooldown in effect. Execution resumes automatically.</div>\
+                 </div>",
+                npc_loop.cooldown_remaining_ms
+            )
+        } else if !npc_loop.last_no_trade_reason.is_empty() {
+            format!(
+                "<div style='margin-top:8px;padding:8px 10px;background:rgba(240,185,11,.10);\
+                 border:1px solid rgba(240,185,11,.35);border-radius:10px;font-size:11px'>\
+                 <span style='color:#f0b90b;font-weight:700'>⚠ BUY possible from quote balance, but agent is blocking execution</span>\
+                 <div style='margin-top:4px;color:#d0d6dd'>{}</div>\
+                 </div>",
+                esc(&npc_loop.last_no_trade_reason)
+            )
+        } else {
+            String::new()
+        }
     } else {
         String::new()
     };
@@ -1256,10 +1282,16 @@ async fn page_events(state: &AppState, query: &str) -> String {
         } else {
             "no equity history yet".to_string()
         };
+        let cooldown_info = if npc_loop.cooldown_active {
+            format!("active — {}ms remaining", npc_loop.cooldown_remaining_ms)
+        } else {
+            "inactive".to_string()
+        };
         format!(
             "<div style='display:grid;grid-template-columns:repeat(2,1fr);gap:6px;margin-top:6px;font-size:11px'>\
                <div><span class='dim'>Final decision: </span>{final_dec}</div>\
                <div><span class='dim'>Drawdown: </span>{dd_info}</div>\
+               <div><span class='dim'>Cooldown: </span>{cooldown_info}</div>\
                <div style='grid-column:1/-1'><span class='dim'>Balance block: </span>{}</div>\
                <div style='grid-column:1/-1'><span class='dim'>Risk block: </span>{}</div>\
                <div style='grid-column:1/-1'><span class='dim'>Execution block: </span>{}</div>\
@@ -2714,6 +2746,26 @@ mod tests {
         assert!(r.contains("\"balance_block_reason\""), "JSON must contain balance_block_reason");
         assert!(r.contains("\"risk_block_reason\""), "JSON must contain risk_block_reason");
         assert!(r.contains("\"execution_block_reason\""), "JSON must contain execution_block_reason");
+        assert!(r.contains("\"cooldown_active\""), "JSON must contain cooldown_active");
+        assert!(r.contains("\"cooldown_remaining_ms\""), "JSON must contain cooldown_remaining_ms");
+    }
+
+    #[tokio::test]
+    async fn test_events_cooldown_banner_shown_when_active() {
+        let state = make_state();
+        // Set sell inventory so balance is available.
+        {
+            let mut truth = state.truth.lock().await;
+            truth.sell_inventory = 0.001;
+        }
+        // Inject cooldown state directly into telemetry.
+        state.npc.set_agent_mode(crate::npc::AgentMode::Auto).await;
+        state.npc.set_cooldown_for_test(true, 1500).await;
+        let r = page_events(&state, "").await;
+        assert!(
+            r.contains("Cooldown active") && r.contains("1500"),
+            "Must show cooldown banner with remaining ms; got page containing cooldown info"
+        );
     }
 
     #[tokio::test]
@@ -2723,6 +2775,7 @@ mod tests {
         assert!(r.contains("Decision transparency"), "Events page must show decision transparency section");
         assert!(r.contains("Final decision") || r.contains("final_decision") || r.contains("Drawdown"),
             "Events page must show decision fields");
+        assert!(r.contains("Cooldown"), "Events page decision transparency must show cooldown status");
     }
 
 }
