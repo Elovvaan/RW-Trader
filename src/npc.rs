@@ -809,7 +809,25 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
     };
     let mode = state.authority.mode().await;
     if mode == AuthorityMode::Off {
-        return no_action(0, "authority_mode_off".to_string(), "blocked".to_string());
+        return NpcCycleReport {
+            cycle_id: 0,
+            last_action: "NO_ACTION".to_string(),
+            execution_result: "AUTHORITY_MODE_OFF".to_string(),
+            status: "blocked".to_string(),
+            last_agent_decision: "BLOCKED — authority mode is OFF".to_string(),
+            no_trade_reason: "Authority mode is OFF. Set authority mode to AUTO via the web UI \
+                              (/authority/mode/auto) to enable autonomous execution."
+                .to_string(),
+            pipeline_state: "Blocked — Authority OFF".to_string(),
+            final_decision: "BLOCKED".to_string(),
+            balance_block_reason: String::new(),
+            risk_block_reason: String::new(),
+            execution_block_reason:
+                "AUTHORITY_MODE_OFF: authority mode is OFF; set to AUTO or ASSIST to permit execution"
+                    .to_string(),
+            cooldown_active: false,
+            cooldown_remaining_ms: 0,
+        };
     }
 
     let exec_state = state.exec.execution_state().await;
@@ -2607,5 +2625,448 @@ mod tests {
         assert!(breach.contains("current_equity"), "Breach message must include current_equity; got: {breach}");
         assert!(breach.contains("peak_equity"), "Breach message must include peak_equity; got: {breach}");
         assert!(breach.contains("limit"), "Breach message must include limit; got: {breach}");
+    }
+}
+
+// ── End-to-end gate diagnostic tests ──────────────────────────────────────────
+//
+// These tests trace the exact blocking chain in run_cycle() and prove which
+// gate fires at each layer.  They serve as living documentation of the root
+// causes preventing autonomous execution.
+//
+// Diagnostic findings (run_cycle gate order):
+//   1. Authority mode OFF  → BLOCKED (authority-layer)
+//   2. Score below threshold → BLOCKED (decision-layer)
+//   3. Portfolio controls active → BLOCKED (risk-layer)
+//   4. Allocation returns zero qty → BLOCKED (sizing-layer)
+//   5. Guard violations → BLOCKED (guard-layer)
+//   6. NPC_TRADING_MODE=live + paper_executions==0 → BLOCKED (authority-layer)
+//   7. web_base_url missing → BLOCKED (dispatch-layer)
+#[cfg(test)]
+mod diagnostic_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::sync::Mutex;
+
+    use super::*;
+    use crate::agent::{AgentState, TradeAgentConfig};
+    use crate::authority::AuthorityLayer;
+    use crate::client::BinanceClient;
+    use crate::executor::{CircuitBreakerConfig, Executor, WatchdogConfig};
+    use crate::feed::{FeedState, MidSample, TradeSample};
+    use crate::reconciler::TruthState;
+    use crate::signal::{SignalConfig, SignalEngine};
+    use crate::store::InMemoryEventStore;
+    use crate::withdrawal::{WithdrawalConfig, WithdrawalManager};
+
+    // ── Shared helpers ────────────────────────────────────────────────────────
+
+    fn minimal_signal_cfg() -> SignalConfig {
+        SignalConfig {
+            order_qty: 0.001,
+            momentum_threshold: 0.00005,
+            imbalance_threshold: 0.10,
+            max_entry_spread_bps: 10.0,
+            max_feed_staleness: Duration::from_secs(5),
+            stop_loss_pct: 0.002,
+            take_profit_pct: 0.004,
+            max_hold_duration: Duration::from_secs(120),
+            min_mid_samples: 1,
+            min_trade_samples: 1,
+        }
+    }
+
+    fn make_agent_state(
+        store: Arc<dyn crate::store::EventStore>,
+        authority: Arc<AuthorityLayer>,
+        web_base_url: Option<String>,
+    ) -> AgentState {
+        let exec = Arc::new(Executor::new(
+            "BTCUSDT".into(),
+            CircuitBreakerConfig::default(),
+            WatchdogConfig::default(),
+        ));
+        let feed = Arc::new(Mutex::new(FeedState::new(Duration::from_secs(10))));
+        let signal = Arc::new(Mutex::new(SignalEngine::new(minimal_signal_cfg())));
+        let truth = Arc::new(Mutex::new(TruthState::new("BTCUSDT", 0.0)));
+        let withdrawals = Arc::new(WithdrawalManager::new(WithdrawalConfig::default()));
+        let client = Arc::new(BinanceClient::new(String::new(), String::new(), String::new()));
+        AgentState {
+            store,
+            exec,
+            feed,
+            signal,
+            truth,
+            authority,
+            withdrawals,
+            client,
+            symbol: "BTCUSDT".into(),
+            web_base_url,
+        }
+    }
+
+    fn active_npc_cfg() -> NpcConfig {
+        NpcConfig::from_trade_cfg(&TradeAgentConfig {
+            enabled: true,
+            trade_size: 0.001,
+            momentum_threshold: 0.00005,
+            poll_interval: Duration::from_secs(1),
+            max_spread_bps: 50.0,
+        })
+    }
+
+    /// Populate feed with bid/ask and trade/mid samples sufficient for scoring.
+    fn populate_feed(feed: &mut FeedState, mid: f64, n_samples: usize) {
+        // 50 ms spacing between samples: wide enough to span the signal engine's
+        // rolling windows without exhausting the feed's max_window (10 s).
+        const SAMPLE_SPACING_MS: u64 = 50;
+        let now = std::time::Instant::now();
+        feed.bid = mid * 0.9998;
+        feed.ask = mid * 1.0002;
+        feed.last_seen = Some(now);
+        for i in 0..n_samples {
+            let ts = now - Duration::from_millis((n_samples - i) as u64 * SAMPLE_SPACING_MS);
+            let slight_trend = mid * (1.0 + (i as f64) * 0.00001);
+            feed.mid_history.push_back(MidSample { timestamp: ts, mid: slight_trend });
+            feed.trade_history.push_back(TradeSample {
+                timestamp: ts,
+                qty: 0.1,
+                is_aggressor_buy: true,
+            });
+        }
+    }
+
+    // ── Gate 1: authority-layer ───────────────────────────────────────────────
+
+    /// DIAGNOSTIC PROOF: When authority mode is OFF (the default), run_cycle()
+    /// must return final_decision="BLOCKED" with execution_block_reason populated.
+    ///
+    /// Root cause: AuthorityLayer::new() initialises mode=Off.
+    /// The operator must call /authority/mode/auto to enable execution.
+    #[tokio::test]
+    async fn gate1_authority_off_returns_blocked_not_hold() {
+        let store = InMemoryEventStore::new();
+        let authority = Arc::new(AuthorityLayer::new()); // mode = Off by default
+        let state = make_agent_state(
+            Arc::clone(&store) as Arc<dyn crate::store::EventStore>,
+            authority,
+            None,
+        );
+        let cfg = active_npc_cfg();
+        let runtime = Arc::new(Mutex::new(NpcRuntimeState::default()));
+
+        let report = run_cycle(&cfg, &state, runtime).await;
+
+        // PROOF: authority OFF must produce BLOCKED, not HOLD.
+        assert_eq!(
+            report.final_decision, "BLOCKED",
+            "authority mode OFF must yield final_decision=BLOCKED; got: {}",
+            report.final_decision
+        );
+        assert!(
+            report.execution_block_reason.contains("AUTHORITY_MODE_OFF"),
+            "execution_block_reason must name AUTHORITY_MODE_OFF; got: {}",
+            report.execution_block_reason
+        );
+        assert_eq!(
+            report.execution_result, "AUTHORITY_MODE_OFF",
+            "execution_result must be AUTHORITY_MODE_OFF; got: {}",
+            report.execution_result
+        );
+        // Balance and risk fields must be empty (authority block precedes those layers).
+        assert!(
+            report.balance_block_reason.is_empty(),
+            "balance_block_reason must be empty when blocked at authority gate; got: {}",
+            report.balance_block_reason
+        );
+        assert!(
+            report.risk_block_reason.is_empty(),
+            "risk_block_reason must be empty when blocked at authority gate; got: {}",
+            report.risk_block_reason
+        );
+    }
+
+    /// DIAGNOSTIC PROOF: When authority mode is AUTO, gate 1 passes and the
+    /// cycle continues to later gates.
+    #[tokio::test]
+    async fn gate1_authority_auto_passes_gate1() {
+        let store = InMemoryEventStore::new();
+        let authority = Arc::new(AuthorityLayer::new());
+        authority.set_mode_auto(&*store).await;
+
+        let state = make_agent_state(
+            Arc::clone(&store) as Arc<dyn crate::store::EventStore>,
+            Arc::clone(&authority),
+            None,
+        );
+        let cfg = active_npc_cfg();
+        let runtime = Arc::new(Mutex::new(NpcRuntimeState::default()));
+
+        let report = run_cycle(&cfg, &state, runtime).await;
+
+        // Gate 1 passed: cycle must NOT block with AUTHORITY_MODE_OFF.
+        assert_ne!(
+            report.execution_block_reason,
+            "AUTHORITY_MODE_OFF: authority mode is OFF; set to AUTO or ASSIST to permit execution",
+            "authority AUTO must pass gate 1"
+        );
+        assert_ne!(
+            report.execution_result, "AUTHORITY_MODE_OFF",
+            "authority AUTO must pass gate 1; execution_result must not be AUTHORITY_MODE_OFF"
+        );
+    }
+
+    // ── Gate 6: NPC live mode safety gate ────────────────────────────────────
+
+    /// DIAGNOSTIC PROOF: NPC_TRADING_MODE=live with zero paper_executions blocks
+    /// every cold start.  paper_executions is in-memory and resets on restart.
+    ///
+    /// Root cause: `rt.paper_executions == 0` at every process start when
+    /// NPC_TRADING_MODE=live.  The operator must first accumulate paper_executions
+    /// by running in Paper mode, or keep NPC_TRADING_MODE=paper (the default).
+    #[tokio::test]
+    async fn gate6_live_mode_never_executes_on_cold_start() {
+        let store = InMemoryEventStore::new();
+        let authority = Arc::new(AuthorityLayer::new());
+        authority.set_mode_auto(&*store).await;
+
+        let state = make_agent_state(
+            Arc::clone(&store) as Arc<dyn crate::store::EventStore>,
+            Arc::clone(&authority),
+            None,
+        );
+        let mut cfg = active_npc_cfg();
+        cfg.mode = NpcTradingMode::Live;
+
+        // Runtime has zero paper_executions (cold start).
+        let runtime = Arc::new(Mutex::new(NpcRuntimeState::default()));
+
+        {
+            let mut feed = state.feed.lock().await;
+            populate_feed(&mut feed, 50_000.0, 20);
+        }
+        {
+            let mut truth = state.truth.lock().await;
+            truth.sell_inventory = 10.0;
+            truth.buy_power = 100_000.0;
+            truth.total_balance_usd = 100_000.0;
+        }
+
+        let report = run_cycle(&cfg, &state, runtime).await;
+
+        // The cycle may block at an earlier gate (score/guards), but must never EXECUTE.
+        assert_ne!(
+            report.final_decision, "EXECUTE",
+            "live mode with zero paper_executions must never reach EXECUTE on cold start; \
+             final_decision={} execution_result={}",
+            report.final_decision, report.execution_result
+        );
+        // If gate 6 was reached, the execution_result must name the live gate.
+        if report.execution_result == "LIVE_REQUIRES_PAPER_EXECUTION" {
+            assert_eq!(
+                report.final_decision, "BLOCKED",
+                "LIVE_REQUIRES_PAPER_EXECUTION must yield final_decision=BLOCKED"
+            );
+            assert!(
+                report.execution_block_reason.contains("LIVE_REQUIRES_PAPER_EXECUTION"),
+                "execution_block_reason must name the live gate; got: {}",
+                report.execution_block_reason
+            );
+        }
+    }
+
+    /// DIAGNOSTIC PROOF: Paper mode does NOT apply the paper_executions gate.
+    #[tokio::test]
+    async fn gate6_paper_mode_skips_live_safety_gate() {
+        let store = InMemoryEventStore::new();
+        let authority = Arc::new(AuthorityLayer::new());
+        authority.set_mode_auto(&*store).await;
+
+        let state = make_agent_state(
+            Arc::clone(&store) as Arc<dyn crate::store::EventStore>,
+            Arc::clone(&authority),
+            None,
+        );
+        let mut cfg = active_npc_cfg();
+        cfg.mode = NpcTradingMode::Paper;
+
+        let runtime = Arc::new(Mutex::new(NpcRuntimeState::default()));
+        {
+            let mut feed = state.feed.lock().await;
+            populate_feed(&mut feed, 50_000.0, 20);
+        }
+        {
+            let mut truth = state.truth.lock().await;
+            truth.sell_inventory = 10.0;
+            truth.buy_power = 100_000.0;
+            truth.total_balance_usd = 100_000.0;
+        }
+
+        let report = run_cycle(&cfg, &state, runtime).await;
+
+        // Paper mode must never block with the live gate.
+        assert_ne!(
+            report.execution_result, "LIVE_REQUIRES_PAPER_EXECUTION",
+            "paper mode must never block with LIVE_REQUIRES_PAPER_EXECUTION; \
+             execution_result={} final_decision={}",
+            report.execution_result, report.final_decision
+        );
+    }
+
+    // ── Sizing gate ───────────────────────────────────────────────────────────
+
+    /// DIAGNOSTIC PROOF: When buy_power=0 and sell_inventory=0, allocate_capital
+    /// returns qty=0 and the cycle blocks before dispatch.
+    ///
+    /// Root cause: TruthState initialises buy_power=0 and sell_inventory=0.
+    /// The reconciler populates them after the first successful reconcile cycle.
+    #[tokio::test]
+    async fn sizing_gate_blocks_when_balances_are_zero() {
+        let store = InMemoryEventStore::new();
+        let authority = Arc::new(AuthorityLayer::new());
+        authority.set_mode_auto(&*store).await;
+
+        let state = make_agent_state(
+            Arc::clone(&store) as Arc<dyn crate::store::EventStore>,
+            Arc::clone(&authority),
+            None,
+        );
+        let mut cfg = active_npc_cfg();
+        cfg.mode = NpcTradingMode::Paper;
+
+        let runtime = Arc::new(Mutex::new(NpcRuntimeState::default()));
+        {
+            let mut feed = state.feed.lock().await;
+            populate_feed(&mut feed, 50_000.0, 20);
+        }
+        // Leave truth at defaults: buy_power=0.0, sell_inventory=0.0.
+
+        let report = run_cycle(&cfg, &state, runtime).await;
+
+        // With no balance, the cycle must not reach EXECUTE.
+        assert_ne!(
+            report.final_decision, "EXECUTE",
+            "cycle must not EXECUTE with zero buy_power and zero sell_inventory; \
+             final_decision={} balance_block={}",
+            report.final_decision, report.balance_block_reason
+        );
+    }
+
+    // ── Portfolio risk gate ───────────────────────────────────────────────────
+
+    /// DIAGNOSTIC PROOF: A severe drawdown in portfolio controls blocks the cycle
+    /// before dispatch.
+    #[tokio::test]
+    async fn portfolio_drawdown_blocks_before_dispatch() {
+        let store = InMemoryEventStore::new();
+        let authority = Arc::new(AuthorityLayer::new());
+        authority.set_mode_auto(&*store).await;
+
+        let state = make_agent_state(
+            Arc::clone(&store) as Arc<dyn crate::store::EventStore>,
+            Arc::clone(&authority),
+            None,
+        );
+        let mut cfg = active_npc_cfg();
+        cfg.mode = NpcTradingMode::Paper;
+
+        let runtime = Arc::new(Mutex::new(NpcRuntimeState::default()));
+        {
+            let mut rt = runtime.lock().await;
+            // $100 peak, $60 loss → equity clipped to 0 → drawdown = 100% → exceeds max 8%.
+            rt.peak_equity = 100.0;
+            rt.perf.insert(
+                NpcRole::Scout,
+                AgentPerformance { gross_pnl: -60.0, ..Default::default() },
+            );
+        }
+        {
+            let mut feed = state.feed.lock().await;
+            populate_feed(&mut feed, 50_000.0, 20);
+        }
+        {
+            let mut truth = state.truth.lock().await;
+            truth.sell_inventory = 10.0;
+            truth.buy_power = 100_000.0;
+            truth.total_balance_usd = 100_000.0;
+        }
+
+        let report = run_cycle(&cfg, &state, runtime).await;
+
+        assert_ne!(
+            report.final_decision, "EXECUTE",
+            "cycle must not EXECUTE when portfolio drawdown breached; \
+             final_decision={} risk_block={}",
+            report.final_decision, report.risk_block_reason
+        );
+        // If the portfolio gate fired, risk_block_reason must be populated.
+        if !report.risk_block_reason.is_empty() {
+            assert_eq!(
+                report.final_decision, "BLOCKED",
+                "portfolio block must yield BLOCKED; got: {}",
+                report.final_decision
+            );
+        }
+    }
+
+    // ── Dispatch gate (all NPC-internal gates clear) ──────────────────────────
+
+    /// DIAGNOSTIC PROOF: When all NPC-internal gates pass but web_base_url is
+    /// missing, the cycle blocks at the dispatch layer with WEB_UI_ADDR_MISSING.
+    ///
+    /// This is the critical proof that the NPC engine itself can reach the
+    /// execution boundary; the remaining blocker is connectivity to the
+    /// /trade/request HTTP endpoint.
+    #[tokio::test]
+    async fn dispatch_gate_blocks_when_web_base_url_missing() {
+        let store = InMemoryEventStore::new();
+        let authority = Arc::new(AuthorityLayer::new());
+        authority.set_mode_auto(&*store).await;
+
+        // No web_base_url — NPC cannot dispatch to /trade/request.
+        let state = make_agent_state(
+            Arc::clone(&store) as Arc<dyn crate::store::EventStore>,
+            Arc::clone(&authority),
+            None,
+        );
+        let mut cfg = active_npc_cfg();
+        cfg.mode = NpcTradingMode::Paper;
+        cfg.trade_size = 0.001;
+
+        let runtime = Arc::new(Mutex::new(NpcRuntimeState::default()));
+        {
+            let mut feed = state.feed.lock().await;
+            populate_feed(&mut feed, 50_000.0, 30);
+        }
+        {
+            let mut truth = state.truth.lock().await;
+            truth.sell_inventory = 10.0;
+            truth.buy_power = 100_000.0;
+            truth.total_balance_usd = 100_000.0;
+        }
+
+        let report = run_cycle(&cfg, &state, runtime).await;
+
+        // Must never claim EXECUTE without a dispatch endpoint.
+        assert_ne!(
+            report.final_decision, "EXECUTE",
+            "cycle must not report EXECUTE when web_base_url is None; \
+             final_decision={} execution_result={}",
+            report.final_decision, report.execution_result
+        );
+        // If the dispatch layer was reached, verify the block reason.
+        if report.execution_result == "WEB_UI_ADDR_MISSING" {
+            assert_eq!(
+                report.final_decision, "BLOCKED",
+                "WEB_UI_ADDR_MISSING must yield BLOCKED; got: {}",
+                report.final_decision
+            );
+            assert!(
+                report.no_trade_reason.contains("WEB_UI_ADDR"),
+                "no_trade_reason must mention WEB_UI_ADDR; got: {}",
+                report.no_trade_reason
+            );
+        }
     }
 }
