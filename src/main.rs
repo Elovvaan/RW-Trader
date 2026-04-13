@@ -1175,7 +1175,16 @@ fn resolve_web_base_url() -> Option<String> {
             if addr.starts_with("http://") || addr.starts_with("https://") {
                 return Some(addr);
             }
-            return Some(format!("http://{}", addr));
+
+            let normalized_addr = if let Some(rest) = addr.strip_prefix("0.0.0.0:") {
+                format!("127.0.0.1:{}", rest)
+            } else if addr == "0.0.0.0" {
+                "127.0.0.1".to_string()
+            } else {
+                addr
+            };
+
+            return Some(format!("http://{}", normalized_addr));
         }
     }
 
