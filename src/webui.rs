@@ -712,8 +712,9 @@ async fn agent_status_json(state: &AppState) -> String {
     let balance_block = snap.balance_block_reason.replace('"', "\\\"");
     let risk_block = snap.risk_block_reason.replace('"', "\\\"");
     let exec_block = snap.execution_block_reason.replace('"', "\\\"");
+    let threshold_mode = snap.threshold_mode.replace('"', "\\\"");
     let body = format!(
-        r#"{{"mode":"{mode_str}","state":"{state_label}","agent_state":"{status_str}","last_action":"{last_action}","last_reason":"{last_reason}","last_agent_decision":"{last_decision}","last_no_trade_reason":"{no_trade_reason}","pipeline_state":"{pipeline}","final_decision":"{final_decision}","balance_block_reason":"{balance_block}","risk_block_reason":"{risk_block}","execution_block_reason":"{exec_block}","current_equity":{current_equity},"peak_equity":{peak_equity},"drawdown_pct":{drawdown_pct},"drawdown_limit":{drawdown_limit},"cycle_count":{cycle_count},"running":{running},"cooldown_active":{cooldown_active},"cooldown_remaining_ms":{cooldown_remaining_ms}}}"#,
+        r#"{{"mode":"{mode_str}","state":"{state_label}","agent_state":"{status_str}","last_action":"{last_action}","last_reason":"{last_reason}","last_agent_decision":"{last_decision}","last_no_trade_reason":"{no_trade_reason}","pipeline_state":"{pipeline}","final_decision":"{final_decision}","balance_block_reason":"{balance_block}","risk_block_reason":"{risk_block}","execution_block_reason":"{exec_block}","current_equity":{current_equity},"peak_equity":{peak_equity},"drawdown_pct":{drawdown_pct},"drawdown_limit":{drawdown_limit},"cycle_count":{cycle_count},"running":{running},"cooldown_active":{cooldown_active},"cooldown_remaining_ms":{cooldown_remaining_ms},"effective_threshold":{effective_threshold},"threshold_mode":"{threshold_mode}"}}"#,
         current_equity  = snap.current_equity,
         peak_equity     = snap.peak_equity,
         drawdown_pct    = snap.drawdown_pct,
@@ -722,6 +723,7 @@ async fn agent_status_json(state: &AppState) -> String {
         running     = snap.running,
         cooldown_active       = snap.cooldown_active,
         cooldown_remaining_ms = snap.cooldown_remaining_ms,
+        effective_threshold   = snap.effective_threshold,
     );
     json_resp(&body)
 }
@@ -1288,11 +1290,25 @@ async fn page_events(state: &AppState, query: &str) -> String {
         } else {
             "inactive".to_string()
         };
+        let micro_mode_badge = if npc_loop.threshold_mode == "micro_aggressive" {
+            format!(
+                "<div style='grid-column:1/-1;padding:4px 8px;background:rgba(240,185,11,.12);\
+                 border:1px solid rgba(240,185,11,.4);border-radius:8px;color:#f0b90b;font-weight:700'>\
+                 ⚡ Micro mode active — signal threshold lowered to {:.2} (balance &lt; $50)</div>",
+                npc_loop.effective_threshold
+            )
+        } else {
+            format!(
+                "<div><span class='dim'>Signal threshold: </span>{:.2} [{}]</div>",
+                npc_loop.effective_threshold, esc(&npc_loop.threshold_mode)
+            )
+        };
         format!(
             "<div style='display:grid;grid-template-columns:repeat(2,1fr);gap:6px;margin-top:6px;font-size:11px'>\
                <div><span class='dim'>Final decision: </span>{final_dec}</div>\
                <div><span class='dim'>Drawdown: </span>{dd_info}</div>\
                <div><span class='dim'>Cooldown: </span>{cooldown_info}</div>\
+               {micro_mode_badge}\
                <div style='grid-column:1/-1'><span class='dim'>Balance block: </span>{}</div>\
                <div style='grid-column:1/-1'><span class='dim'>Risk block: </span>{}</div>\
                <div style='grid-column:1/-1'><span class='dim'>Execution block: </span>{}</div>\
@@ -2883,6 +2899,30 @@ mod tests {
         assert!(r.contains("Final decision") || r.contains("final_decision") || r.contains("Drawdown"),
             "Events page must show decision fields");
         assert!(r.contains("Cooldown"), "Events page decision transparency must show cooldown status");
+    }
+
+    #[tokio::test]
+    async fn test_agent_status_json_threshold_fields_present() {
+        let state = make_state();
+        let r = agent_status_json(&state).await;
+        assert!(r.contains("\"effective_threshold\""), "JSON must contain effective_threshold");
+        assert!(r.contains("\"threshold_mode\""), "JSON must contain threshold_mode");
+    }
+
+    #[tokio::test]
+    async fn test_events_normal_account_shows_signal_threshold() {
+        let state = make_state();
+        // Default state has no balance → threshold_mode = "normal"
+        let r = page_events(&state, "").await;
+        // Should show signal threshold info (normal mode, not micro mode badge)
+        assert!(
+            r.contains("Signal threshold") || r.contains("normal"),
+            "Events page must show threshold info for normal mode"
+        );
+        assert!(
+            !r.contains("Micro mode active"),
+            "Must not show micro mode badge when threshold_mode is normal"
+        );
     }
 
 }

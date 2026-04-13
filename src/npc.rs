@@ -442,6 +442,11 @@ pub struct NpcLoopSnapshot {
     pub cooldown_active: bool,
     /// Milliseconds remaining on the active cooldown (0 when inactive).
     pub cooldown_remaining_ms: u64,
+    // ── Micro-account adaptive thresholds ────────────────────────────────────
+    /// Adaptive signal threshold in effect for the last cycle (balance-dependent).
+    pub effective_threshold: f64,
+    /// Threshold mode label: "normal" or "micro_aggressive".
+    pub threshold_mode: String,
 }
 
 #[derive(Default)]
@@ -464,6 +469,10 @@ struct NpcLoopTelemetry {
     cooldown_active: bool,
     /// Milliseconds remaining on the active cooldown (0 when inactive).
     cooldown_remaining_ms: u64,
+    /// Adaptive signal threshold in effect (balance-dependent).
+    effective_threshold: f64,
+    /// Threshold mode: "normal" or "micro_aggressive".
+    threshold_mode: String,
 }
 
 struct NpcLoopControl {
@@ -510,6 +519,8 @@ impl NpcAutonomousController {
                 last_agent_decision: "Waiting for first cycle".to_string(),
                 last_no_trade_reason: String::new(),
                 pipeline_state: "Scanning".to_string(),
+                effective_threshold: THRESHOLD_BASE,
+                threshold_mode: "normal".to_string(),
                 ..NpcLoopTelemetry::default()
             })),
             control: Arc::new(Mutex::new(NpcLoopControl::new(interval_ms, mode))),
@@ -634,6 +645,8 @@ impl NpcAutonomousController {
             drawdown_limit: self.cfg.alpha.max_drawdown_pct,
             cooldown_active: telemetry.cooldown_active,
             cooldown_remaining_ms: telemetry.cooldown_remaining_ms,
+            effective_threshold: telemetry.effective_threshold,
+            threshold_mode: telemetry.threshold_mode.clone(),
         }
     }
 
@@ -702,6 +715,8 @@ impl NpcAutonomousController {
                         t.execution_block_reason = report.execution_block_reason;
                         t.cooldown_active = report.cooldown_active;
                         t.cooldown_remaining_ms = report.cooldown_remaining_ms;
+                        t.effective_threshold = report.effective_threshold;
+                        t.threshold_mode = report.threshold_mode;
                         t.status = match report.status.as_str() {
                             "blocked" => "Blocked by safety checks".to_string(),
                             "running" => AgentMode::Auto.state_label().to_string(),
@@ -789,9 +804,52 @@ struct NpcCycleReport {
     cooldown_active: bool,
     /// Milliseconds remaining on the active cooldown (0 when inactive).
     cooldown_remaining_ms: u64,
+    /// Adaptive signal threshold in effect for this cycle (balance-dependent).
+    effective_threshold: f64,
+    /// Threshold mode: "normal" or "micro_aggressive".
+    threshold_mode: String,
+}
+
+// ── Micro-account adaptive threshold constants ────────────────────────────────
+
+const MICRO_BALANCE_ULTRA_USD: f64 = 25.0;   // below this: ultra-micro tier
+const MICRO_BALANCE_USD: f64       = 50.0;   // below this: micro tier
+const THRESHOLD_ULTRA_MICRO: f64   = 0.10;   // signal threshold for ultra-micro accounts
+const THRESHOLD_MICRO: f64         = 0.14;   // signal threshold for micro accounts
+const THRESHOLD_BASE: f64          = 0.18;   // signal threshold for normal accounts
+
+/// Compute balance-adaptive signal threshold and mode label.
+///
+/// Returns `(effective_threshold, threshold_mode)`:
+/// - `effective_threshold`: the score floor to use for this balance level
+/// - `threshold_mode`: `"micro_aggressive"` only when `total_balance_usd > 0.0`
+///   and below [`MICRO_BALANCE_USD`]; a `0.0` balance returns `"normal"`
+fn adaptive_signal_threshold(total_balance_usd: f64) -> (f64, &'static str) {
+    if total_balance_usd > 0.0 && total_balance_usd < MICRO_BALANCE_ULTRA_USD {
+        (THRESHOLD_ULTRA_MICRO, "micro_aggressive")
+    } else if total_balance_usd > 0.0 && total_balance_usd < MICRO_BALANCE_USD {
+        (THRESHOLD_MICRO, "micro_aggressive")
+    } else {
+        (THRESHOLD_BASE, "normal")
+    }
 }
 
 async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRuntimeState>>) -> NpcCycleReport {
+    let mode = state.authority.mode().await;
+    let metrics = {
+        let feed = state.feed.lock().await;
+        let signal = state.signal.lock().await;
+        signal.compute_metrics_pub(&feed)
+    };
+
+    let (position_size, buy_power, sell_inventory, exposure_notional, total_balance_usd) = {
+        let t = state.truth.lock().await;
+        let pos = t.position.size.max(0.0);
+        let mid = metrics.mid.max(0.0);
+        (pos, t.buy_power.max(0.0), t.sell_inventory.max(0.0), pos * mid, t.total_balance_usd.max(0.0))
+    };
+
+    let (effective_threshold, threshold_mode) = adaptive_signal_threshold(total_balance_usd);
     let no_action = |cycle_id: u64, execution_result: String, status: String| NpcCycleReport {
         cycle_id,
         last_action: "NO_ACTION".to_string(),
@@ -806,8 +864,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         execution_block_reason: String::new(),
         cooldown_active: false,
         cooldown_remaining_ms: 0,
+        effective_threshold,
+        threshold_mode: threshold_mode.to_string(),
     };
-    let mode = state.authority.mode().await;
     if mode == AuthorityMode::Off {
         return NpcCycleReport {
             cycle_id: 0,
@@ -832,18 +891,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
 
     let exec_state = state.exec.execution_state().await;
     let pending = state.authority.pending_proposals().await;
-    let metrics = {
-        let feed = state.feed.lock().await;
-        let signal = state.signal.lock().await;
-        signal.compute_metrics_pub(&feed)
-    };
 
-    let (position_size, buy_power, sell_inventory, exposure_notional, total_balance_usd) = {
-        let t = state.truth.lock().await;
-        let pos = t.position.size.max(0.0);
-        let mid = metrics.mid.max(0.0);
-        (pos, t.buy_power.max(0.0), t.sell_inventory.max(0.0), pos * mid, t.total_balance_usd.max(0.0))
-    };
+    // ── Micro-account adaptive signal threshold ───────────────────────────────
+    let (effective_threshold, threshold_mode) = adaptive_signal_threshold(total_balance_usd);
 
     let mut rt = runtime.lock().await;
     rt.cycle_seq = rt.cycle_seq.saturating_add(1);
@@ -967,25 +1017,32 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             execution_block_reason: reason.clone(),
             cooldown_active: false,
             cooldown_remaining_ms: 0,
+            effective_threshold,
+            threshold_mode: threshold_mode.to_string(),
         };
     }
 
-    if chosen.score < regime_cutoff {
+    let effective_cutoff = if threshold_mode.to_string() == "micro" {
+        effective_threshold.min(regime_cutoff)
+    } else {
+        regime_cutoff
+    };
+    if chosen.score < effective_cutoff {
         lifecycle(
             &*state.store,
             chosen.role,
             &chosen.action_id,
             NpcLifecycleState::Blocked,
             &format!(
-                "NO_ACTION_SCORE_BELOW_THRESHOLD:{:.4}<{:.4}",
-                chosen.score, regime_cutoff
+                "NO_ACTION_SCORE_BELOW_THRESHOLD:{:.4}<{:.4}(effective={:.4},regime={:.4},mode={})",
+                chosen.score, effective_cutoff, effective_threshold, regime_cutoff, threshold_mode
             ),
         );
         rt.perf.entry(chosen.role).or_default().blocked += 1;
         observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
         let score_reason = format!(
-            "Signal score {:.4} below minimum threshold {:.4}. Waiting for stronger trigger.",
-            chosen.score, regime_cutoff
+            "Signal score {:.4} below minimum threshold {:.4} [{}]. Waiting for stronger trigger.",
+            chosen.score, effective_cutoff, threshold_mode
         );
         return NpcCycleReport {
             cycle_id,
@@ -993,8 +1050,8 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             execution_result: "SCORE_BELOW_THRESHOLD".to_string(),
             status: "blocked".to_string(),
             last_agent_decision: format!(
-                "HOLD — {} {} score {:.4} below threshold {:.4}",
-                chosen.side.to_uppercase(), chosen.role.as_str(), chosen.score, regime_cutoff
+                "HOLD — {} {} score {:.4} below threshold {:.4} [{}]",
+                chosen.side.to_uppercase(), chosen.role.as_str(), chosen.score, effective_cutoff, threshold_mode
             ),
             no_trade_reason: score_reason.clone(),
             pipeline_state: "Scanning".to_string(),
@@ -1004,6 +1061,8 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             execution_block_reason: score_reason,
             cooldown_active: false,
             cooldown_remaining_ms: 0,
+            effective_threshold,
+            threshold_mode: threshold_mode.to_string(),
         };
     }
 
@@ -1035,6 +1094,8 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             execution_block_reason: String::new(),
             cooldown_active: false,
             cooldown_remaining_ms: 0,
+            effective_threshold,
+            threshold_mode: threshold_mode.to_string(),
         };
     }
 
@@ -1079,6 +1140,8 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             execution_block_reason: String::new(),
             cooldown_active: false,
             cooldown_remaining_ms: 0,
+            effective_threshold,
+            threshold_mode: threshold_mode.to_string(),
         };
     }
 
@@ -1123,6 +1186,8 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             execution_block_reason: guard_reason,
             cooldown_active,
             cooldown_remaining_ms,
+            effective_threshold,
+            threshold_mode: threshold_mode.to_string(),
         };
     }
 
@@ -1166,6 +1231,8 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             execution_block_reason: "LIVE_REQUIRES_PAPER_EXECUTION".to_string(),
             cooldown_active: false,
             cooldown_remaining_ms: 0,
+            effective_threshold,
+            threshold_mode: threshold_mode.to_string(),
         };
     }
 
@@ -1217,6 +1284,8 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                 execution_block_reason: "WEB_UI_ADDR_MISSING".to_string(),
                 cooldown_active,
                 cooldown_remaining_ms,
+                effective_threshold,
+                threshold_mode: threshold_mode.to_string(),
             };
         };
 
@@ -1296,6 +1365,8 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                     execution_block_reason: format!("HTTP_STATUS_{}", status_code),
                     cooldown_active,
                     cooldown_remaining_ms,
+                    effective_threshold,
+                    threshold_mode: threshold_mode.to_string(),
                 };
             }
             Err(e) => {
@@ -1324,6 +1395,8 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                     execution_block_reason: format!("REQUEST_ERROR:{}", e),
                     cooldown_active,
                     cooldown_remaining_ms,
+                    effective_threshold,
+                    threshold_mode: threshold_mode.to_string(),
                 };
             }
         }
@@ -1384,6 +1457,8 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         execution_block_reason: String::new(),
         cooldown_active,
         cooldown_remaining_ms,
+        effective_threshold,
+        threshold_mode: threshold_mode.to_string(),
     }
 }
 
@@ -2625,6 +2700,72 @@ mod tests {
         assert!(breach.contains("current_equity"), "Breach message must include current_equity; got: {breach}");
         assert!(breach.contains("peak_equity"), "Breach message must include peak_equity; got: {breach}");
         assert!(breach.contains("limit"), "Breach message must include limit; got: {breach}");
+    }
+
+    // ── Micro-account adaptive signal thresholds ───────────────────────────────
+
+    #[test]
+    fn micro_threshold_below_25_uses_0_10() {
+        let (threshold, mode) = adaptive_signal_threshold(10.0);
+        assert!((threshold - THRESHOLD_ULTRA_MICRO).abs() < f64::EPSILON,
+            "balance $10 → threshold {THRESHOLD_ULTRA_MICRO}, got {threshold}");
+        assert_eq!(mode, "micro_aggressive");
+    }
+
+    #[test]
+    fn micro_threshold_between_25_and_50_uses_0_14() {
+        let (threshold, mode) = adaptive_signal_threshold(30.0);
+        assert!((threshold - THRESHOLD_MICRO).abs() < f64::EPSILON,
+            "balance $30 → threshold {THRESHOLD_MICRO}, got {threshold}");
+        assert_eq!(mode, "micro_aggressive");
+    }
+
+    #[test]
+    fn micro_threshold_at_exactly_25_uses_0_14() {
+        let (threshold, mode) = adaptive_signal_threshold(25.0);
+        assert!((threshold - THRESHOLD_MICRO).abs() < f64::EPSILON,
+            "balance $25 → threshold {THRESHOLD_MICRO}, got {threshold}");
+        assert_eq!(mode, "micro_aggressive");
+    }
+
+    #[test]
+    fn micro_threshold_at_50_or_above_uses_base() {
+        for balance in [50.0, 100.0, 500.0, 10_000.0] {
+            let (threshold, mode) = adaptive_signal_threshold(balance);
+            assert!((threshold - THRESHOLD_BASE).abs() < f64::EPSILON,
+                "balance ${balance} → threshold {THRESHOLD_BASE}, got {threshold}");
+            assert_eq!(mode, "normal", "balance ${balance} → mode normal");
+        }
+    }
+
+    #[test]
+    fn micro_threshold_zero_balance_uses_base() {
+        // Zero balance (no data yet) must not activate micro mode.
+        let (threshold, mode) = adaptive_signal_threshold(0.0);
+        assert!((threshold - THRESHOLD_BASE).abs() < f64::EPSILON,
+            "balance $0 → threshold {THRESHOLD_BASE} (base), got {threshold}");
+        assert_eq!(mode, "normal");
+    }
+
+    #[test]
+    fn micro_threshold_effective_cutoff_lower_for_micro_accounts() {
+        // For micro accounts, effective_cutoff = effective_threshold.min(regime_cutoff).
+        // When regime_cutoff > effective_threshold, micro accounts get the lower cutoff.
+        let regime_cutoff = 0.20_f64;
+        let (effective_threshold, _mode) = adaptive_signal_threshold(20.0);
+        let effective_cutoff = effective_threshold.min(regime_cutoff);
+        assert!((effective_cutoff - THRESHOLD_ULTRA_MICRO).abs() < f64::EPSILON,
+            "micro account should use effective_threshold={THRESHOLD_ULTRA_MICRO} not regime_cutoff=0.20, got {effective_cutoff}");
+    }
+
+    #[test]
+    fn micro_threshold_effective_cutoff_respects_regime_for_normal_accounts() {
+        // For normal accounts, regime_cutoff (if lower) still wins.
+        let regime_cutoff = 0.08_f64; // learner set it low
+        let (effective_threshold, _mode) = adaptive_signal_threshold(200.0);
+        let effective_cutoff = effective_threshold.min(regime_cutoff);
+        assert!((effective_cutoff - 0.08).abs() < f64::EPSILON,
+            "normal account should use regime_cutoff=0.08 when it is lower, got {effective_cutoff}");
     }
 }
 
