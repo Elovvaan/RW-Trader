@@ -3449,4 +3449,64 @@ mod diagnostic_tests {
             report.risk_block_reason
         );
     }
+
+    // ── Requirement 5 & 6: WEB_UI_ADDR present → dispatch gate cleared ────────
+
+    /// Shared setup for dispatch-gate tests: Paper mode, valid feed + balances,
+    /// web_base_url pointing at a non-listening port (immediate connection refused).
+    async fn make_dispatch_gate_report() -> NpcCycleReport {
+        let store = InMemoryEventStore::new();
+        let authority = Arc::new(AuthorityLayer::new());
+        authority.set_mode_auto(&*store).await;
+
+        // Port 1 is never open → immediate connection refused (not a config error).
+        let state = make_agent_state(
+            Arc::clone(&store) as Arc<dyn crate::store::EventStore>,
+            Arc::clone(&authority),
+            Some("http://127.0.0.1:1".to_string()),
+        );
+        let mut cfg = active_npc_cfg();
+        cfg.mode = NpcTradingMode::Paper;
+        cfg.trade_size = 0.001;
+
+        let runtime = Arc::new(Mutex::new(NpcRuntimeState::default()));
+        {
+            let mut feed = state.feed.lock().await;
+            populate_feed(&mut feed, 50_000.0, 30);
+        }
+        {
+            let mut truth = state.truth.lock().await;
+            truth.sell_inventory = 10.0;
+            truth.buy_power = 100_000.0;
+            truth.total_balance_usd = 100_000.0;
+        }
+        run_cycle(&cfg, &state, runtime).await
+    }
+
+    /// TEST (Requirement 5): When web_base_url is set, run_cycle must NOT return
+    /// WEB_UI_ADDR_MISSING — the config-missing sentinel is gone.
+    #[tokio::test]
+    async fn web_base_url_set_prevents_addr_missing_error() {
+        let report = make_dispatch_gate_report().await;
+        assert_ne!(
+            report.execution_result, "WEB_UI_ADDR_MISSING",
+            "WEB_UI_ADDR_MISSING must not appear when web_base_url is set; \
+             execution_result={} final_decision={}",
+            report.execution_result, report.final_decision
+        );
+    }
+
+    /// TEST (Requirement 6): When web_base_url is set, run_cycle builds an
+    /// absolute URL and attempts the POST.  A REQUEST_ERROR (connection refused
+    /// against port 1) proves the dispatch gate was cleared with a fully-qualified URL.
+    #[tokio::test]
+    async fn web_base_url_builds_absolute_request_url() {
+        let report = make_dispatch_gate_report().await;
+        assert!(
+            report.execution_result.starts_with("REQUEST_ERROR:"),
+            "expected REQUEST_ERROR when web_base_url is set and server is unreachable; \
+             got execution_result={} final_decision={}",
+            report.execution_result, report.final_decision
+        );
+    }
 }
