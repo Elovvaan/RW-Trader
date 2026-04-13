@@ -834,6 +834,21 @@ fn adaptive_signal_threshold(total_balance_usd: f64) -> (f64, &'static str) {
 }
 
 async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRuntimeState>>) -> NpcCycleReport {
+    let mode = state.authority.mode().await;
+    let metrics = {
+        let feed = state.feed.lock().await;
+        let signal = state.signal.lock().await;
+        signal.compute_metrics_pub(&feed)
+    };
+
+    let (position_size, buy_power, sell_inventory, exposure_notional, total_balance_usd) = {
+        let t = state.truth.lock().await;
+        let pos = t.position.size.max(0.0);
+        let mid = metrics.mid.max(0.0);
+        (pos, t.buy_power.max(0.0), t.sell_inventory.max(0.0), pos * mid, t.total_balance_usd.max(0.0))
+    };
+
+    let (effective_threshold, threshold_mode) = adaptive_signal_threshold(total_balance_usd);
     let no_action = |cycle_id: u64, execution_result: String, status: String| NpcCycleReport {
         cycle_id,
         last_action: "NO_ACTION".to_string(),
@@ -848,28 +863,15 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         execution_block_reason: String::new(),
         cooldown_active: false,
         cooldown_remaining_ms: 0,
-        effective_threshold: THRESHOLD_BASE,
-        threshold_mode: "normal".to_string(),
+        effective_threshold,
+        threshold_mode: threshold_mode.to_string(),
     };
-    let mode = state.authority.mode().await;
     if mode == AuthorityMode::Off {
         return no_action(0, "authority_mode_off".to_string(), "blocked".to_string());
     }
 
     let exec_state = state.exec.execution_state().await;
     let pending = state.authority.pending_proposals().await;
-    let metrics = {
-        let feed = state.feed.lock().await;
-        let signal = state.signal.lock().await;
-        signal.compute_metrics_pub(&feed)
-    };
-
-    let (position_size, buy_power, sell_inventory, exposure_notional, total_balance_usd) = {
-        let t = state.truth.lock().await;
-        let pos = t.position.size.max(0.0);
-        let mid = metrics.mid.max(0.0);
-        (pos, t.buy_power.max(0.0), t.sell_inventory.max(0.0), pos * mid, t.total_balance_usd.max(0.0))
-    };
 
     // ── Micro-account adaptive signal threshold ───────────────────────────────
     let (effective_threshold, threshold_mode) = adaptive_signal_threshold(total_balance_usd);
