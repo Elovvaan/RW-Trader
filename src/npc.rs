@@ -812,22 +812,28 @@ struct NpcCycleReport {
 
 // ── Micro-account adaptive threshold constants ────────────────────────────────
 
-const MICRO_BALANCE_ULTRA_USD: f64 = 25.0;   // below this: ultra-micro tier
-const MICRO_BALANCE_USD: f64       = 50.0;   // below this: micro tier
-const THRESHOLD_ULTRA_MICRO: f64   = 0.10;   // signal threshold for ultra-micro accounts
-const THRESHOLD_MICRO: f64         = 0.14;   // signal threshold for micro accounts
-const THRESHOLD_BASE: f64          = 0.18;   // signal threshold for normal accounts
+const MICRO_BALANCE_USD: f64        = 50.0;   // below this: micro tier (< $50)
+const MICRO_BALANCE_MID_USD: f64    = 100.0;  // below this: mid tier ($50–$99.99)
+const THRESHOLD_MICRO_SMALL: f64    = 0.11;   // signal threshold for micro accounts (balance < $50)
+const THRESHOLD_MICRO: f64          = 0.14;   // signal threshold for mid accounts ($50–$99.99)
+const THRESHOLD_BASE: f64           = 0.18;   // signal threshold for normal accounts (balance ≥ $100)
 
 /// Compute balance-adaptive signal threshold and mode label.
 ///
 /// Returns `(effective_threshold, threshold_mode)`:
 /// - `effective_threshold`: the score floor to use for this balance level
-/// - `threshold_mode`: `"micro_aggressive"` only when `total_balance_usd > 0.0`
-///   and below [`MICRO_BALANCE_USD`]; a `0.0` balance returns `"normal"`
+/// - `threshold_mode`: `"micro_aggressive"` when `total_balance_usd > 0.0`
+///   and below [`MICRO_BALANCE_MID_USD`]; a `0.0` balance returns `"normal"`
+///
+/// Tier map:
+///   balance < $50        → 0.11  "micro_aggressive"
+///   $50 ≤ balance < $100 → 0.14  "micro_aggressive"
+///   balance ≥ $100       → 0.18  "normal"
+///   balance = 0.0        → 0.18  "normal"  (no data yet)
 fn adaptive_signal_threshold(total_balance_usd: f64) -> (f64, &'static str) {
-    if total_balance_usd > 0.0 && total_balance_usd < MICRO_BALANCE_ULTRA_USD {
-        (THRESHOLD_ULTRA_MICRO, "micro_aggressive")
-    } else if total_balance_usd > 0.0 && total_balance_usd < MICRO_BALANCE_USD {
+    if total_balance_usd > 0.0 && total_balance_usd < MICRO_BALANCE_USD {
+        (THRESHOLD_MICRO_SMALL, "micro_aggressive")
+    } else if total_balance_usd > 0.0 && total_balance_usd < MICRO_BALANCE_MID_USD {
         (THRESHOLD_MICRO, "micro_aggressive")
     } else {
         (THRESHOLD_BASE, "normal")
@@ -886,6 +892,8 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                     .to_string(),
             cooldown_active: false,
             cooldown_remaining_ms: 0,
+            effective_threshold,
+            threshold_mode: threshold_mode.to_string(),
         };
     }
 
@@ -1022,7 +1030,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         };
     }
 
-    let effective_cutoff = if threshold_mode.to_string() == "micro" {
+    // For micro accounts, cap the enforced cutoff at effective_threshold so that
+    // regime/learner values can never raise the gate back above the balance-tier limit.
+    let effective_cutoff = if threshold_mode == "micro_aggressive" {
         effective_threshold.min(regime_cutoff)
     } else {
         regime_cutoff
@@ -1061,7 +1071,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             execution_block_reason: score_reason,
             cooldown_active: false,
             cooldown_remaining_ms: 0,
-            effective_threshold,
+            effective_threshold: effective_cutoff, // report the actual enforced gate to UI/telemetry
             threshold_mode: threshold_mode.to_string(),
         };
     }
@@ -1457,7 +1467,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         execution_block_reason: String::new(),
         cooldown_active,
         cooldown_remaining_ms,
-        effective_threshold,
+        effective_threshold: effective_cutoff, // report the actual enforced gate to UI/telemetry
         threshold_mode: threshold_mode.to_string(),
     }
 }
@@ -2705,32 +2715,31 @@ mod tests {
     // ── Micro-account adaptive signal thresholds ───────────────────────────────
 
     #[test]
-    fn micro_threshold_below_25_uses_0_10() {
-        let (threshold, mode) = adaptive_signal_threshold(10.0);
-        assert!((threshold - THRESHOLD_ULTRA_MICRO).abs() < f64::EPSILON,
-            "balance $10 → threshold {THRESHOLD_ULTRA_MICRO}, got {threshold}");
-        assert_eq!(mode, "micro_aggressive");
+    fn micro_threshold_below_50_uses_0_11() {
+        // Any balance > 0 and < $50 must use THRESHOLD_MICRO_SMALL = 0.11.
+        for balance in [1.0, 10.0, 25.0, 35.0, 49.99] {
+            let (threshold, mode) = adaptive_signal_threshold(balance);
+            assert!((threshold - THRESHOLD_MICRO_SMALL).abs() < f64::EPSILON,
+                "balance ${balance} → threshold {THRESHOLD_MICRO_SMALL}, got {threshold}");
+            assert_eq!(mode, "micro_aggressive");
+        }
     }
 
     #[test]
-    fn micro_threshold_between_25_and_50_uses_0_14() {
-        let (threshold, mode) = adaptive_signal_threshold(30.0);
-        assert!((threshold - THRESHOLD_MICRO).abs() < f64::EPSILON,
-            "balance $30 → threshold {THRESHOLD_MICRO}, got {threshold}");
-        assert_eq!(mode, "micro_aggressive");
+    fn micro_threshold_between_50_and_100_uses_0_14() {
+        // $50 ≤ balance < $100 must use THRESHOLD_MICRO = 0.14.
+        for balance in [50.0, 75.0, 99.99] {
+            let (threshold, mode) = adaptive_signal_threshold(balance);
+            assert!((threshold - THRESHOLD_MICRO).abs() < f64::EPSILON,
+                "balance ${balance} → threshold {THRESHOLD_MICRO}, got {threshold}");
+            assert_eq!(mode, "micro_aggressive");
+        }
     }
 
     #[test]
-    fn micro_threshold_at_exactly_25_uses_0_14() {
-        let (threshold, mode) = adaptive_signal_threshold(25.0);
-        assert!((threshold - THRESHOLD_MICRO).abs() < f64::EPSILON,
-            "balance $25 → threshold {THRESHOLD_MICRO}, got {threshold}");
-        assert_eq!(mode, "micro_aggressive");
-    }
-
-    #[test]
-    fn micro_threshold_at_50_or_above_uses_base() {
-        for balance in [50.0, 100.0, 500.0, 10_000.0] {
+    fn micro_threshold_at_100_or_above_uses_base() {
+        // balance ≥ $100 must preserve THRESHOLD_BASE = 0.18 (existing behaviour).
+        for balance in [100.0, 150.0, 500.0, 10_000.0] {
             let (threshold, mode) = adaptive_signal_threshold(balance);
             assert!((threshold - THRESHOLD_BASE).abs() < f64::EPSILON,
                 "balance ${balance} → threshold {THRESHOLD_BASE}, got {threshold}");
@@ -2749,21 +2758,71 @@ mod tests {
 
     #[test]
     fn micro_threshold_effective_cutoff_lower_for_micro_accounts() {
-        // For micro accounts, effective_cutoff = effective_threshold.min(regime_cutoff).
-        // When regime_cutoff > effective_threshold, micro accounts get the lower cutoff.
-        let regime_cutoff = 0.20_f64;
-        let (effective_threshold, _mode) = adaptive_signal_threshold(20.0);
-        let effective_cutoff = effective_threshold.min(regime_cutoff);
-        assert!((effective_cutoff - THRESHOLD_ULTRA_MICRO).abs() < f64::EPSILON,
-            "micro account should use effective_threshold={THRESHOLD_ULTRA_MICRO} not regime_cutoff=0.20, got {effective_cutoff}");
+        // For micro accounts (balance < $50), effective_cutoff = effective_threshold.min(regime_cutoff).
+        // When regime_cutoff > effective_threshold, the balance-tier cap wins.
+        let regime_cutoff = 0.20_f64; // e.g. learner raised it high
+        let balance = 35.0_f64;       // typical $30-$40 account
+        let (effective_threshold, mode) = adaptive_signal_threshold(balance);
+        assert_eq!(mode, "micro_aggressive");
+        // Simulate the fixed effective_cutoff logic (condition: mode == "micro_aggressive")
+        let effective_cutoff = if mode == "micro_aggressive" {
+            effective_threshold.min(regime_cutoff)
+        } else {
+            regime_cutoff
+        };
+        assert!((effective_cutoff - THRESHOLD_MICRO_SMALL).abs() < f64::EPSILON,
+            "micro account (${balance}) should use effective_threshold={THRESHOLD_MICRO_SMALL} not regime_cutoff=0.20, got {effective_cutoff}");
+    }
+
+    #[test]
+    fn micro_threshold_regime_cannot_raise_cutoff_above_tier_limit() {
+        // Even if regime_cutoff is 0.1800 (the old normal baseline), a micro account
+        // must still be gated at THRESHOLD_MICRO_SMALL = 0.11, not 0.18.
+        let regime_cutoff = THRESHOLD_BASE; // 0.18 – worst case
+        let (effective_threshold, mode) = adaptive_signal_threshold(35.0);
+        let effective_cutoff = if mode == "micro_aggressive" {
+            effective_threshold.min(regime_cutoff)
+        } else {
+            regime_cutoff
+        };
+        assert!((effective_cutoff - THRESHOLD_MICRO_SMALL).abs() < f64::EPSILON,
+            "regime_cutoff={THRESHOLD_BASE} must not raise micro-account gate above {THRESHOLD_MICRO_SMALL}; got {effective_cutoff}");
+    }
+
+    #[test]
+    fn micro_account_score_0_1491_passes_threshold() {
+        // PROOF: a $30-$40 account with signal_score 0.1491 must pass the decision gate
+        // and not return HOLD. With THRESHOLD_MICRO_SMALL=0.11 and worst-case
+        // regime_cutoff=0.18, effective_cutoff = min(0.11, 0.18) = 0.11 < 0.1491.
+        let signal_score = 0.1491_f64;
+        let balance = 35.0_f64;
+        let regime_cutoff = THRESHOLD_BASE; // 0.18 – the previously enforced stale value
+        let (effective_threshold, mode) = adaptive_signal_threshold(balance);
+        let effective_cutoff = if mode == "micro_aggressive" {
+            effective_threshold.min(regime_cutoff)
+        } else {
+            regime_cutoff
+        };
+        assert!(
+            signal_score >= effective_cutoff,
+            "signal_score {signal_score} must pass effective_cutoff {effective_cutoff} \
+             for a ${balance} micro account; old stale gate was 0.1800"
+        );
+        assert!((effective_cutoff - THRESHOLD_MICRO_SMALL).abs() < f64::EPSILON,
+            "effective_cutoff should be THRESHOLD_MICRO_SMALL={THRESHOLD_MICRO_SMALL}, got {effective_cutoff}");
     }
 
     #[test]
     fn micro_threshold_effective_cutoff_respects_regime_for_normal_accounts() {
-        // For normal accounts, regime_cutoff (if lower) still wins.
+        // For normal accounts (balance ≥ $100), regime_cutoff (if lower) still wins.
         let regime_cutoff = 0.08_f64; // learner set it low
-        let (effective_threshold, _mode) = adaptive_signal_threshold(200.0);
-        let effective_cutoff = effective_threshold.min(regime_cutoff);
+        let (effective_threshold, mode) = adaptive_signal_threshold(200.0);
+        assert_eq!(mode, "normal");
+        let effective_cutoff = if mode == "micro_aggressive" {
+            effective_threshold.min(regime_cutoff)
+        } else {
+            regime_cutoff
+        };
         assert!((effective_cutoff - 0.08).abs() < f64::EPSILON,
             "normal account should use regime_cutoff=0.08 when it is lower, got {effective_cutoff}");
     }
