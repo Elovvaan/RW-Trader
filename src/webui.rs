@@ -1000,6 +1000,7 @@ async fn page_events(state: &AppState, query: &str) -> String {
     };
     let kill = state.risk.lock().await.kill_switch_active();
     let npc_loop = state.npc.snapshot().await;
+    let phase1_status = state.strategy.lock().await.phase1_status();
 
     let best_summary = events.first().map(summarise_event).unwrap_or_else(|| "No fresh event yet; waiting for next snapshot.".to_string());
     let market_ticks = events
@@ -1502,11 +1503,114 @@ async fn page_events(state: &AppState, query: &str) -> String {
         open_orders
     );
 
+    // ── Phase 1 Strategy Panel ───────────────────────────────────────────────
+    // Displays regime state, setup details, and explicit block reason.
+    // Always shows an exact reason — never a generic HOLD.
+    let phase1_card = {
+        let regime_str = phase1_status.regime.as_str();
+        let (regime_color, regime_bg) = match phase1_status.regime {
+            crate::phase1::DaySwingRegime::TrendUp   =>
+                ("#22C55E", "rgba(34,197,94,.12)"),
+            crate::phase1::DaySwingRegime::TrendDown =>
+                ("#ef4444", "rgba(239,68,68,.12)"),
+            crate::phase1::DaySwingRegime::Range     =>
+                ("#f0b90b", "rgba(240,185,11,.12)"),
+            crate::phase1::DaySwingRegime::NoTrade   =>
+                ("#82909f", "rgba(130,144,159,.12)"),
+        };
+        let enabled_badge = if phase1_status.enabled {
+            "<span style='background:rgba(34,197,94,.18);color:#22C55E;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:700'>PRIMARY</span>"
+        } else {
+            "<span style='background:rgba(130,144,159,.14);color:#82909f;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:700'>DISABLED</span>"
+        };
+        let block_row = if phase1_status.enabled && !phase1_status.block_reason.is_empty()
+            && phase1_status.regime != crate::phase1::DaySwingRegime::TrendUp
+        {
+            format!(
+                "<div style='margin-top:6px;padding:6px 8px;background:rgba(239,68,68,.08);\
+                 border:1px solid rgba(239,68,68,.25);border-radius:8px;font-size:11px'>\
+                 <span style='color:#ef4444;font-weight:700'>⚑ NO TRADE — </span>\
+                 <span style='color:#d0d6dd'>{}</span></div>",
+                esc(&phase1_status.block_reason)
+            )
+        } else if phase1_status.enabled && phase1_status.block_reason.is_empty()
+            && phase1_status.regime == crate::phase1::DaySwingRegime::TrendUp
+        {
+            "<div style='margin-top:6px;padding:6px 8px;background:rgba(34,197,94,.08);\
+             border:1px solid rgba(34,197,94,.25);border-radius:8px;font-size:11px'>\
+             <span style='color:#22C55E;font-weight:700'>✓ TREND_UP — scanning for setup</span></div>".to_string()
+        } else {
+            String::new()
+        };
+        let setup_row = if let (Some(st), Some(mode), Some(entry), Some(stop), Some(target), Some(qual)) = (
+            phase1_status.last_setup_type,
+            phase1_status.last_setup_mode,
+            phase1_status.last_entry,
+            phase1_status.last_stop,
+            phase1_status.last_target,
+            phase1_status.last_quality,
+        ) {
+            format!(
+                "<div style='margin-top:6px;display:grid;grid-template-columns:repeat(3,1fr);gap:4px;font-size:11px'>\
+                 <div><span class='dim'>Setup: </span><strong style='color:#22C55E'>{} {}</strong></div>\
+                 <div><span class='dim'>Quality: </span>{:.2}</div>\
+                 <div><span class='dim'>Mode: </span>{}</div>\
+                 <div><span class='dim'>Entry: </span>{:.2}</div>\
+                 <div><span class='dim'>Stop: </span>{:.2}</div>\
+                 <div><span class='dim'>Target: </span>{:.2}</div>\
+                 </div>",
+                esc(st.as_str()),
+                "BUY",
+                qual,
+                esc(mode.as_str()),
+                entry, stop, target,
+            )
+        } else {
+            String::new()
+        };
+        let position_row = if phase1_status.in_position {
+            let stop_str  = phase1_status.position_stop.map(|v| format!("{:.2}", v)).unwrap_or_else(|| "—".into());
+            let target_str = phase1_status.position_target.map(|v| format!("{:.2}", v)).unwrap_or_else(|| "—".into());
+            let hwm_str   = phase1_status.high_water.map(|v| format!("{:.2}", v)).unwrap_or_else(|| "—".into());
+            let be_str    = if phase1_status.break_even { "yes" } else { "no" };
+            format!(
+                "<div style='margin-top:6px;padding:6px 8px;background:rgba(34,197,94,.08);\
+                 border:1px solid rgba(34,197,94,.25);border-radius:8px;font-size:11px'>\
+                 <span style='color:#22C55E;font-weight:700'>▶ POSITION OPEN</span>\
+                 <div style='display:grid;grid-template-columns:repeat(4,1fr);gap:4px;margin-top:4px'>\
+                 <div><span class='dim'>Stop: </span>{}</div>\
+                 <div><span class='dim'>Target: </span>{}</div>\
+                 <div><span class='dim'>HWM: </span>{}</div>\
+                 <div><span class='dim'>BE: </span>{}</div>\
+                 </div></div>",
+                stop_str, target_str, hwm_str, be_str,
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            "<div class='signal-box' style='margin-bottom:12px'>\
+               <div style='display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px'>\
+                 <div class='label'>Phase 1 — Spot Day+Swing (Long-Only)</div>\
+                 {enabled_badge}\
+               </div>\
+               <div style='display:flex;align-items:center;gap:8px;margin-top:8px'>\
+                 <span style='padding:3px 10px;border-radius:999px;font-weight:700;font-size:12px;\
+                   background:{regime_bg};color:{regime_color}'>{regime_str}</span>\
+                 <span class='dim' style='font-size:11px'>Timeframe stack: 4H bias · 1H setup · 15M trigger</span>\
+               </div>\
+               {block_row}\
+               {setup_row}\
+               {position_row}\
+             </div>"
+        )
+    };
+
     let body = system_layout(
         "LIVE Workspace",
         &status_body,
         "Primary Trading Action",
-        &format!("{}{}{}", agent_control_card, primary_body, market_body),
+        &format!("{}{}{}{}", phase1_card, agent_control_card, primary_body, market_body),
         "Recent Activity",
         &context_body,
         Some(("Market / Position Panel", "<div class='sum'>Snapshot view keeps routing and safety behavior unchanged.</div>")),
