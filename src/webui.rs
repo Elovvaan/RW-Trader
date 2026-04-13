@@ -2925,4 +2925,174 @@ mod tests {
         );
     }
 
+    // ── Post-threshold executor-submit proof (Requirement 5) ──────────────────
+    //
+    // DIAGNOSTIC PROOF: When the /trade/request handler receives a valid request
+    // and all authority/risk gates pass, exec.submit_market_order() is called.
+    //
+    // Exact file/function: webui.rs :: handle_post :: /trade/request
+    //   After authority.check() returns Proceed, the handler calls
+    //   state.exec.submit_market_order(...).await.  If the exchange client has an
+    //   empty base_url, the inner BinanceClient::post_order builds a relative URL
+    //   ("/api/v3/order"), which reqwest rejects immediately with a non-transient
+    //   "relative URL without a base" error — no retries, no network latency.
+    //   The handler then redirects to /authority?err=Trade%20execution%20failed…
+    //
+    // A redirect that contains "Trade%20execution%20failed" (rather than
+    // "No%20exchange%20client" or an earlier gate message) is conclusive proof:
+    //   1. Side/size validation passed.
+    //   2. Authority mode was not OFF.
+    //   3. Executor was Idle (idempotency guard cleared).
+    //   4. Risk check approved the order.
+    //   5. authority.check() returned Proceed.
+    //   6. exec.submit_market_order() was invoked.
+    //
+    // This test closes the chain: NPC dispatch → POST /trade/request
+    // → executor submit (submit_market_order → BinanceClient::post_order).
+
+    /// Helper: build an AppState where all gates are clear and a (failing)
+    /// exchange client is present, so /trade/request reaches executor submit.
+    fn make_state_gates_clear_failing_client() -> AppState {
+        use crate::client::BinanceClient;
+        use crate::executor::Executor;
+        use crate::withdrawal::{WithdrawalConfig, WithdrawalManager};
+
+        let pos  = Position::new("BTCUSDT");
+        let risk = RiskEngine::new(RiskConfig {
+            max_position_qty:       0.01,
+            max_daily_loss_usd:     50.0,
+            max_drawdown_usd:       100.0,
+            max_consecutive_losses: 3,
+            cooldown_after_loss:    Duration::from_secs(300),
+            max_spread_bps:         10.0,
+            max_feed_staleness:     Duration::from_secs(5),
+            min_order_interval:     Duration::from_secs(1),
+            signal_dedup_window:    Duration::from_secs(5),
+            max_open_orders:        1,
+            max_slippage_bps:       20.0,
+        }, &pos);
+        let store: Arc<dyn EventStore> = InMemoryEventStore::new();
+        let exec  = Arc::new(Executor::new(
+            "BTCUSDT".into(),
+            CircuitBreakerConfig::default(),
+            WatchdogConfig::default(),
+        ));
+        let authority = Arc::new(crate::authority::AuthorityLayer::new());
+        let withdrawals = Arc::new(WithdrawalManager::new(WithdrawalConfig::default()));
+        let signal = Arc::new(tokio::sync::Mutex::new(crate::signal::SignalEngine::new(
+            crate::signal::SignalConfig {
+                order_qty: 0.001,
+                momentum_threshold: 0.0,
+                imbalance_threshold: 0.0,
+                max_entry_spread_bps: 5.0,
+                max_feed_staleness: Duration::from_secs(3),
+                stop_loss_pct: 0.0,
+                take_profit_pct: 0.0,
+                max_hold_duration: Duration::from_secs(10),
+                min_mid_samples: 1,
+                min_trade_samples: 1,
+            },
+        )));
+        let truth = Arc::new(tokio::sync::Mutex::new(TruthState::new("BTCUSDT", 0.0)));
+        let npc = Arc::new(crate::npc::NpcAutonomousController::new(
+            crate::npc::NpcConfig::from_trade_cfg(&crate::agent::TradeAgentConfig {
+                enabled: false,
+                trade_size: 0.0,
+                momentum_threshold: 0.0,
+                poll_interval: Duration::from_millis(1000),
+                max_spread_bps: 5.0,
+            }),
+            crate::agent::AgentState {
+                store: Arc::clone(&store),
+                exec: Arc::clone(&exec),
+                feed: Arc::new(tokio::sync::Mutex::new(
+                    crate::feed::FeedState::new(Duration::from_secs(10))
+                )),
+                signal,
+                truth: Arc::clone(&truth),
+                authority: Arc::clone(&authority),
+                withdrawals: Arc::clone(&withdrawals),
+                // Use empty base_url so BinanceClient::post_order builds a
+                // relative URL that reqwest rejects immediately (non-transient,
+                // no retries) — proving submit_market_order was invoked.
+                client: Arc::new(BinanceClient::new(
+                    String::new(), String::new(), String::new(),
+                )),
+                symbol: "BTCUSDT".into(),
+                web_base_url: None,
+            },
+        ));
+        AppState {
+            store,
+            exec,
+            truth,
+            risk: Arc::new(tokio::sync::Mutex::new(risk)),
+            authority,
+            strategy: Arc::new(tokio::sync::Mutex::new(
+                crate::strategy::StrategyEngine::new()
+            )),
+            // Failing client: empty base_url → "relative URL without a base"
+            // (non-transient, no retries, immediate return).
+            client: Some(Arc::new(BinanceClient::new(
+                String::new(), String::new(), String::new(),
+            ))),
+            withdrawals,
+            npc,
+            profile: Arc::new(tokio::sync::Mutex::new(
+                crate::profile::RuntimeProfile::default()
+            )),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trade_request_reaches_executor_submit_when_authority_proceeds() {
+        let state = make_state_gates_clear_failing_client();
+
+        // Transition executor to Ready so sys_mode.can_trade() is true.
+        state.exec.set_mode_reconciling().await;
+        state.exec.set_mode_ready().await;
+
+        // Set authority to AUTO.
+        state.authority.set_mode_auto(&*state.store).await;
+
+        {
+            let mut truth = state.truth.lock().await;
+            // BUY side: needs buy_power > 0.
+            truth.buy_power = 1_000.0;
+            // can_place_order() = !state_dirty && !recon_in_progress && reconciled_at.is_some()
+            truth.state_dirty = false;
+            truth.last_reconciled_at = Some(std::time::Instant::now());
+            // Risk check uses mark_price as bid/ask; must be > 0 to pass InvalidMarketData guard.
+            truth.position.mark_price = 50_000.0;
+        }
+
+        // POST a small BUY request — all gates should clear and executor submit fires.
+        let body = "symbol=BTCUSDT&side=BUY&size=0.001&reason=diagnostic_test";
+        let resp = handle_post("/trade/request", "", body, &state).await;
+
+        // PROOF (Req. 5): executor submit was called.
+        // With an empty-URL client the HTTP POST returns a "relative URL without
+        // a base" error immediately (non-transient → no retries).  The handler
+        // wraps this in a redirect to /authority?err=Trade%20execution%20failed…
+        assert!(
+            resp.contains("Trade%20execution%20failed") || resp.contains("Trade execution failed"),
+            "Response must indicate executor submit was reached and failed; \
+             expected 'Trade execution failed' in redirect Location but got: {}",
+            &resp[..resp.len().min(300)]
+        );
+        // The handler must NOT have returned an earlier gate message.
+        assert!(
+            !resp.contains("No%20exchange%20client") && !resp.contains("No exchange client"),
+            "Must not return client-missing error (client IS configured)"
+        );
+        assert!(
+            !resp.contains("Authority%20mode%20OFF") && !resp.contains("Authority mode OFF"),
+            "Must not return authority-OFF error (authority is AUTO)"
+        );
+        assert!(
+            !resp.contains("executor%20is%20busy") && !resp.contains("executor is busy"),
+            "Must not return idempotency-guard error (executor is Idle)"
+        );
+    }
+
 }
