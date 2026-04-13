@@ -67,7 +67,9 @@ fn classify(event: &StoredEvent) -> LifecycleStage {
         TradingEvent::ExecStateTransition(_) => LifecycleStage::StateTransition,
         TradingEvent::ReconcileStarted(_)
         | TradingEvent::ReconcileCompleted(_)
-        | TradingEvent::ReconcileMismatch(_) => LifecycleStage::ReconcileEvent,
+        | TradingEvent::ReconcileMismatch(_)
+        | TradingEvent::ReconcileApplied(_)
+        | TradingEvent::BalanceUpdated(_)    => LifecycleStage::ReconcileEvent,
         TradingEvent::WatchdogTimeout(_)
         | TradingEvent::CircuitBreakerTripped(_) => LifecycleStage::SafetyEvent,
         _ => LifecycleStage::Other,
@@ -187,6 +189,24 @@ pub fn summarise_event(e: &StoredEvent) -> String {
             format!(
                 "field={}  local=\"{}\"  exchange=\"{}\"",
                 p.field, p.local_value, p.exchange_value,
+            ),
+
+        TradingEvent::ReconcileApplied(p) => {
+            let fill_summary: Vec<String> = p.fills
+                .iter()
+                .map(|f| format!("{}@{:.2}x{:.6}", f.side, f.price, f.qty))
+                .collect();
+            format!(
+                "cycle={}  fills={}  [{}]",
+                p.cycle, p.fills_count,
+                fill_summary.join(", "),
+            )
+        }
+
+        TradingEvent::BalanceUpdated(p) =>
+            format!(
+                "total_usd={:.2}  buy_power={:.8}  sell_inventory={:.8}",
+                p.total_balance_usd, p.buy_power, p.sell_inventory,
             ),
 
         TradingEvent::WatchdogTimeout(p) =>

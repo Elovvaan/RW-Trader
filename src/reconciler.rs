@@ -135,6 +135,10 @@ pub struct ReconcileResult {
     pub new_fills: usize,
     /// Whether reconcile data itself came back successfully.
     pub exchange_fetch_ok: bool,
+    /// True when buy_power or sell_inventory changed from the previous cycle.
+    pub balances_changed: bool,
+    /// Per-fill details for every new fill discovered this cycle.
+    pub fill_details: Vec<crate::events::FillDetail>,
 }
 
 impl ReconcileResult {
@@ -444,6 +448,10 @@ async fn fetch_all(
     Ok((open_orders, trades, balances, mark_price))
 }
 
+/// Minimum balance delta (in asset units) required to trigger a BALANCE_UPDATED event.
+/// Avoids spurious events from floating-point rounding noise.
+const BALANCE_CHANGE_EPSILON: f64 = 1e-8;
+
 /// Apply fetched data to TruthState. Returns what changed.
 /// Called with the mutex held — runs synchronously.
 fn apply_reconciliation(
@@ -469,6 +477,27 @@ fn apply_reconciliation(
     if result.new_fills > 0 {
         info!("RECONCILE: {} new fill(s) to process", result.new_fills);
     }
+
+    // ── Collect fill details for new fills (for RECONCILE_APPLIED events) ──────
+    result.fill_details = new_trades
+        .iter()
+        .map(|t| {
+            let qty: f64 = t.qty.parse().unwrap_or_else(|_| {
+                warn!("RECONCILE: fill id={} has unparseable qty {:?} — defaulting to 0", t.id, t.qty);
+                0.0
+            });
+            let price: f64 = t.price.parse().unwrap_or_else(|_| {
+                warn!("RECONCILE: fill id={} has unparseable price {:?} — defaulting to 0", t.id, t.price);
+                0.0
+            });
+            crate::events::FillDetail {
+                fill_id: t.id,
+                side:    t.side().to_string(),
+                qty,
+                price,
+            }
+        })
+        .collect();
 
     // ── Rebuild position from ALL fills (not just new ones) ───────────────────
     // Rebuilding from scratch every cycle ensures correctness even if we
@@ -579,6 +608,19 @@ fn apply_reconciliation(
     }
     let (total_balance_usd, buy_power, sell_inventory, balance_status) =
         map_balances(&state.symbol, &balances, mark_price);
+
+    // Detect balance changes: flag when buy_power or sell_inventory differs from last cycle.
+    let prev_buy_power    = state.buy_power;
+    let prev_sell_inv     = state.sell_inventory;
+    result.balances_changed = (buy_power - prev_buy_power).abs() > BALANCE_CHANGE_EPSILON
+        || (sell_inventory - prev_sell_inv).abs() > BALANCE_CHANGE_EPSILON;
+    if result.balances_changed {
+        info!(
+            "RECONCILE: BALANCE_UPDATED — buy_power {:.8} → {:.8}  sell_inventory {:.8} → {:.8}",
+            prev_buy_power, buy_power, prev_sell_inv, sell_inventory,
+        );
+    }
+
     state.total_balance_usd = total_balance_usd;
     state.tradable_balance = buy_power;
     state.buy_power = buy_power;
@@ -756,6 +798,40 @@ pub fn spawn_reconciliation_loop_with_executor_and_store(
                                         field:          "open_order_count".to_string(),
                                         local_value:    "mismatch_detected".to_string(),
                                         exchange_value: "see_logs".to_string(),
+                                    },
+                                ),
+                            ));
+                        }
+
+                        // ── RECONCILE_APPLIED: emit when new fills were processed ──────────
+                        if result.new_fills > 0 {
+                            store.append(crate::events::StoredEvent::new(
+                                Some(symbol.clone()),
+                                None, None,
+                                crate::events::TradingEvent::ReconcileApplied(
+                                    crate::events::ReconcileAppliedPayload {
+                                        cycle,
+                                        fills_count: result.new_fills,
+                                        fills:       result.fill_details.clone(),
+                                    },
+                                ),
+                            ));
+                        }
+
+                        // ── BALANCE_UPDATED: emit when buy_power or sell_inventory changed ─
+                        if result.balances_changed {
+                            let (total_usd, buy_power, sell_inv) = {
+                                let s = state.lock().await;
+                                (s.total_balance_usd, s.buy_power, s.sell_inventory)
+                            };
+                            store.append(crate::events::StoredEvent::new(
+                                Some(symbol.clone()),
+                                None, None,
+                                crate::events::TradingEvent::BalanceUpdated(
+                                    crate::events::BalanceUpdatedPayload {
+                                        total_balance_usd: total_usd,
+                                        buy_power,
+                                        sell_inventory:    sell_inv,
                                     },
                                 ),
                             ));
@@ -1335,5 +1411,107 @@ mod tests {
         };
         let remaining = compute_remaining_qty(&record).unwrap();
         assert!(approx(remaining, 0.007), "got {}", remaining);
+    }
+
+    // ── End-to-end spot lifecycle diagnostic ─────────────────────────────────
+    //
+    // Requirement: prove that submit → accepted/rejected → reconcile/update
+    // is fully observable through ReconcileResult fields.
+    //
+    // Simulates the path:
+    //   1. Order submitted (state transitions to WaitingAck / position = 0)
+    //   2. Reconcile cycle discovers the fill via myTrades
+    //   3. ReconcileResult carries fill details (RECONCILE_APPLIED observable)
+    //   4. ReconcileResult carries balance change flag (BALANCE_UPDATED observable)
+    //   5. Position is updated from exchange truth
+    //   6. fill_id is recorded so the next cycle does NOT re-process the fill
+
+    #[test]
+    fn test_spot_lifecycle_reconcile_applied_and_balance_updated() {
+        let mut state = fresh_state();
+        // Simulate post-submission state: order submitted, not yet locally filled
+        state.state_dirty = false;
+        state.last_reconciled_at = Some(Instant::now());
+        state.buy_power = 500.0;     // starting USDT balance
+        state.sell_inventory = 0.0;  // no BTC yet
+
+        // Exchange returns a fill for the order (0.001 BTC @ 50000 USDT)
+        let trades = vec![make_trade(101, true, "0.001", "50000")];
+        // Balance after fill: received 0.001 BTC, spent ~50 USDT
+        let balances = vec![
+            crate::client::Balance { asset: "USDT".to_string(), free: 450.0, locked: 0.0 },
+            crate::client::Balance { asset: "BTC".to_string(),  free: 0.001, locked: 0.0 },
+        ];
+
+        // ── Cycle 1: reconcile discovers the fill ────────────────────────────
+        let result = apply_reconciliation(&mut state, vec![], trades.clone(), balances.clone(), 50000.0);
+
+        // ORDER fill observable: new_fills = 1, fill_details populated
+        assert_eq!(result.new_fills, 1,
+            "RECONCILE_APPLIED: expected 1 new fill, got {}", result.new_fills);
+        assert_eq!(result.fill_details.len(), 1,
+            "fill_details should carry per-fill info");
+        let fill = &result.fill_details[0];
+        assert_eq!(fill.fill_id, 101);
+        assert_eq!(fill.side, "BUY");
+        assert!((fill.qty - 0.001).abs() < 1e-8,
+            "fill qty mismatch: {}", fill.qty);
+        assert!((fill.price - 50000.0).abs() < 1e-2,
+            "fill price mismatch: {}", fill.price);
+
+        // BALANCE_UPDATED observable: sell_inventory increased (received BTC)
+        assert!(result.balances_changed,
+            "BALANCE_UPDATED: balances_changed should be true after fill");
+
+        // Position updated from exchange truth
+        assert!((state.position.size - 0.001).abs() < 1e-8,
+            "position.size should reflect exchange fill: {}", state.position.size);
+
+        // fill_id recorded to prevent re-processing
+        assert!(state.seen_fill_ids.contains(&101),
+            "fill_id 101 should be in seen_fill_ids after reconcile");
+
+        // ── Cycle 2: same fill reappears on exchange, no new processing ───────
+        let result2 = apply_reconciliation(&mut state, vec![], trades.clone(), balances.clone(), 50000.0);
+        assert_eq!(result2.new_fills, 0,
+            "Idempotency: fill should not be re-processed on second reconcile cycle");
+        assert!(result2.fill_details.is_empty(),
+            "fill_details should be empty when no new fills");
+        // Balances are identical so no change event on second cycle
+        assert!(!result2.balances_changed,
+            "BALANCE_UPDATED: no change expected when balances are identical");
+    }
+
+    // ── Rejected order observable ─────────────────────────────────────────────
+    // Verifies that when an order is rejected (no fill appears in myTrades),
+    // reconcile correctly sees 0 new fills and no balance change.
+
+    #[test]
+    fn test_spot_lifecycle_rejected_order_no_fill_no_balance_change() {
+        let mut state = fresh_state();
+        state.state_dirty = false;
+        state.last_reconciled_at = Some(Instant::now());
+        state.buy_power = 500.0;
+        state.sell_inventory = 0.0;
+
+        // Exchange returns no trades (order was rejected before reaching the book)
+        let no_trades: Vec<crate::client::MyTrade> = vec![];
+        let balances_unchanged = vec![
+            crate::client::Balance { asset: "USDT".to_string(), free: 500.0, locked: 0.0 },
+        ];
+
+        let result = apply_reconciliation(
+            &mut state, vec![], no_trades, balances_unchanged, 50000.0,
+        );
+
+        // No fills processed — ORDER_REJECTED path leaves no trace in myTrades
+        assert_eq!(result.new_fills, 0,
+            "No fills expected for a rejected order");
+        assert!(result.fill_details.is_empty());
+
+        // No balance change (order never reached exchange balance layer)
+        // buy_power was 500.0, still shows 500.0 in USDT
+        assert!(!result.balances_changed,
+            "No balance change expected when order was rejected and never filled");
     }
 }

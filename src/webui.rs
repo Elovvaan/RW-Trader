@@ -889,7 +889,9 @@ fn event_tag_class(et: &str) -> &'static str {
         "order_rejected"             => "REJECT",
         "reconcile_started"
         | "reconcile_completed"
-        | "reconcile_mismatch"       => "RECON",
+        | "reconcile_mismatch"
+        | "reconcile_applied"
+        | "balance_updated"              => "RECON",
         "watchdog_timeout"
         | "circuit_breaker_tripped"  => "SAFETY",
         _                            => "OTHER",
