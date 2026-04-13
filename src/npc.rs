@@ -946,6 +946,17 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         .and_then(|r| r.regime_score_cutoff.get(&regime).map(|v| v.current))
         .unwrap_or(effective_cfg.alpha.min_action_score);
 
+    // Compute the enforced gate here — before any logging or comparison — so that
+    // every event, report, and telemetry field uses exactly the same variable as
+    // the final `if chosen.score < effective_cutoff` comparison below.
+    // For micro accounts the balance-tier cap is applied; regime/learner can only
+    // lower the gate further, never raise it back above the tier maximum.
+    let effective_cutoff = if threshold_mode == "micro_aggressive" {
+        effective_threshold.min(regime_cutoff)
+    } else {
+        regime_cutoff
+    };
+
     for c in &candidates {
         rt.perf.entry(c.role).or_default().proposed += 1;
         lifecycle(
@@ -979,7 +990,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             .then_with(|| a.role.cmp(&b.role))
     });
 
-    let metrics_line = format_cycle_metrics(cycle_id, regime, &candidates, regime_cutoff, &portfolio_controls);
+    let metrics_line = format_cycle_metrics(cycle_id, regime, &candidates, effective_cutoff, &portfolio_controls);
     log_npc_event(&*state.store, "alpha_cycle", &metrics_line);
 
     let Some(chosen) = candidates.first().cloned() else {
@@ -1025,18 +1036,11 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             execution_block_reason: reason.clone(),
             cooldown_active: false,
             cooldown_remaining_ms: 0,
-            effective_threshold,
+            effective_threshold: effective_cutoff,
             threshold_mode: threshold_mode.to_string(),
         };
     }
 
-    // For micro accounts, cap the enforced cutoff at effective_threshold so that
-    // regime/learner values can never raise the gate back above the balance-tier limit.
-    let effective_cutoff = if threshold_mode == "micro_aggressive" {
-        effective_threshold.min(regime_cutoff)
-    } else {
-        regime_cutoff
-    };
     if chosen.score < effective_cutoff {
         lifecycle(
             &*state.store,
@@ -1104,7 +1108,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             execution_block_reason: String::new(),
             cooldown_active: false,
             cooldown_remaining_ms: 0,
-            effective_threshold,
+            effective_threshold: effective_cutoff,
             threshold_mode: threshold_mode.to_string(),
         };
     }
@@ -1150,7 +1154,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             execution_block_reason: String::new(),
             cooldown_active: false,
             cooldown_remaining_ms: 0,
-            effective_threshold,
+            effective_threshold: effective_cutoff,
             threshold_mode: threshold_mode.to_string(),
         };
     }
@@ -1196,7 +1200,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             execution_block_reason: guard_reason,
             cooldown_active,
             cooldown_remaining_ms,
-            effective_threshold,
+            effective_threshold: effective_cutoff,
             threshold_mode: threshold_mode.to_string(),
         };
     }
@@ -1241,7 +1245,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             execution_block_reason: "LIVE_REQUIRES_PAPER_EXECUTION".to_string(),
             cooldown_active: false,
             cooldown_remaining_ms: 0,
-            effective_threshold,
+            effective_threshold: effective_cutoff,
             threshold_mode: threshold_mode.to_string(),
         };
     }
@@ -1294,7 +1298,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                 execution_block_reason: "WEB_UI_ADDR_MISSING".to_string(),
                 cooldown_active,
                 cooldown_remaining_ms,
-                effective_threshold,
+                effective_threshold: effective_cutoff,
                 threshold_mode: threshold_mode.to_string(),
             };
         };
@@ -1375,7 +1379,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                     execution_block_reason: format!("HTTP_STATUS_{}", status_code),
                     cooldown_active,
                     cooldown_remaining_ms,
-                    effective_threshold,
+                    effective_threshold: effective_cutoff,
                     threshold_mode: threshold_mode.to_string(),
                 };
             }
@@ -1405,7 +1409,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                     execution_block_reason: format!("REQUEST_ERROR:{}", e),
                     cooldown_active,
                     cooldown_remaining_ms,
-                    effective_threshold,
+                    effective_threshold: effective_cutoff,
                     threshold_mode: threshold_mode.to_string(),
                 };
             }
