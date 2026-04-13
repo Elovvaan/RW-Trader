@@ -437,6 +437,11 @@ pub struct NpcLoopSnapshot {
     pub drawdown_pct: f64,
     /// Configured max drawdown limit (fraction).
     pub drawdown_limit: f64,
+    // ── Cooldown telemetry ────────────────────────────────────────────────────
+    /// True when the chosen role's per-role cooldown is still ticking.
+    pub cooldown_active: bool,
+    /// Milliseconds remaining on the active cooldown (0 when inactive).
+    pub cooldown_remaining_ms: u64,
 }
 
 #[derive(Default)]
@@ -455,6 +460,10 @@ struct NpcLoopTelemetry {
     balance_block_reason: String,
     risk_block_reason: String,
     execution_block_reason: String,
+    /// True when the chosen role's per-role cooldown is still ticking.
+    cooldown_active: bool,
+    /// Milliseconds remaining on the active cooldown (0 when inactive).
+    cooldown_remaining_ms: u64,
 }
 
 struct NpcLoopControl {
@@ -623,6 +632,8 @@ impl NpcAutonomousController {
             peak_equity,
             drawdown_pct,
             drawdown_limit: self.cfg.alpha.max_drawdown_pct,
+            cooldown_active: telemetry.cooldown_active,
+            cooldown_remaining_ms: telemetry.cooldown_remaining_ms,
         }
     }
 
@@ -689,6 +700,8 @@ impl NpcAutonomousController {
                         t.balance_block_reason = report.balance_block_reason;
                         t.risk_block_reason = report.risk_block_reason;
                         t.execution_block_reason = report.execution_block_reason;
+                        t.cooldown_active = report.cooldown_active;
+                        t.cooldown_remaining_ms = report.cooldown_remaining_ms;
                         t.status = match report.status.as_str() {
                             "blocked" => "Blocked by safety checks".to_string(),
                             "running" => AgentMode::Auto.state_label().to_string(),
@@ -735,6 +748,14 @@ impl NpcAutonomousController {
         t.execution_block_reason = reason.to_string();
         t.final_decision = "BLOCKED".to_string();
     }
+
+    /// Test-only helper: inject cooldown state into telemetry.
+    #[cfg(test)]
+    pub async fn set_cooldown_for_test(&self, active: bool, remaining_ms: u64) {
+        let mut t = self.telemetry.lock().await;
+        t.cooldown_active = active;
+        t.cooldown_remaining_ms = remaining_ms;
+    }
 }
 
 pub async fn spawn_npc_trading_layer(controller: &NpcAutonomousController) {
@@ -764,6 +785,10 @@ struct NpcCycleReport {
     risk_block_reason: String,
     /// Why a strategy/score/execution guard blocked execution (empty when not the cause).
     execution_block_reason: String,
+    /// True when the chosen role's per-role cooldown is still ticking.
+    cooldown_active: bool,
+    /// Milliseconds remaining on the active cooldown (0 when inactive).
+    cooldown_remaining_ms: u64,
 }
 
 async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRuntimeState>>) -> NpcCycleReport {
@@ -779,6 +804,8 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         balance_block_reason: String::new(),
         risk_block_reason: String::new(),
         execution_block_reason: String::new(),
+        cooldown_active: false,
+        cooldown_remaining_ms: 0,
     };
     let mode = state.authority.mode().await;
     if mode == AuthorityMode::Off {
@@ -920,6 +947,8 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             balance_block_reason: String::new(),
             risk_block_reason: String::new(),
             execution_block_reason: reason.clone(),
+            cooldown_active: false,
+            cooldown_remaining_ms: 0,
         };
     }
 
@@ -955,6 +984,8 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             balance_block_reason: String::new(),
             risk_block_reason: String::new(),
             execution_block_reason: score_reason,
+            cooldown_active: false,
+            cooldown_remaining_ms: 0,
         };
     }
 
@@ -984,6 +1015,8 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             balance_block_reason: String::new(),
             risk_block_reason: portfolio_reason,
             execution_block_reason: String::new(),
+            cooldown_active: false,
+            cooldown_remaining_ms: 0,
         };
     }
 
@@ -1026,11 +1059,13 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             balance_block_reason: alloc_reason,
             risk_block_reason: String::new(),
             execution_block_reason: String::new(),
+            cooldown_active: false,
+            cooldown_remaining_ms: 0,
         };
     }
 
     let order_notional = allocation.qty * metrics.mid.max(0.0);
-    let guard_reasons = evaluate_guards(
+    let (guard_reasons, cooldown_active, cooldown_remaining_ms) = evaluate_guards(
         &effective_cfg,
         &rt,
         chosen.role,
@@ -1068,6 +1103,8 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             balance_block_reason: String::new(),
             risk_block_reason: String::new(),
             execution_block_reason: guard_reason,
+            cooldown_active,
+            cooldown_remaining_ms,
         };
     }
 
@@ -1109,6 +1146,8 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             balance_block_reason: String::new(),
             risk_block_reason: String::new(),
             execution_block_reason: "LIVE_REQUIRES_PAPER_EXECUTION".to_string(),
+            cooldown_active: false,
+            cooldown_remaining_ms: 0,
         };
     }
 
@@ -1158,6 +1197,8 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                 balance_block_reason: String::new(),
                 risk_block_reason: String::new(),
                 execution_block_reason: "WEB_UI_ADDR_MISSING".to_string(),
+                cooldown_active,
+                cooldown_remaining_ms,
             };
         };
 
@@ -1235,6 +1276,8 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                     balance_block_reason: String::new(),
                     risk_block_reason: String::new(),
                     execution_block_reason: format!("HTTP_STATUS_{}", status_code),
+                    cooldown_active,
+                    cooldown_remaining_ms,
                 };
             }
             Err(e) => {
@@ -1261,6 +1304,8 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                     balance_block_reason: String::new(),
                     risk_block_reason: String::new(),
                     execution_block_reason: format!("REQUEST_ERROR:{}", e),
+                    cooldown_active,
+                    cooldown_remaining_ms,
                 };
             }
         }
@@ -1319,6 +1364,8 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         balance_block_reason: String::new(),
         risk_block_reason: String::new(),
         execution_block_reason: String::new(),
+        cooldown_active,
+        cooldown_remaining_ms,
     }
 }
 
@@ -1622,7 +1669,7 @@ fn evaluate_guards(
     total_balance_usd: f64,
     sell_inventory: f64,
     order_notional: f64,
-) -> Vec<String> {
+) -> (Vec<String>, bool, u64) {
     let mut reasons = Vec::new();
     if cfg.guards.kill_switch {
         reasons.push("KILL_SWITCH_ACTIVE".to_string());
@@ -1665,11 +1712,6 @@ fn evaluate_guards(
             expected_slippage_bps, cfg.guards.max_slippage_bps
         ));
     }
-    if let Some(last_at) = rt.last_action_at.get(&role) {
-        if last_at.elapsed() < Duration::from_secs(cfg.guards.cooldown_secs) {
-            reasons.push("ROLE_COOLDOWN_ACTIVE".to_string());
-        }
-    }
     if side.eq_ignore_ascii_case("BUY") && position_size + cfg.trade_size > cfg.guards.max_position_qty {
         reasons.push(format!(
             "POSITION_LIMIT_EXCEEDED:{:.8}>{:.8}",
@@ -1677,7 +1719,39 @@ fn evaluate_guards(
             cfg.guards.max_position_qty
         ));
     }
-    reasons
+
+    // ── Per-role cooldown ────────────────────────────────────────────────────
+    // Small accounts (0 < balance < $100): drastically reduced cooldown (300ms).
+    // Normal accounts: max(cycle_interval, 250ms).
+    // Allow immediate execution when no other guards fired — the cooldown only
+    // adds friction when something else is already blocking the cycle.
+    let effective_cooldown = if total_balance_usd > 0.0 && total_balance_usd < 100.0 {
+        Duration::from_millis(300)
+    } else {
+        let cycle_ms = cfg.cycle_interval.as_millis() as u64;
+        Duration::from_millis(cycle_ms.max(250))
+    };
+
+    let (cooldown_active, cooldown_remaining_ms) =
+        if let Some(last_at) = rt.last_action_at.get(&role) {
+            let elapsed = last_at.elapsed();
+            if elapsed < effective_cooldown {
+                let remaining = effective_cooldown - elapsed;
+                (true, remaining.as_millis() as u64)
+            } else {
+                (false, 0u64)
+            }
+        } else {
+            (false, 0u64)
+        };
+
+    // Only block on cooldown when other guards are already firing.
+    // If the pipeline is otherwise clear (no blocks), allow immediate execution.
+    if cooldown_active && !reasons.is_empty() {
+        reasons.push(format!("ROLE_COOLDOWN_ACTIVE:{cooldown_remaining_ms}ms_remaining"));
+    }
+
+    (reasons, cooldown_active, cooldown_remaining_ms)
 }
 
 fn evaluate_portfolio_controls(
@@ -2123,7 +2197,7 @@ mod tests {
         let metrics = low_liquidity_metrics();
 
         // Small account (<$100), SELL side, non-zero inventory and notional.
-        let reasons = evaluate_guards(
+        let (reasons, _cooldown_active, _cooldown_remaining_ms) = evaluate_guards(
             &cfg, &rt, NpcRole::InventoryManager, "SELL",
             0.0, &metrics, 20.0,
             /* total_balance_usd */ 50.0,
@@ -2153,7 +2227,7 @@ mod tests {
         let metrics = low_liquidity_metrics();
 
         // Large account (>=$100): depth checks must remain active.
-        let reasons = evaluate_guards(
+        let (reasons, _cooldown_active, _cooldown_remaining_ms) = evaluate_guards(
             &cfg, &rt, NpcRole::InventoryManager, "SELL",
             0.0, &metrics, 20.0,
             /* total_balance_usd */ 500.0,
@@ -2178,7 +2252,7 @@ mod tests {
         let metrics = low_liquidity_metrics();
 
         // Small account but zero sell_inventory: bypass must NOT apply.
-        let reasons = evaluate_guards(
+        let (reasons, _cooldown_active, _cooldown_remaining_ms) = evaluate_guards(
             &cfg, &rt, NpcRole::InventoryManager, "SELL",
             0.0, &metrics, 20.0,
             /* total_balance_usd */ 50.0,
@@ -2199,7 +2273,7 @@ mod tests {
         let rt = NpcRuntimeState::default();
         let metrics = low_liquidity_metrics();
 
-        let reasons = evaluate_guards(
+        let (reasons, _cooldown_active, _cooldown_remaining_ms) = evaluate_guards(
             &cfg, &rt, NpcRole::InventoryManager, "SELL",
             0.0, &metrics, 0.0,
             /* total_balance_usd */ 50.0,
@@ -2211,6 +2285,130 @@ mod tests {
             reasons.iter().any(|r| r == "KILL_SWITCH_ACTIVE"),
             "kill switch must always block, got: {:?}", reasons
         );
+    }
+
+    // ── evaluate_guards: cooldown logic ────────────────────────────────────────
+
+    #[test]
+    fn cooldown_inactive_when_no_prior_action() {
+        let cfg = test_cfg();
+        let rt = NpcRuntimeState::default();
+        let metrics = crate::signal::SignalMetrics {
+            momentum_5s: 0.01,
+            spread_bps: 1.0,
+            trade_samples: 10,
+            mid: 50_000.0,
+            ..Default::default()
+        };
+        let (reasons, cooldown_active, cooldown_remaining_ms) = evaluate_guards(
+            &cfg, &rt, NpcRole::InventoryManager, "SELL",
+            0.0, &metrics, 0.0,
+            /* total_balance_usd */ 500.0,
+            /* sell_inventory    */ 0.001,
+            /* order_notional    */ 50.0,
+        );
+        assert!(!cooldown_active, "cooldown must be inactive when no prior action, reasons: {:?}", reasons);
+        assert_eq!(cooldown_remaining_ms, 0);
+        assert!(!reasons.iter().any(|r| r.starts_with("ROLE_COOLDOWN_ACTIVE")));
+    }
+
+    #[test]
+    fn cooldown_active_but_allows_immediate_execution_when_no_other_blocks() {
+        let mut cfg = test_cfg();
+        cfg.cycle_interval = Duration::from_millis(500);
+        let mut rt = NpcRuntimeState::default();
+        // Record a very recent action to trigger cooldown.
+        rt.last_action_at.insert(NpcRole::InventoryManager, Instant::now());
+        let metrics = crate::signal::SignalMetrics {
+            momentum_5s: 0.01,
+            spread_bps: 1.0,   // within max_spread_bps
+            trade_samples: 10, // above min_liquidity_score
+            mid: 50_000.0,
+            ..Default::default()
+        };
+        // Normal account (>= $100), no other guard violations.
+        let (reasons, cooldown_active, cooldown_remaining_ms) = evaluate_guards(
+            &cfg, &rt, NpcRole::InventoryManager, "SELL",
+            0.0, &metrics, 0.0,
+            /* total_balance_usd */ 500.0,
+            /* sell_inventory    */ 0.001,
+            /* order_notional    */ 50.0,
+        );
+        // cooldown IS active, but should NOT block because no other guards fired.
+        assert!(cooldown_active, "cooldown should be detected as active");
+        assert!(cooldown_remaining_ms > 0, "remaining ms must be positive");
+        assert!(
+            !reasons.iter().any(|r| r.starts_with("ROLE_COOLDOWN_ACTIVE")),
+            "ROLE_COOLDOWN_ACTIVE must NOT be added when no other guards fired (immediate execution), reasons: {:?}", reasons
+        );
+    }
+
+    #[test]
+    fn cooldown_blocks_when_other_guards_also_fire() {
+        let mut cfg = test_cfg();
+        cfg.cycle_interval = Duration::from_millis(500);
+        let mut rt = NpcRuntimeState::default();
+        rt.last_action_at.insert(NpcRole::InventoryManager, Instant::now());
+        // High spread to trigger another guard.
+        let metrics = crate::signal::SignalMetrics {
+            momentum_5s: 0.01,
+            spread_bps: 100.0, // exceeds max_spread_bps=5.0
+            trade_samples: 10,
+            mid: 50_000.0,
+            ..Default::default()
+        };
+        let (reasons, cooldown_active, _cooldown_remaining_ms) = evaluate_guards(
+            &cfg, &rt, NpcRole::InventoryManager, "SELL",
+            0.0, &metrics, 0.0,
+            /* total_balance_usd */ 500.0,
+            /* sell_inventory    */ 0.001,
+            /* order_notional    */ 50.0,
+        );
+        assert!(cooldown_active);
+        assert!(
+            reasons.iter().any(|r| r.starts_with("ROLE_COOLDOWN_ACTIVE")),
+            "ROLE_COOLDOWN_ACTIVE must be added when other guards also fired, reasons: {:?}", reasons
+        );
+    }
+
+    #[test]
+    fn small_account_uses_reduced_cooldown() {
+        let mut cfg = test_cfg();
+        // Use a long cycle interval so normal cooldown would be large.
+        cfg.cycle_interval = Duration::from_secs(10);
+        let mut rt = NpcRuntimeState::default();
+        // Place the last action 400ms ago — within normal cooldown (10s) but beyond small account (300ms).
+        rt.last_action_at.insert(
+            NpcRole::InventoryManager,
+            Instant::now() - Duration::from_millis(400),
+        );
+        let metrics = crate::signal::SignalMetrics {
+            momentum_5s: 0.01,
+            spread_bps: 1.0,
+            trade_samples: 10,
+            mid: 50_000.0,
+            ..Default::default()
+        };
+        // Small account: effective cooldown is 300ms, so 400ms ago means cooldown is expired.
+        let (_, cooldown_active, _) = evaluate_guards(
+            &cfg, &rt, NpcRole::InventoryManager, "SELL",
+            0.0, &metrics, 0.0,
+            /* total_balance_usd */ 50.0,
+            /* sell_inventory    */ 0.001,
+            /* order_notional    */ 50.0,
+        );
+        assert!(!cooldown_active, "small account cooldown (300ms) should be expired after 400ms");
+
+        // Same test for normal account: effective cooldown is 10s, so 400ms ago still in cooldown.
+        let (_, cooldown_active_normal, remaining_normal) = evaluate_guards(
+            &cfg, &rt, NpcRole::InventoryManager, "SELL",
+            0.0, &metrics, 0.0,
+            /* total_balance_usd */ 500.0,
+            /* sell_inventory    */ 0.001,
+            /* order_notional    */ 50.0,
+        );
+        assert!(cooldown_active_normal, "normal account cooldown (10s) should still be active after 400ms");
+        assert!(remaining_normal > 0);
     }
 
 
