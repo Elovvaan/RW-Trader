@@ -473,29 +473,45 @@ fn apply_reconciliation(
         .filter(|t| !state.seen_fill_ids.contains(&t.id))
         .collect();
 
-    result.new_fills = new_trades.len();
-    if result.new_fills > 0 {
-        info!("RECONCILE: {} new fill(s) to process", result.new_fills);
+    let pending_new_fills = new_trades.len();
+    if pending_new_fills > 0 {
+        info!("RECONCILE: {} new fill(s) to process", pending_new_fills);
     }
 
     // ── Collect fill details for new fills (for RECONCILE_APPLIED events) ──────
-    result.fill_details = new_trades
+    // These remain pending until after build_position(...) succeeds so callers
+    // cannot observe fills as "applied" on an early-return error path.
+    let pending_fill_details: Vec<crate::events::FillDetail> = new_trades
         .iter()
-        .map(|t| {
-            let qty: f64 = t.qty.parse().unwrap_or_else(|_| {
-                warn!("RECONCILE: fill id={} has unparseable qty {:?} — defaulting to 0", t.id, t.qty);
-                0.0
-            });
-            let price: f64 = t.price.parse().unwrap_or_else(|_| {
-                warn!("RECONCILE: fill id={} has unparseable price {:?} — defaulting to 0", t.id, t.price);
-                0.0
-            });
-            crate::events::FillDetail {
+        .filter_map(|t| {
+            let qty: f64 = match t.qty.parse() {
+                Ok(qty) => qty,
+                Err(_) => {
+                    warn!(
+                        "RECONCILE: fill id={} has unparseable qty {:?} — skipping fill detail",
+                        t.id,
+                        t.qty
+                    );
+                    return None;
+                }
+            };
+            let price: f64 = match t.price.parse() {
+                Ok(price) => price,
+                Err(_) => {
+                    warn!(
+                        "RECONCILE: fill id={} has unparseable price {:?} — skipping fill detail",
+                        t.id,
+                        t.price
+                    );
+                    return None;
+                }
+            };
+            Some(crate::events::FillDetail {
                 fill_id: t.id,
                 side:    t.side().to_string(),
                 qty,
                 price,
-            }
+            })
         })
         .collect();
 
