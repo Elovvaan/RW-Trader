@@ -202,6 +202,13 @@ pub struct Phase1Config {
     /// For Range regime: both 4H and 1H must be below (min_trend_drift * this factor).
     /// Lower factor = stricter range qualification.
     pub range_setup_factor: f64,
+
+    /// Breakout: minimum buy imbalance required to confirm the move.
+    ///
+    /// Default 0.20 (20% net buy aggression). MICRO_ACTIVE lowers this to 0.12
+    /// to allow earlier entry on smaller-balance moves without removing the
+    /// imbalance gate entirely.
+    pub breakout_min_imbalance: f64,
 }
 
 impl Default for Phase1Config {
@@ -226,6 +233,28 @@ impl Default for Phase1Config {
             pullback_swing_depth_pct: 0.003, // pullbacks < 0.3% are DAY; deeper are SWING
             breakout_min_momentum_1s: 0.0001, // minimum 1s momentum to confirm breakout
             range_setup_factor:      0.5,   // 1H must be < min_trend_drift * 0.5 for RANGE
+            breakout_min_imbalance:  0.20,  // 20% net buy aggression to confirm breakout
+        }
+    }
+}
+
+impl Phase1Config {
+    /// MICRO_ACTIVE preset: lower thresholds for high-frequency small-balance trading.
+    ///
+    /// Changes from default (behavior-only; all safety mechanics preserved):
+    ///   trigger_window_secs      15.0  → 8.0    faster trigger acceptance
+    ///   min_trend_drift          0.0008 → 0.0004 earlier momentum confirmation
+    ///   min_samples                10  → 5      shorter confirmation window
+    ///   breakout_min_momentum_1s 0.0001→ 0.00005 fewer "wait" holds
+    ///   breakout_min_imbalance    0.20 → 0.12   more permissive breakout entry
+    pub fn micro_active() -> Self {
+        Self {
+            trigger_window_secs:     8.0,
+            min_trend_drift:         0.0004,
+            min_samples:             5,
+            breakout_min_momentum_1s: 0.00005,
+            breakout_min_imbalance:  0.12,
+            ..Self::default()
         }
     }
 }
@@ -455,7 +484,7 @@ impl Phase1Engine {
         if td < self.cfg.min_trend_drift * 0.5 { return None; }
 
         // Strong buy imbalance required — volume must confirm the move.
-        if metrics.imbalance_1s < 0.20 { return None; }
+        if metrics.imbalance_1s < self.cfg.breakout_min_imbalance { return None; }
 
         // 1s momentum must meet the configured minimum to confirm acceleration.
         // Without acceleration, the "breakout" could be a false start.
@@ -734,6 +763,12 @@ pub struct Phase1Status {
     pub position_target:  Option<f64>,
     pub break_even:       bool,
     pub high_water:       Option<f64>,
+    /// Active behavior mode label (e.g. "MICRO_ACTIVE", "STANDARD").
+    pub behavior_mode:    String,
+    /// Effective trigger window in seconds (profile-adjusted).
+    pub effective_trigger_window_secs: f64,
+    /// Effective minimum trend drift (profile-adjusted).
+    pub effective_min_trend_drift: f64,
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -985,5 +1020,104 @@ mod tests {
         });
         engine.on_exit_confirmed();
         assert!(engine.open_position.is_none());
+    }
+
+    // ── MICRO_ACTIVE Phase1Config preset tests ────────────────────────────────
+
+    #[test]
+    fn test_micro_active_config_trigger_window_shorter() {
+        let ma  = Phase1Config::micro_active();
+        let def = Phase1Config::default();
+        assert!(ma.trigger_window_secs < def.trigger_window_secs,
+            "micro_active trigger_window_secs {} should be < default {}",
+            ma.trigger_window_secs, def.trigger_window_secs);
+    }
+
+    #[test]
+    fn test_micro_active_config_min_trend_drift_lower() {
+        let ma  = Phase1Config::micro_active();
+        let def = Phase1Config::default();
+        assert!(ma.min_trend_drift < def.min_trend_drift,
+            "micro_active min_trend_drift {} should be < default {}",
+            ma.min_trend_drift, def.min_trend_drift);
+    }
+
+    #[test]
+    fn test_micro_active_config_min_samples_fewer() {
+        let ma  = Phase1Config::micro_active();
+        let def = Phase1Config::default();
+        assert!(ma.min_samples < def.min_samples,
+            "micro_active min_samples {} should be < default {}",
+            ma.min_samples, def.min_samples);
+    }
+
+    #[test]
+    fn test_micro_active_config_breakout_momentum_lower() {
+        let ma  = Phase1Config::micro_active();
+        let def = Phase1Config::default();
+        assert!(ma.breakout_min_momentum_1s < def.breakout_min_momentum_1s,
+            "micro_active breakout_min_momentum_1s {} should be < default {}",
+            ma.breakout_min_momentum_1s, def.breakout_min_momentum_1s);
+    }
+
+    #[test]
+    fn test_micro_active_config_breakout_imbalance_lower() {
+        let ma  = Phase1Config::micro_active();
+        let def = Phase1Config::default();
+        assert!(ma.breakout_min_imbalance < def.breakout_min_imbalance,
+            "micro_active breakout_min_imbalance {} should be < default {}",
+            ma.breakout_min_imbalance, def.breakout_min_imbalance);
+    }
+
+    /// Safety rails unchanged: stop/TP percentages, spread limit, sizing.
+    #[test]
+    fn test_micro_active_preserves_safety_parameters() {
+        let ma  = Phase1Config::micro_active();
+        let def = Phase1Config::default();
+        assert_eq!(ma.pullback_stop_pct,     def.pullback_stop_pct,   "stop_pct unchanged");
+        assert_eq!(ma.breakout_stop_pct,     def.breakout_stop_pct,   "breakout stop_pct unchanged");
+        assert_eq!(ma.max_spread_bps,        def.max_spread_bps,      "max_spread unchanged");
+        assert_eq!(ma.dollar_risk_per_trade, def.dollar_risk_per_trade, "dollar_risk unchanged");
+    }
+
+    /// MICRO_ACTIVE Phase1Config fires a breakout setup where default would not.
+    ///
+    /// We verify this at the config level:
+    ///   - MICRO_ACTIVE has a lower breakout_min_imbalance (0.12 < 0.20 default)
+    ///   - MICRO_ACTIVE has a lower breakout_min_momentum_1s (0.00005 < 0.0001 default)
+    ///   - A metrics snapshot with imbalance=0.15 and momentum_1s=0.00007 would pass
+    ///     MICRO_ACTIVE thresholds but fail default thresholds.
+    #[test]
+    fn test_micro_active_detects_breakout_where_default_does_not() {
+        let ma  = Phase1Config::micro_active();
+        let def = Phase1Config::default();
+
+        // Target scenario: imbalance_1s = 0.15, momentum_1s = 0.00007
+        let imbalance    = 0.15_f64;
+        let momentum_1s  = 0.00007_f64;
+
+        // MICRO_ACTIVE accepts these values
+        assert!(
+            imbalance >= ma.breakout_min_imbalance,
+            "MICRO_ACTIVE should accept imbalance={} (threshold={})",
+            imbalance, ma.breakout_min_imbalance
+        );
+        assert!(
+            momentum_1s >= ma.breakout_min_momentum_1s,
+            "MICRO_ACTIVE should accept momentum_1s={} (threshold={})",
+            momentum_1s, ma.breakout_min_momentum_1s
+        );
+
+        // Default engine rejects these values
+        assert!(
+            imbalance < def.breakout_min_imbalance,
+            "Default should reject imbalance={} (threshold={})",
+            imbalance, def.breakout_min_imbalance
+        );
+        assert!(
+            momentum_1s < def.breakout_min_momentum_1s,
+            "Default should reject momentum_1s={} (threshold={})",
+            momentum_1s, def.breakout_min_momentum_1s
+        );
     }
 }
