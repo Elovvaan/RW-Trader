@@ -1003,7 +1003,11 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         };
     }
 
-    let effective_cutoff = effective_threshold.min(regime_cutoff);
+    let effective_cutoff = if threshold_mode.to_string() == "micro" {
+        effective_threshold.min(regime_cutoff)
+    } else {
+        regime_cutoff
+    };
     if chosen.score < effective_cutoff {
         lifecycle(
             &*state.store,
