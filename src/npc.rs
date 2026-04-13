@@ -822,7 +822,8 @@ const THRESHOLD_BASE: f64          = 0.18;   // signal threshold for normal acco
 ///
 /// Returns `(effective_threshold, threshold_mode)`:
 /// - `effective_threshold`: the score floor to use for this balance level
-/// - `threshold_mode`: `"micro_aggressive"` when below [`MICRO_BALANCE_USD`], else `"normal"`
+/// - `threshold_mode`: `"micro_aggressive"` only when `total_balance_usd > 0.0`
+///   and below [`MICRO_BALANCE_USD`]; a `0.0` balance returns `"normal"`
 fn adaptive_signal_threshold(total_balance_usd: f64) -> (f64, &'static str) {
     if total_balance_usd > 0.0 && total_balance_usd < MICRO_BALANCE_ULTRA_USD {
         (THRESHOLD_ULTRA_MICRO, "micro_aggressive")
