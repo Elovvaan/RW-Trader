@@ -441,11 +441,7 @@ async fn main() -> Result<()> {
         poll_interval: Duration::from_secs(trade_interval_secs),
         max_spread_bps: env_f64("SIGNAL_MAX_SPREAD_BPS", 5.0),
     };
-    let web_base_url = resolve_dispatch_base_url();
-    match &web_base_url {
-        Some(url) => info!("[dispatch] base URL resolved: {}", url),
-        None      => warn!("[dispatch] base URL not resolved — NPC trade dispatch will be blocked (set WEB_UI_ADDR or RAILWAY_PUBLIC_DOMAIN)"),
-    }
+    let web_base_url = web_ui_addr.as_ref().map(|addr| format!("http://{}", addr));
     let npc_controller = Arc::new(npc::NpcAutonomousController::new(
         npc::NpcConfig::from_trade_cfg(&trade_cfg),
         agent::AgentState {
@@ -497,6 +493,7 @@ async fn main() -> Result<()> {
         sweep_interval: Duration::from_secs(env_u64("SWEEP_INTERVAL", 30)),
         sweep_network: std::env::var("WITHDRAW_DEFAULT_NETWORK").unwrap_or_else(|_| "ETH".to_string()),
     };
+    let web_base_url = web_ui_addr.as_ref().map(|addr| format!("http://{}", addr));
     agent::spawn_profit_sweep_agent(
         sweep_cfg,
         agent::AgentState {
@@ -509,7 +506,7 @@ async fn main() -> Result<()> {
             withdrawals: Arc::clone(&withdrawals),
             client: Arc::clone(&client),
             symbol: symbol.clone(),
-            web_base_url: web_base_url.clone(),
+            web_base_url,
         },
     );
 
@@ -1125,32 +1122,6 @@ fn require_env(key: &str) -> Result<String> {
 }
 fn env_f64(key: &str, default: f64) -> f64 {
     std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
-}
-
-/// Resolves the base URL that internal agents (NPC, sweep) use when posting to
-/// /trade/request.  The bind address (`web_ui_addr`) is intentionally NOT used
-/// here because `0.0.0.0` is not a connectable host.
-///
-/// Priority:
-///   1. `WEB_UI_ADDR`            — operator-supplied; `0.0.0.0` is rewritten to `127.0.0.1`
-///   2. `RAILWAY_STATIC_URL`     — Railway-injected full public HTTPS URL
-///   3. `RAILWAY_PUBLIC_DOMAIN`  — Railway-injected domain, prefixed with `https://`
-///   4. `PORT`                   — self-request fallback via `http://localhost:{PORT}`
-fn resolve_dispatch_base_url() -> Option<String> {
-    if let Ok(addr) = std::env::var("WEB_UI_ADDR") {
-        let routable = addr.replace("0.0.0.0", "127.0.0.1");
-        return Some(format!("http://{}", routable));
-    }
-    if let Ok(url) = std::env::var("RAILWAY_STATIC_URL") {
-        return Some(url.trim_end_matches('/').to_string());
-    }
-    if let Ok(domain) = std::env::var("RAILWAY_PUBLIC_DOMAIN") {
-        return Some(format!("https://{}", domain.trim_end_matches('/')));
-    }
-    if let Ok(port) = std::env::var("PORT") {
-        return Some(format!("http://localhost:{}", port.trim()));
-    }
-    None
 }
 fn env_u64(key: &str, default: u64) -> u64 {
     std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
