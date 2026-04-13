@@ -3449,4 +3449,93 @@ mod diagnostic_tests {
             report.risk_block_reason
         );
     }
+
+    // ── Requirement 5: WEB_UI_ADDR present → no longer blocked ───────────────
+
+    /// TEST (Requirement 5): When web_base_url is set, run_cycle must NOT return
+    /// WEB_UI_ADDR_MISSING.  The dispatch layer is reached; the result is a
+    /// network error against a non-listening port, which is acceptable — it
+    /// proves the config-missing sentinel is gone.
+    #[tokio::test]
+    async fn run_cycle_does_not_return_web_ui_addr_missing_when_url_set() {
+        let store = InMemoryEventStore::new();
+        let authority = Arc::new(AuthorityLayer::new());
+        authority.set_mode_auto(&*store).await;
+
+        // Port 1 is never open → immediate connection refused (not a config error).
+        let state = make_agent_state(
+            Arc::clone(&store) as Arc<dyn crate::store::EventStore>,
+            Arc::clone(&authority),
+            Some("http://127.0.0.1:1".to_string()),
+        );
+        let mut cfg = active_npc_cfg();
+        cfg.mode = NpcTradingMode::Paper;
+        cfg.trade_size = 0.001;
+
+        let runtime = Arc::new(Mutex::new(NpcRuntimeState::default()));
+        {
+            let mut feed = state.feed.lock().await;
+            populate_feed(&mut feed, 50_000.0, 30);
+        }
+        {
+            let mut truth = state.truth.lock().await;
+            truth.sell_inventory = 10.0;
+            truth.buy_power = 100_000.0;
+            truth.total_balance_usd = 100_000.0;
+        }
+
+        let report = run_cycle(&cfg, &state, runtime).await;
+
+        assert_ne!(
+            report.execution_result, "WEB_UI_ADDR_MISSING",
+            "WEB_UI_ADDR_MISSING must not appear when web_base_url is set; \
+             execution_result={} final_decision={}",
+            report.execution_result, report.final_decision
+        );
+    }
+
+    // ── Requirement 6: /trade/request reached with an absolute URL ────────────
+
+    /// TEST (Requirement 6): When web_base_url is set, run_cycle builds an
+    /// absolute URL for /trade/request and attempts the POST.  A REQUEST_ERROR
+    /// result (connection refused against port 1) proves the dispatch path was
+    /// reached with a fully-qualified URL.
+    #[tokio::test]
+    async fn run_cycle_reaches_trade_request_with_absolute_url() {
+        let store = InMemoryEventStore::new();
+        let authority = Arc::new(AuthorityLayer::new());
+        authority.set_mode_auto(&*store).await;
+
+        let state = make_agent_state(
+            Arc::clone(&store) as Arc<dyn crate::store::EventStore>,
+            Arc::clone(&authority),
+            Some("http://127.0.0.1:1".to_string()),
+        );
+        let mut cfg = active_npc_cfg();
+        cfg.mode = NpcTradingMode::Paper;
+        cfg.trade_size = 0.001;
+
+        let runtime = Arc::new(Mutex::new(NpcRuntimeState::default()));
+        {
+            let mut feed = state.feed.lock().await;
+            populate_feed(&mut feed, 50_000.0, 30);
+        }
+        {
+            let mut truth = state.truth.lock().await;
+            truth.sell_inventory = 10.0;
+            truth.buy_power = 100_000.0;
+            truth.total_balance_usd = 100_000.0;
+        }
+
+        let report = run_cycle(&cfg, &state, runtime).await;
+
+        // A REQUEST_ERROR means the NPC built http://127.0.0.1:1/trade/request
+        // (absolute) and attempted the POST — the dispatch gate was cleared.
+        assert!(
+            report.execution_result.starts_with("REQUEST_ERROR:"),
+            "expected REQUEST_ERROR when web_base_url is set and server is unreachable; \
+             got execution_result={} final_decision={}",
+            report.execution_result, report.final_decision
+        );
+    }
 }
