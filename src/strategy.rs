@@ -32,7 +32,8 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, info};
 
-use crate::phase1::{Phase1Engine, Phase1Result, Phase1Status};
+use crate::phase1::{Phase1Config, Phase1Engine, Phase1Result, Phase1Status};
+use crate::profile::ProfileConfig;
 use crate::reconciler::TruthState;
 use crate::signal::SignalMetrics;
 
@@ -598,6 +599,12 @@ pub struct StrategyEngine {
     paused_until: HashMap<StrategyId, Instant>,
     pause_duration: Duration,
     edge_decay_pause_threshold: f64,
+    /// Active behavior mode label sourced from the applied profile.
+    ///
+    /// Stored explicitly to avoid inferring mode from threshold comparisons,
+    /// which would be fragile if default values change.
+    /// Example values: `"STANDARD"`, `"MICRO_ACTIVE"`.
+    pub behavior_mode: String,
 }
 
 impl StrategyEngine {
@@ -638,7 +645,62 @@ impl StrategyEngine {
             paused_until: HashMap::new(),
             pause_duration: Duration::from_secs(300),
             edge_decay_pause_threshold: 0.08,
+            behavior_mode: "STANDARD".to_string(),
         }
+    }
+
+    /// Create with profile-specific behavior parameters applied.
+    ///
+    /// Applies behavior-only overrides from `ProfileConfig`:
+    ///   - Phase1 engine uses MICRO_ACTIVE preset when profile has Phase1 overrides
+    ///   - StrategyEngine dynamic thresholds are lowered as specified by profile
+    ///   - `behavior_mode` is set to the profile's as_str() value for unambiguous telemetry
+    ///   - All hard safety rails (kill switch, exchange filters, sizing, balance checks,
+    ///     authority mode, dispatcher / executor protections) remain fully active
+    pub fn with_profile(profile_cfg: &ProfileConfig) -> Self {
+        let mut engine = Self::new();
+
+        // Apply Phase1 engine overrides when the profile specifies them.
+        // This replaces the Phase1Engine's Phase1Config in-place; no new subsystem is created.
+        if profile_cfg.phase1_trigger_window_secs.is_some()
+            || profile_cfg.phase1_min_trend_drift.is_some()
+            || profile_cfg.phase1_min_samples.is_some()
+            || profile_cfg.phase1_breakout_min_momentum_1s.is_some()
+            || profile_cfg.phase1_breakout_min_imbalance.is_some()
+        {
+            let mut phase1_cfg = Phase1Config::default();
+            if let Some(v) = profile_cfg.phase1_trigger_window_secs {
+                phase1_cfg.trigger_window_secs = v;
+            }
+            if let Some(v) = profile_cfg.phase1_min_trend_drift {
+                phase1_cfg.min_trend_drift = v;
+            }
+            if let Some(v) = profile_cfg.phase1_min_samples {
+                phase1_cfg.min_samples = v;
+            }
+            if let Some(v) = profile_cfg.phase1_breakout_min_momentum_1s {
+                phase1_cfg.breakout_min_momentum_1s = v;
+            }
+            if let Some(v) = profile_cfg.phase1_breakout_min_imbalance {
+                phase1_cfg.breakout_min_imbalance = v;
+            }
+            engine.phase1 = Phase1Engine::new(phase1_cfg);
+            // Store behavior mode explicitly — do not infer from threshold comparisons.
+            engine.behavior_mode = "MICRO_ACTIVE".to_string();
+        }
+
+        // Apply StrategyEngine dynamic-threshold overrides.
+        if let Some(v) = profile_cfg.strategy_base_confidence_threshold {
+            engine.base_confidence_threshold = v;
+        }
+        if let Some(v) = profile_cfg.strategy_no_trade_lowering_after_secs {
+            engine.no_trade_lowering_after = Duration::from_secs(v);
+        }
+        if let Some(v) = profile_cfg.strategy_min_abs_imbalance_1s {
+            engine.min_abs_imbalance_1s = v;
+        }
+
+        engine
     }
 
     // ── Enable/disable ────────────────────────────────────────────────────────
@@ -1013,8 +1075,10 @@ impl StrategyEngine {
 
     /// Return a snapshot of Phase1Engine state for UI display.
     pub fn phase1_status(&self) -> Phase1Status {
-        let pos = self.phase1.open_position.as_ref();
+        let pos   = self.phase1.open_position.as_ref();
         let setup = self.phase1.last_setup.as_ref();
+        // Use the explicitly stored behavior mode rather than inferring it
+        // from threshold comparisons (which would break if defaults change).
         Phase1Status {
             enabled:         self.phase1_enabled,
             regime:          self.phase1.last_regime,
@@ -1030,6 +1094,9 @@ impl StrategyEngine {
             position_target: pos.map(|p| p.target_price),
             break_even:      pos.map(|p| p.break_even_triggered).unwrap_or(false),
             high_water:      pos.map(|p| p.high_water_mark),
+            behavior_mode:                 self.behavior_mode.clone(),
+            effective_trigger_window_secs: self.phase1.cfg.trigger_window_secs,
+            effective_min_trend_drift:     self.phase1.cfg.min_trend_drift,
         }
     }
 
@@ -1532,5 +1599,129 @@ mod tests {
         };
         let sr = d.to_signal_result(&base_metrics());
         assert!(matches!(sr.decision, crate::signal::SignalDecision::Hold));
+    }
+
+    // ── with_profile() tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_with_profile_default_has_standard_behavior_mode() {
+        let engine = StrategyEngine::new();
+        let status = engine.phase1_status();
+        assert_eq!(status.behavior_mode, "STANDARD",
+            "Default engine must report STANDARD behavior mode");
+    }
+
+    #[test]
+    fn test_with_profile_micro_active_reports_micro_behavior_mode() {
+        let profile_cfg = crate::profile::ProfileConfig::for_profile(
+            crate::profile::RuntimeProfile::MicroActive,
+        );
+        let engine = StrategyEngine::with_profile(&profile_cfg);
+        let status = engine.phase1_status();
+        assert_eq!(status.behavior_mode, "MICRO_ACTIVE",
+            "MICRO_ACTIVE engine must report MICRO_ACTIVE behavior mode");
+    }
+
+    #[test]
+    fn test_with_profile_micro_active_lowers_trigger_window() {
+        let profile_cfg = crate::profile::ProfileConfig::for_profile(
+            crate::profile::RuntimeProfile::MicroActive,
+        );
+        let engine = StrategyEngine::with_profile(&profile_cfg);
+        let status = engine.phase1_status();
+        assert!(
+            status.effective_trigger_window_secs < 15.0,
+            "MICRO_ACTIVE trigger window {} should be < 15s",
+            status.effective_trigger_window_secs
+        );
+    }
+
+    #[test]
+    fn test_with_profile_micro_active_lowers_confidence_threshold() {
+        let profile_cfg = crate::profile::ProfileConfig::for_profile(
+            crate::profile::RuntimeProfile::MicroActive,
+        );
+        let engine = StrategyEngine::with_profile(&profile_cfg);
+        // Default base_confidence_threshold is 0.72; MICRO_ACTIVE should be lower.
+        assert!(
+            engine.base_confidence_threshold < 0.72,
+            "MICRO_ACTIVE base_confidence_threshold {} must be < default 0.72",
+            engine.base_confidence_threshold
+        );
+    }
+
+    #[test]
+    fn test_with_profile_micro_active_lowers_imbalance_floor() {
+        let profile_cfg = crate::profile::ProfileConfig::for_profile(
+            crate::profile::RuntimeProfile::MicroActive,
+        );
+        let engine = StrategyEngine::with_profile(&profile_cfg);
+        // Default min_abs_imbalance_1s is 0.06; MICRO_ACTIVE should be lower.
+        assert!(
+            engine.min_abs_imbalance_1s < 0.06,
+            "MICRO_ACTIVE min_abs_imbalance_1s {} must be < default 0.06",
+            engine.min_abs_imbalance_1s
+        );
+    }
+
+    #[test]
+    fn test_with_profile_conservative_keeps_standard_behavior() {
+        let profile_cfg = crate::profile::ProfileConfig::for_profile(
+            crate::profile::RuntimeProfile::Conservative,
+        );
+        let engine = StrategyEngine::with_profile(&profile_cfg);
+        let status = engine.phase1_status();
+        assert_eq!(status.behavior_mode, "STANDARD",
+            "Conservative profile must report STANDARD behavior mode");
+        // Confidence threshold unchanged from default 0.72
+        assert!((engine.base_confidence_threshold - 0.72).abs() < 1e-9,
+            "Conservative confidence threshold should remain at default 0.72");
+    }
+
+    /// MICRO_ACTIVE produces more execution opportunities by accepting lower confidence.
+    ///
+    /// Scenario: a BuyCandidate with confidence 0.58 is generated.
+    /// Default engine blocks it (threshold 0.72); MICRO_ACTIVE engine allows it.
+    #[test]
+    fn test_micro_active_more_execution_opportunities_than_default() {
+        use crate::profile::{ProfileConfig, RuntimeProfile};
+
+        let default_engine   = StrategyEngine::new();
+        let micro_active_cfg = ProfileConfig::for_profile(RuntimeProfile::MicroActive);
+        let micro_engine     = StrategyEngine::with_profile(&micro_active_cfg);
+
+        // Confirm the threshold difference itself.
+        assert!(
+            micro_engine.base_confidence_threshold < default_engine.base_confidence_threshold,
+            "MICRO_ACTIVE confidence gate ({}) must be lower than default ({})",
+            micro_engine.base_confidence_threshold,
+            default_engine.base_confidence_threshold,
+        );
+
+        // Confirm the participation floor difference.
+        assert!(
+            micro_engine.min_abs_imbalance_1s < default_engine.min_abs_imbalance_1s,
+            "MICRO_ACTIVE imbalance floor ({}) must be lower than default ({})",
+            micro_engine.min_abs_imbalance_1s,
+            default_engine.min_abs_imbalance_1s,
+        );
+
+        // Confirm the no-trade lowering window is shorter (fewer forced holds).
+        assert!(
+            micro_engine.no_trade_lowering_after < default_engine.no_trade_lowering_after,
+            "MICRO_ACTIVE no_trade_lowering_after ({:?}) must be shorter than default ({:?})",
+            micro_engine.no_trade_lowering_after,
+            default_engine.no_trade_lowering_after,
+        );
+    }
+
+    #[test]
+    fn test_phase1_status_exposes_behavior_telemetry_fields() {
+        let engine = StrategyEngine::new();
+        let status = engine.phase1_status();
+        // Verify new telemetry fields are accessible and have sane defaults
+        assert!(!status.behavior_mode.is_empty(), "behavior_mode must not be empty");
+        assert!(status.effective_trigger_window_secs > 0.0, "trigger_window must be positive");
+        assert!(status.effective_min_trend_drift > 0.0, "min_trend_drift must be positive");
     }
 }

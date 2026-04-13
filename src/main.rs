@@ -220,7 +220,7 @@ async fn main() -> Result<()> {
     let bnb_price: f64 = env_f64("BNB_PRICE_USD", 0.0);
 
     // ── Runtime profile ──────────────────────────────────────────────────────
-    // RUNTIME_PROFILE env-var: CONSERVATIVE | ACTIVE | MICRO_TEST (default: ACTIVE)
+    // RUNTIME_PROFILE env-var: CONSERVATIVE | ACTIVE | MICRO_TEST | MICRO_ACTIVE (default: ACTIVE)
     let runtime_profile = profile::RuntimeProfile::from_str(
         &std::env::var("RUNTIME_PROFILE").unwrap_or_else(|_| "ACTIVE".into()),
     );
@@ -346,15 +346,37 @@ async fn main() -> Result<()> {
     }));
 
     // ── 5. Signal engine + Strategy engine ───────────────────────────────────
+    // Apply profile-level signal threshold overrides unless operator has set them explicitly.
+    let signal_momentum_thresh = if std::env::var("SIGNAL_MOMENTUM_THRESH").is_ok() {
+        env_f64("SIGNAL_MOMENTUM_THRESH", 0.00005)
+    } else {
+        profile_cfg.signal_momentum_threshold.unwrap_or(0.00005)
+    };
+    let signal_imbalance_thresh = if std::env::var("SIGNAL_IMBALANCE_THRESH").is_ok() {
+        env_f64("SIGNAL_IMBALANCE_THRESH", 0.10)
+    } else {
+        profile_cfg.signal_imbalance_threshold.unwrap_or(0.10)
+    };
+    let signal_max_hold_secs = if std::env::var("SIGNAL_MAX_HOLD_SECS").is_ok() {
+        env_u64("SIGNAL_MAX_HOLD_SECS", 120)
+    } else {
+        profile_cfg.signal_max_hold_secs.unwrap_or(120)
+    };
+    info!(
+        momentum_threshold   = signal_momentum_thresh,
+        imbalance_threshold  = signal_imbalance_thresh,
+        max_hold_secs        = signal_max_hold_secs,
+        "[SIGNAL] Effective thresholds (profile={})", runtime_profile.as_str()
+    );
     let signal_config = signal::SignalConfig {
         order_qty:             env_f64("SIGNAL_QTY",              0.001),
-        momentum_threshold:    env_f64("SIGNAL_MOMENTUM_THRESH",  0.00005),
-        imbalance_threshold:   env_f64("SIGNAL_IMBALANCE_THRESH", 0.10),
+        momentum_threshold:    signal_momentum_thresh,
+        imbalance_threshold:   signal_imbalance_thresh,
         max_entry_spread_bps:  env_f64("SIGNAL_MAX_SPREAD_BPS",   5.0),
         max_feed_staleness:    Duration::from_secs(env_u64("RISK_FEED_STALE_SECS", 3)),
         stop_loss_pct:         env_f64("SIGNAL_STOP_LOSS_PCT",    0.0020),
         take_profit_pct:       env_f64("SIGNAL_TAKE_PROFIT_PCT",  0.0040),
-        max_hold_duration:     Duration::from_secs(env_u64("SIGNAL_MAX_HOLD_SECS", 120)),
+        max_hold_duration:     Duration::from_secs(signal_max_hold_secs),
         min_mid_samples:       3,
         min_trade_samples:     3,
     };
@@ -362,8 +384,10 @@ async fn main() -> Result<()> {
     // signal_engine retained for compute_metrics (SignalEngine still computes
     // the shared SignalMetrics that all strategies receive).
     let signal_engine  = Arc::new(Mutex::new(signal::SignalEngine::new(signal_config)));
-    // StrategyEngine replaces direct use of signal_engine for decision-making.
-    let strategy_engine = Arc::new(Mutex::new(strategy::StrategyEngine::new()));
+    // StrategyEngine applies profile-specific behavior overrides (Phase1 config,
+    // confidence thresholds, imbalance floor, no-trade lowering window).
+    // All hard safety rails remain active regardless of profile.
+    let strategy_engine = Arc::new(Mutex::new(strategy::StrategyEngine::with_profile(&profile_cfg)));
     // min_confidence_normal is overridden by the profile unless explicitly set.
     let min_conf_normal = if std::env::var("PORTFOLIO_MIN_CONF_NORMAL").is_ok() {
         env_f64("PORTFOLIO_MIN_CONF_NORMAL", 0.70)

@@ -1098,7 +1098,12 @@ async fn page_events(state: &AppState, query: &str) -> String {
     let inventory_value_usd = sell_inventory * latest_mid;
     // Profile banner — shown prominently on LIVE page.
     let profile_banner = {
-        let (extra_style, text) = if current_profile == RuntimeProfile::MicroTest {
+        let (extra_style, text) = if current_profile == RuntimeProfile::MicroActive {
+            (
+                "background:rgba(82,255,168,0.10);border-color:#52ffa8;color:#52ffa8;",
+                format!("{}", esc(current_profile.label())),
+            )
+        } else if current_profile == RuntimeProfile::MicroTest {
             (
                 "background:rgba(240,185,11,0.12);border-color:#f0b90b;color:#f0b90b;",
                 format!("⚡ {}", esc(current_profile.label())),
@@ -1618,10 +1623,19 @@ async fn page_events(state: &AppState, query: &str) -> String {
                    background:{regime_bg};color:{regime_color}'>{regime_str}</span>\
                  <span class='dim' style='font-size:11px'>Timeframe stack: 4H bias · 1H setup · 15M trigger</span>\
                </div>\
+               <div style='margin-top:6px;font-size:11px;color:#93a2b3'>\
+                 Behavior: <strong style='color:{bmode_color}'>{bmode}</strong> &nbsp;·&nbsp;\
+                 Trigger window: <strong>{tw:.0}s</strong> &nbsp;·&nbsp;\
+                 Min drift: <strong>{drift:.4}%</strong>\
+               </div>\
                {block_row}\
                {setup_row}\
                {position_row}\
-             </div>"
+             </div>",
+            bmode       = esc(&phase1_status.behavior_mode),
+            bmode_color = if current_profile == RuntimeProfile::MicroActive { "#52ffa8" } else { "#93a2b3" },
+            tw          = phase1_status.effective_trigger_window_secs,
+            drift       = phase1_status.effective_min_trend_drift * 100.0,
         )
     };
 
@@ -1844,6 +1858,7 @@ async fn page_assistant(state: &AppState, query: &str) -> String {
         ("CONSERVATIVE", "Conservative — cautious, long cooldowns"),
         ("ACTIVE",       "Active — balanced defaults"),
         ("MICRO_TEST",   "Micro-Test — faster decisions for small balances"),
+        ("MICRO_ACTIVE", "⚡ Micro Active — high-frequency mode for balances under $100"),
     ]
     .iter()
     .map(|(val, label)| {
@@ -2668,6 +2683,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_events_micro_active_banner() {
+        let state = make_state();
+        *state.profile.lock().await = crate::profile::RuntimeProfile::MicroActive;
+        let r = page_events(&state, "").await;
+        assert!(r.contains("Runtime Profile"), "LIVE page must show 'Runtime Profile' heading");
+        assert!(
+            r.contains("Micro Active") || r.contains("MICRO_ACTIVE"),
+            "LIVE page must show MICRO_ACTIVE indicator; got page excerpt missing that text"
+        );
+        assert!(
+            r.contains("$100") || r.contains("high-frequency"),
+            "LIVE page must include MICRO_ACTIVE plain-language description mentioning $100 or high-frequency"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_assistant_shows_micro_active_option() {
+        let state = make_state();
+        let r = page_assistant(&state, "").await;
+        assert!(r.contains("value='MICRO_ACTIVE'"), "SETTINGS page must include MICRO_ACTIVE option");
+        assert!(
+            r.contains("high-frequency") || r.contains("Micro Active") || r.contains("$100"),
+            "MICRO_ACTIVE option must have a descriptive label"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_assistant_micro_active_selected_matches_state() {
+        let state = make_state();
+        *state.profile.lock().await = crate::profile::RuntimeProfile::MicroActive;
+        let r = page_assistant(&state, "").await;
+        assert!(
+            r.contains("value='MICRO_ACTIVE' selected") || r.contains("value='MICRO_ACTIVE'  selected"),
+            "MICRO_ACTIVE option must be marked as selected when profile is MICRO_ACTIVE"
+        );
+    }
+
+    #[tokio::test]
     async fn test_assistant_shows_profile_selector() {
         let state = make_state();
         let r = page_assistant(&state, "").await;
@@ -2676,6 +2729,7 @@ mod tests {
         assert!(r.contains("value='CONSERVATIVE'"), "CONSERVATIVE option must be present");
         assert!(r.contains("value='ACTIVE'"),       "ACTIVE option must be present");
         assert!(r.contains("value='MICRO_TEST'"),   "MICRO_TEST option must be present");
+        assert!(r.contains("value='MICRO_ACTIVE'"), "MICRO_ACTIVE option must be present");
         assert!(r.contains("Apply"),                "Apply button must be present");
     }
 
