@@ -441,7 +441,13 @@ async fn main() -> Result<()> {
         poll_interval: Duration::from_secs(trade_interval_secs),
         max_spread_bps: env_f64("SIGNAL_MAX_SPREAD_BPS", 5.0),
     };
-    let web_base_url = web_ui_addr.as_ref().map(|addr| format!("http://{}", addr));
+    let web_base_url = resolve_web_base_url();
+    if let Some(ref base) = web_base_url {
+        info!("[DISPATCH] Resolved dispatch base URL: {}", base);
+        info!("[DISPATCH] Trade requests will be sent to: {}/trade/request", base);
+    } else {
+        warn!("[DISPATCH] No dispatch base URL resolved — trade dispatch will be blocked (WEB_UI_ADDR_MISSING)");
+    }
     let npc_controller = Arc::new(npc::NpcAutonomousController::new(
         npc::NpcConfig::from_trade_cfg(&trade_cfg),
         agent::AgentState {
@@ -493,7 +499,7 @@ async fn main() -> Result<()> {
         sweep_interval: Duration::from_secs(env_u64("SWEEP_INTERVAL", 30)),
         sweep_network: std::env::var("WITHDRAW_DEFAULT_NETWORK").unwrap_or_else(|_| "ETH".to_string()),
     };
-    let web_base_url = web_ui_addr.as_ref().map(|addr| format!("http://{}", addr));
+    let web_base_url = resolve_web_base_url();
     agent::spawn_profit_sweep_agent(
         sweep_cfg,
         agent::AgentState {
@@ -1131,4 +1137,55 @@ fn env_bool(key: &str, default: bool) -> bool {
         .ok()
         .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(default)
+}
+
+/// Resolve the base URL used for all internal dispatch requests (e.g. POST /trade/request).
+///
+/// Priority (first non-empty value wins):
+///   1. `WEB_BASE_URL`          — explicit absolute URL with scheme (e.g. https://host)
+///   2. `RAILWAY_PUBLIC_DOMAIN` — Railway-injected public hostname → https://{domain}
+///   3. `WEB_UI_ADDR`           — bind address, with scheme auto-added when absent
+///   4. `PORT`                  — fallback loopback URL http://127.0.0.1:{port}
+///
+/// Returns `None` when no address source is configured at all.
+/// When `Some` is returned, the value is guaranteed to be non-empty, start with
+/// "http://" or "https://", and have no trailing slash, so that appending
+/// "/trade/request" produces a valid absolute URL without double slashes.
+fn resolve_web_base_url() -> Option<String> {
+    // 1. Explicit absolute base URL (highest priority).
+    if let Ok(v) = std::env::var("WEB_BASE_URL") {
+        let v = v.trim().trim_end_matches('/').to_string();
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+
+    // 2. Railway-injected public domain (no scheme).
+    if let Ok(domain) = std::env::var("RAILWAY_PUBLIC_DOMAIN") {
+        let domain = domain.trim().trim_end_matches('/').to_string();
+        if !domain.is_empty() {
+            return Some(format!("https://{}", domain));
+        }
+    }
+
+    // 3. WEB_UI_ADDR — may be a bare host:port or a full URL.
+    if let Ok(addr) = std::env::var("WEB_UI_ADDR") {
+        let addr = addr.trim().trim_end_matches('/').to_string();
+        if !addr.is_empty() {
+            if addr.starts_with("http://") || addr.starts_with("https://") {
+                return Some(addr);
+            }
+            return Some(format!("http://{}", addr));
+        }
+    }
+
+    // 4. PORT only — dispatch to self via loopback.
+    if let Ok(port) = std::env::var("PORT") {
+        let port = port.trim().to_string();
+        if !port.is_empty() {
+            return Some(format!("http://127.0.0.1:{}", port));
+        }
+    }
+
+    None
 }
