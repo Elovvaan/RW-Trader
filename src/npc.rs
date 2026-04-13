@@ -419,6 +419,24 @@ pub struct NpcLoopSnapshot {
     pub last_no_trade_reason: String,
     /// Current execution pipeline state label.
     pub pipeline_state: String,
+    // ── Decision transparency ─────────────────────────────────────────────────
+    /// Top-level decision outcome: "EXECUTE", "HOLD", or "BLOCKED".
+    pub final_decision: String,
+    /// Why a balance/allocation check blocked execution (empty when not the cause).
+    pub balance_block_reason: String,
+    /// Why a risk/portfolio control blocked execution (empty when not the cause).
+    pub risk_block_reason: String,
+    /// Why a strategy/score/execution guard blocked execution (empty when not the cause).
+    pub execution_block_reason: String,
+    // ── Drawdown diagnostics ──────────────────────────────────────────────────
+    /// Current equity estimate used in drawdown calculation (position value + aggregate PnL).
+    pub current_equity: f64,
+    /// Highest equity seen since agent started.
+    pub peak_equity: f64,
+    /// Current drawdown as a fraction (0.0 = no drawdown, 0.1 = 10% drawdown).
+    pub drawdown_pct: f64,
+    /// Configured max drawdown limit (fraction).
+    pub drawdown_limit: f64,
 }
 
 #[derive(Default)]
@@ -433,6 +451,10 @@ struct NpcLoopTelemetry {
     last_agent_decision: String,
     last_no_trade_reason: String,
     pipeline_state: String,
+    final_decision: String,
+    balance_block_reason: String,
+    risk_block_reason: String,
+    execution_block_reason: String,
 }
 
 struct NpcLoopControl {
@@ -565,6 +587,20 @@ impl NpcAutonomousController {
         let telemetry = self.telemetry.lock().await;
         let control = self.control.lock().await;
         let agent_mode = control.mode;
+        let (current_equity, peak_equity, drawdown_pct) = {
+            // Compute current equity and drawdown from runtime state (same formula as evaluate_portfolio_controls).
+            let rt = self.runtime.lock().await;
+            let aggregate_pnl: f64 = rt.perf.values().map(|p| p.gross_pnl).sum();
+            let equity = aggregate_pnl.max(0.0);
+            let peak = rt.peak_equity.max(equity);
+            const MIN_PEAK_FOR_DRAWDOWN: f64 = 1.0;
+            let dd = if peak >= MIN_PEAK_FOR_DRAWDOWN {
+                ((peak - equity) / peak).max(0.0)
+            } else {
+                0.0
+            };
+            (equity, peak, dd)
+        };
         NpcLoopSnapshot {
             agent_mode,
             autonomous_mode: agent_mode != AgentMode::Off,
@@ -579,6 +615,14 @@ impl NpcAutonomousController {
             last_agent_decision: telemetry.last_agent_decision.clone(),
             last_no_trade_reason: telemetry.last_no_trade_reason.clone(),
             pipeline_state: telemetry.pipeline_state.clone(),
+            final_decision: telemetry.final_decision.clone(),
+            balance_block_reason: telemetry.balance_block_reason.clone(),
+            risk_block_reason: telemetry.risk_block_reason.clone(),
+            execution_block_reason: telemetry.execution_block_reason.clone(),
+            current_equity,
+            peak_equity,
+            drawdown_pct,
+            drawdown_limit: self.cfg.alpha.max_drawdown_pct,
         }
     }
 
@@ -641,6 +685,10 @@ impl NpcAutonomousController {
                         t.last_agent_decision = report.last_agent_decision;
                         t.last_no_trade_reason = report.no_trade_reason;
                         t.pipeline_state = report.pipeline_state;
+                        t.final_decision = report.final_decision;
+                        t.balance_block_reason = report.balance_block_reason;
+                        t.risk_block_reason = report.risk_block_reason;
+                        t.execution_block_reason = report.execution_block_reason;
                         t.status = match report.status.as_str() {
                             "blocked" => "Blocked by safety checks".to_string(),
                             "running" => AgentMode::Auto.state_label().to_string(),
@@ -677,6 +725,16 @@ impl NpcAutonomousController {
         t.running = false;
         t.status = AgentMode::Off.state_label().to_string();
     }
+
+    /// Test-only helper: inject a no-trade reason and mark the agent as blocked.
+    /// This simulates what happens after a cycle that doesn't trade.
+    #[cfg(test)]
+    pub async fn set_no_trade_reason_for_test(&self, reason: &str) {
+        let mut t = self.telemetry.lock().await;
+        t.last_no_trade_reason = reason.to_string();
+        t.execution_block_reason = reason.to_string();
+        t.final_decision = "BLOCKED".to_string();
+    }
 }
 
 pub async fn spawn_npc_trading_layer(controller: &NpcAutonomousController) {
@@ -698,6 +756,14 @@ struct NpcCycleReport {
     no_trade_reason: String,
     /// Current execution pipeline state label.
     pipeline_state: String,
+    /// Top-level decision outcome: "EXECUTE", "HOLD", or "BLOCKED".
+    final_decision: String,
+    /// Why a balance/allocation check blocked execution (empty when not the cause).
+    balance_block_reason: String,
+    /// Why a risk/portfolio control blocked execution (empty when not the cause).
+    risk_block_reason: String,
+    /// Why a strategy/score/execution guard blocked execution (empty when not the cause).
+    execution_block_reason: String,
 }
 
 async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRuntimeState>>) -> NpcCycleReport {
@@ -709,6 +775,10 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         last_agent_decision: "HOLD — no actionable trigger".to_string(),
         no_trade_reason: execution_result,
         pipeline_state: "Scanning".to_string(),
+        final_decision: "HOLD".to_string(),
+        balance_block_reason: String::new(),
+        risk_block_reason: String::new(),
+        execution_block_reason: String::new(),
     };
     let mode = state.authority.mode().await;
     if mode == AuthorityMode::Off {
@@ -846,6 +916,10 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             ),
             no_trade_reason: format!("Regime mismatch — {}. Try a different market condition.", reason),
             pipeline_state: "Scanning".to_string(),
+            final_decision: "BLOCKED".to_string(),
+            balance_block_reason: String::new(),
+            risk_block_reason: String::new(),
+            execution_block_reason: reason.clone(),
         };
     }
 
@@ -862,6 +936,10 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         );
         rt.perf.entry(chosen.role).or_default().blocked += 1;
         observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
+        let score_reason = format!(
+            "Signal score {:.4} below minimum threshold {:.4}. Waiting for stronger trigger.",
+            chosen.score, regime_cutoff
+        );
         return NpcCycleReport {
             cycle_id,
             last_action: "NO_ACTION".to_string(),
@@ -871,11 +949,12 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                 "HOLD — {} {} score {:.4} below threshold {:.4}",
                 chosen.side.to_uppercase(), chosen.role.as_str(), chosen.score, regime_cutoff
             ),
-            no_trade_reason: format!(
-                "Signal score {:.4} below minimum threshold {:.4}. Waiting for stronger trigger.",
-                chosen.score, regime_cutoff
-            ),
+            no_trade_reason: score_reason.clone(),
             pipeline_state: "Scanning".to_string(),
+            final_decision: "BLOCKED".to_string(),
+            balance_block_reason: String::new(),
+            risk_block_reason: String::new(),
+            execution_block_reason: score_reason,
         };
     }
 
@@ -889,6 +968,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         );
         rt.perf.entry(chosen.role).or_default().blocked += 1;
         observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
+        let portfolio_reason = format!("Portfolio risk controls active: {}", portfolio_controls.join("; "));
         return NpcCycleReport {
             cycle_id,
             last_action: "NO_ACTION".to_string(),
@@ -898,11 +978,12 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                 "HOLD — {} {} blocked by portfolio controls",
                 chosen.side.to_uppercase(), chosen.role.as_str()
             ),
-            no_trade_reason: format!(
-                "Portfolio risk controls active: {}",
-                portfolio_controls.join("; ")
-            ),
+            no_trade_reason: portfolio_reason.clone(),
             pipeline_state: "Scanning".to_string(),
+            final_decision: "BLOCKED".to_string(),
+            balance_block_reason: String::new(),
+            risk_block_reason: portfolio_reason,
+            execution_block_reason: String::new(),
         };
     }
 
@@ -917,6 +998,19 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         );
         rt.perf.entry(chosen.role).or_default().blocked += 1;
         observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
+        let alloc_reason = if chosen.side.eq_ignore_ascii_case("SELL") {
+            format!(
+                "SELL blocked — insufficient sell inventory (sell_inv={:.8}, alloc_reason={}). \
+                 Ensure base-asset balance is non-zero.",
+                sell_inventory, allocation.reason
+            )
+        } else {
+            format!(
+                "BUY blocked — insufficient buy power (buy_power={:.2}, alloc_reason={}). \
+                 Ensure USDT balance is non-zero.",
+                buy_power, allocation.reason
+            )
+        };
         return NpcCycleReport {
             cycle_id,
             last_action: "NO_ACTION".to_string(),
@@ -926,20 +1020,12 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                 "HOLD — {} {} allocation rejected: {}",
                 chosen.side.to_uppercase(), chosen.role.as_str(), allocation.reason
             ),
-            no_trade_reason: if chosen.side.eq_ignore_ascii_case("SELL") {
-                format!(
-                    "SELL blocked — insufficient sell inventory (sell_inv={:.8}, alloc_reason={}). \
-                     Ensure base-asset balance is non-zero.",
-                    sell_inventory, allocation.reason
-                )
-            } else {
-                format!(
-                    "BUY blocked — insufficient buy power (buy_power={:.2}, alloc_reason={}). \
-                     Ensure USDT balance is non-zero.",
-                    buy_power, allocation.reason
-                )
-            },
+            no_trade_reason: alloc_reason.clone(),
             pipeline_state: "Scanning".to_string(),
+            final_decision: "BLOCKED".to_string(),
+            balance_block_reason: alloc_reason,
+            risk_block_reason: String::new(),
+            execution_block_reason: String::new(),
         };
     }
 
@@ -966,6 +1052,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         );
         rt.perf.entry(chosen.role).or_default().blocked += 1;
         observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
+        let guard_reason = format!("Safety guard blocked order: {}", guard_reasons.join("; "));
         return NpcCycleReport {
             cycle_id,
             last_action: "NO_ACTION".to_string(),
@@ -975,11 +1062,12 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                 "HOLD — {} {} blocked by safety guards",
                 chosen.side.to_uppercase(), chosen.role.as_str()
             ),
-            no_trade_reason: format!(
-                "Safety guard blocked order: {}",
-                guard_reasons.join("; ")
-            ),
+            no_trade_reason: guard_reason.clone(),
             pipeline_state: "Scanning".to_string(),
+            final_decision: "BLOCKED".to_string(),
+            balance_block_reason: String::new(),
+            risk_block_reason: String::new(),
+            execution_block_reason: guard_reason,
         };
     }
 
@@ -1017,6 +1105,10 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                                One successful paper execution is required before live trades are allowed."
                 .to_string(),
             pipeline_state: "Trigger Matched — Blocked".to_string(),
+            final_decision: "BLOCKED".to_string(),
+            balance_block_reason: String::new(),
+            risk_block_reason: String::new(),
+            execution_block_reason: "LIVE_REQUIRES_PAPER_EXECUTION".to_string(),
         };
     }
 
@@ -1062,6 +1154,10 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                                    trade requests without a configured web UI address."
                     .to_string(),
                 pipeline_state: "Trigger Matched — Blocked".to_string(),
+                final_decision: "BLOCKED".to_string(),
+                balance_block_reason: String::new(),
+                risk_block_reason: String::new(),
+                execution_block_reason: "WEB_UI_ADDR_MISSING".to_string(),
             };
         };
 
@@ -1135,6 +1231,10 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                         status_code, short_body
                     ),
                     pipeline_state: "Rejected".to_string(),
+                    final_decision: "BLOCKED".to_string(),
+                    balance_block_reason: String::new(),
+                    risk_block_reason: String::new(),
+                    execution_block_reason: format!("HTTP_STATUS_{}", status_code),
                 };
             }
             Err(e) => {
@@ -1157,6 +1257,10 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                     ),
                     no_trade_reason: format!("Network error dispatching trade request: {}", e),
                     pipeline_state: "Rejected".to_string(),
+                    final_decision: "BLOCKED".to_string(),
+                    balance_block_reason: String::new(),
+                    risk_block_reason: String::new(),
+                    execution_block_reason: format!("REQUEST_ERROR:{}", e),
                 };
             }
         }
@@ -1211,6 +1315,10 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         ),
         no_trade_reason: String::new(),
         pipeline_state: "Submitting Order".to_string(),
+        final_decision: "EXECUTE".to_string(),
+        balance_block_reason: String::new(),
+        risk_block_reason: String::new(),
+        execution_block_reason: String::new(),
     }
 }
 
@@ -1604,10 +1712,21 @@ fn evaluate_portfolio_controls(
 
     let aggregate_pnl: f64 = rt.perf.values().map(|p| p.gross_pnl).sum();
     let equity = (position_size * mid.max(0.0)) + aggregate_pnl;
-    let peak = rt.peak_equity.max(equity.max(0.0));
-    let dd = if peak > 0.0 { ((peak - equity) / peak).max(0.0) } else { 0.0 };
+    // Clamp equity to 0 before ratio calculation: negative PnL can produce
+    // ratios > 1 that falsely trigger MAX_DRAWDOWN_BREACH on tiny accounts.
+    let equity_clipped = equity.max(0.0);
+    let peak = rt.peak_equity.max(equity_clipped);
+    // Require peak >= $1 to prevent false triggers on fresh/zero-balance accounts
+    // where both peak and equity are near zero (bad initialization / stale peak).
+    const MIN_PEAK_FOR_DRAWDOWN_CHECK: f64 = 1.0;
+    let dd = if peak >= MIN_PEAK_FOR_DRAWDOWN_CHECK {
+        ((peak - equity_clipped) / peak).max(0.0)
+    } else {
+        0.0
+    };
     if dd >= cfg.alpha.max_drawdown_pct {
-        reasons.push(format!("MAX_DRAWDOWN_BREACH:{:.4}>={:.4}", dd, cfg.alpha.max_drawdown_pct));
+        reasons.push(format!("MAX_DRAWDOWN_BREACH:{:.4}>={:.4} (current_equity={:.4} peak_equity={:.4} limit={:.4})",
+            dd, cfg.alpha.max_drawdown_pct, equity_clipped, peak, cfg.alpha.max_drawdown_pct));
     }
     if dd >= cfg.alpha.drawdown_hard_stop_pct {
         reasons.push("AUTO_DERISK_DRAWDOWN_EXPANSION".to_string());
@@ -2203,5 +2322,92 @@ mod tests {
         // We can't easily construct AgentState in a unit test, so test the enum logic only.
         let mode = if cfg.enabled { AgentMode::Auto } else { AgentMode::Off };
         assert_eq!(mode, AgentMode::Off);
+    }
+
+    // ── Drawdown checks for small accounts ────────────────────────────────────
+
+    #[test]
+    fn drawdown_check_no_false_trigger_on_zero_peak_equity() {
+        // Fresh account: peak_equity=0, position_size=0, no PnL.
+        // Must NOT trigger MAX_DRAWDOWN_BREACH.
+        let cfg = test_cfg();
+        let rt = NpcRuntimeState { peak_equity: 0.0, ..NpcRuntimeState::default() };
+        let reasons = evaluate_portfolio_controls(
+            &cfg,
+            &rt,
+            /* position_size */ 0.0,
+            /* exposure_notional */ 0.0,
+            /* mid */ 50_000.0,
+            MarketRegime::TrendingUp,
+        );
+        assert!(
+            !reasons.iter().any(|r| r.contains("MAX_DRAWDOWN_BREACH")),
+            "MAX_DRAWDOWN_BREACH must not trigger on zero-peak account; got: {:?}", reasons
+        );
+    }
+
+    #[test]
+    fn drawdown_check_no_false_trigger_when_stale_peak_is_tiny() {
+        // Stale peak of $0.50 (sub-$1): must NOT trigger even if equity dropped to 0.
+        let cfg = test_cfg();
+        let rt = NpcRuntimeState { peak_equity: 0.5, ..NpcRuntimeState::default() };
+        let reasons = evaluate_portfolio_controls(
+            &cfg,
+            &rt,
+            0.0,
+            0.0,
+            50_000.0,
+            MarketRegime::TrendingUp,
+        );
+        assert!(
+            !reasons.iter().any(|r| r.contains("MAX_DRAWDOWN_BREACH")),
+            "Must not trigger MAX_DRAWDOWN_BREACH with sub-$1 peak; got: {:?}", reasons
+        );
+    }
+
+    #[test]
+    fn drawdown_check_triggers_correctly_on_real_drawdown() {
+        // Meaningful peak ($100) and current equity drops far enough to breach.
+        // max_drawdown_pct=0.08, so a 50% drawdown should definitely trigger.
+        let cfg = test_cfg();
+        let mut rt = NpcRuntimeState::default();
+        rt.peak_equity = 100.0;
+        // Inject negative PnL so equity = 0 + (-60) = -60 → clipped to 0.
+        // Drawdown = (100 - 0) / 100 = 1.0 ≥ 0.08
+        rt.perf.insert(NpcRole::Scout, AgentPerformance { gross_pnl: -60.0, ..Default::default() });
+        let reasons = evaluate_portfolio_controls(
+            &cfg,
+            &rt,
+            0.0,
+            0.0,
+            50_000.0,
+            MarketRegime::TrendingUp,
+        );
+        assert!(
+            reasons.iter().any(|r| r.contains("MAX_DRAWDOWN_BREACH")),
+            "Must trigger MAX_DRAWDOWN_BREACH with 100% drawdown from $100 peak; got: {:?}", reasons
+        );
+    }
+
+    #[test]
+    fn drawdown_check_includes_diagnostic_fields_in_message() {
+        // Verify the diagnostic fields appear in the breach message.
+        let cfg = test_cfg();
+        let mut rt = NpcRuntimeState::default();
+        rt.peak_equity = 50.0;
+        rt.perf.insert(NpcRole::Scout, AgentPerformance { gross_pnl: -40.0, ..Default::default() });
+        let reasons = evaluate_portfolio_controls(
+            &cfg,
+            &rt,
+            0.0,
+            0.0,
+            50_000.0,
+            MarketRegime::TrendingUp,
+        );
+        let breach = reasons.iter().find(|r| r.contains("MAX_DRAWDOWN_BREACH"))
+            .cloned().unwrap_or_default();
+        assert!(breach.contains("current_equity"), "Breach message must include current_equity; got: {breach}");
+        assert!(breach.contains("peak_equity"), "Breach message must include peak_equity; got: {breach}");
+        assert!(breach.contains("limit"), "Breach message must include limit; got: {breach}");
     }
 }
