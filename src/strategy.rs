@@ -5,6 +5,21 @@
 // eligible (enabled, highest confidence) and returns it for the rest of
 // the pipeline.
 //
+// ── Strategy modes ────────────────────────────────────────────────────────────
+//
+// PRIMARY (Phase 1): Phase1SpotDaySwing
+//   - Spot Day+Swing Long-Only engine.
+//   - Timeframe stack: 4H trend bias, 1H setup validation, 15M execution trigger.
+//   - Entries only when regime = TREND_UP; all shorts blocked.
+//   - Setup types: PullbackLong, BreakoutLong.
+//   - Sizing from stop distance and fixed dollar risk — no vibe sizing.
+//   - Full position management: SL, TP, break-even, trailing stop, time exit.
+//
+// LEGACY / EXPERIMENTAL: MomentumMicro, MeanReversionMicro, BreakoutMicro
+//   - Original microstructure-momentum strategies.
+//   - Retained for comparison and fallback experimentation.
+//   - Can be toggled independently from Phase 1.
+//
 // Design principles:
 //   - Strategy trait is pure: evaluate() takes plain data, returns StrategyDecision.
 //   - No I/O, no locks, no async inside strategies themselves.
@@ -17,6 +32,7 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, info};
 
+use crate::phase1::{Phase1Engine, Phase1Result, Phase1Status};
 use crate::reconciler::TruthState;
 use crate::signal::SignalMetrics;
 
@@ -24,14 +40,20 @@ use crate::signal::SignalMetrics;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum StrategyId {
+    /// PRIMARY — Phase 1 Spot Day+Swing Long-Only engine.
+    Phase1SpotDaySwing,
+    /// LEGACY — Original microstructure momentum strategy.
     MomentumMicro,
+    /// LEGACY — Original mean-reversion micro strategy.
     MeanReversionMicro,
+    /// LEGACY — Original breakout micro strategy.
     BreakoutMicro,
 }
 
 impl StrategyId {
     pub fn as_str(&self) -> &'static str {
         match self {
+            StrategyId::Phase1SpotDaySwing => "Phase1SpotDaySwing",
             StrategyId::MomentumMicro      => "MomentumMicro",
             StrategyId::MeanReversionMicro => "MeanReversionMicro",
             StrategyId::BreakoutMicro      => "BreakoutMicro",
@@ -39,11 +61,13 @@ impl StrategyId {
     }
 
     /// Deterministic priority for tie-breaking (lower = higher priority).
+    /// Phase1SpotDaySwing has highest priority (0).
     pub fn priority(&self) -> u8 {
         match self {
-            StrategyId::MomentumMicro      => 0,
-            StrategyId::MeanReversionMicro => 1,
-            StrategyId::BreakoutMicro      => 2,
+            StrategyId::Phase1SpotDaySwing => 0,
+            StrategyId::MomentumMicro      => 1,
+            StrategyId::MeanReversionMicro => 2,
+            StrategyId::BreakoutMicro      => 3,
         }
     }
 }
@@ -55,7 +79,10 @@ impl std::fmt::Display for StrategyId {
 }
 
 /// All strategies in deterministic priority order.
+/// Phase1SpotDaySwing is listed first (primary path).
+/// Legacy micro strategies follow.
 pub const ALL_STRATEGIES: &[StrategyId] = &[
+    StrategyId::Phase1SpotDaySwing,
     StrategyId::MomentumMicro,
     StrategyId::MeanReversionMicro,
     StrategyId::BreakoutMicro,
@@ -210,10 +237,10 @@ fn evaluate_exit(
     None
 }
 
-// ── Strategy 1: MomentumMicro ─────────────────────────────────────────────────
+// ── Strategy 1: MomentumMicro (LEGACY / EXPERIMENTAL) ────────────────────────
 //
 // Entry: all three momentum windows positive + 1s imbalance above threshold.
-// The existing signal engine logic, now as a named strategy.
+// The existing signal engine logic, now as a named legacy strategy.
 
 pub struct MomentumMicro {
     pub momentum_threshold:   f64,
@@ -297,7 +324,7 @@ impl Strategy for MomentumMicro {
     }
 }
 
-// ── Strategy 2: MeanReversionMicro ───────────────────────────────────────────
+// ── Strategy 2: MeanReversionMicro (LEGACY / EXPERIMENTAL) ──────────────────
 //
 // Entry: short-window momentum (1s) is negative while the longer window (5s)
 // is positive → price dipped within an upward trend (mean-reversion entry).
@@ -398,7 +425,7 @@ impl Strategy for MeanReversionMicro {
     }
 }
 
-// ── Strategy 3: BreakoutMicro ─────────────────────────────────────────────────
+// ── Strategy 3: BreakoutMicro (LEGACY / EXPERIMENTAL) ────────────────────────
 //
 // Entry: 1s momentum significantly exceeds 5s momentum, indicating price
 // just accelerated above its recent range. Buy on the breakout candle.
@@ -541,6 +568,16 @@ struct RegimeView {
 /// Holds all strategies, their enable flags, and per-strategy entry state.
 /// Wrapped in Arc<Mutex<>> so the web UI can toggle enables at runtime.
 pub struct StrategyEngine {
+    // ── Phase 1 (primary strategy path) ──────────────────────────────────────
+    /// Phase 1 Spot Day+Swing Long-Only engine.
+    /// Maintains its own rolling mid-price history for multi-timeframe analysis.
+    phase1:         Phase1Engine,
+    /// Whether Phase 1 is enabled as the primary strategy path.
+    phase1_enabled: bool,
+    /// Last Phase 1 setup details (for entry tracking when Phase1 fires).
+    phase1_last_setup: Option<crate::phase1::Phase1Setup>,
+
+    // ── Legacy strategies (micro/agent system) ────────────────────────────────
     strategies:  Vec<Box<dyn Strategy>>,
     enabled:     HashMap<StrategyId, bool>,
     entry_state: HashMap<StrategyId, StrategyState>,
@@ -564,7 +601,7 @@ pub struct StrategyEngine {
 }
 
 impl StrategyEngine {
-    /// Create with all three strategies enabled.
+    /// Create with Phase1SpotDaySwing (primary) and all three legacy strategies enabled.
     pub fn new() -> Self {
         let strategies: Vec<Box<dyn Strategy>> = vec![
             Box::new(MomentumMicro::default()),
@@ -578,6 +615,9 @@ impl StrategyEngine {
             entry_state.insert(s.id().clone(), StrategyState::default());
         }
         Self {
+            phase1:            Phase1Engine::default(),
+            phase1_enabled:    true,
+            phase1_last_setup: None,
             strategies,
             enabled,
             entry_state,
@@ -604,6 +644,11 @@ impl StrategyEngine {
     // ── Enable/disable ────────────────────────────────────────────────────────
 
     pub fn set_enabled(&mut self, id: &StrategyId, enabled: bool) {
+        if *id == StrategyId::Phase1SpotDaySwing {
+            self.phase1_enabled = enabled;
+            info!(strategy = %id, enabled, "[STRATEGY] Enable toggled");
+            return;
+        }
         if let Some(e) = self.enabled.get_mut(id) {
             *e = enabled;
             info!(strategy = %id, enabled, "[STRATEGY] Enable toggled");
@@ -611,6 +656,9 @@ impl StrategyEngine {
     }
 
     pub fn is_enabled(&self, id: &StrategyId) -> bool {
+        if *id == StrategyId::Phase1SpotDaySwing {
+            return self.phase1_enabled;
+        }
         *self.enabled.get(id).unwrap_or(&false)
     }
 
@@ -624,6 +672,14 @@ impl StrategyEngine {
 
     /// Called when a BUY is confirmed submitted for a specific strategy.
     pub fn on_entry_submitted(&mut self, id: &StrategyId, price: f64) {
+        if *id == StrategyId::Phase1SpotDaySwing {
+            if let Some(setup) = self.phase1_last_setup.take() {
+                self.phase1.on_entry_confirmed(&setup);
+            }
+            self.last_trade_at = Some(Instant::now());
+            self.active_strategy_hint = Some(id.clone());
+            return;
+        }
         if let Some(state) = self.entry_state.get_mut(id) {
             state.entry_price_hint = Some(price);
             state.entry_time       = Some(Instant::now());
@@ -634,6 +690,12 @@ impl StrategyEngine {
 
     /// Called when position is closed (sell executed).
     pub fn on_exit_submitted(&mut self, id: &StrategyId, exit_price: f64) {
+        if *id == StrategyId::Phase1SpotDaySwing {
+            self.phase1.on_exit_confirmed();
+            self.last_trade_at = Some(Instant::now());
+            self.active_strategy_hint = None;
+            return;
+        }
         let mut was_win = None;
         let mut realized_edge = None;
         if let Some(state) = self.entry_state.get_mut(id) {
@@ -703,11 +765,17 @@ impl StrategyEngine {
             state.entry_price_hint = None;
             state.entry_time       = None;
         }
+        self.phase1.on_exit_confirmed();
+        self.phase1_last_setup = None;
         self.active_strategy_hint = None;
     }
 
     /// Which strategy ID is currently "active" (has an open entry hint).
     pub fn active_strategy(&self) -> Option<StrategyId> {
+        // Check Phase1 first (primary strategy)
+        if self.phase1.open_position.is_some() {
+            return Some(StrategyId::Phase1SpotDaySwing);
+        }
         self.entry_state.iter()
             .find(|(_, s)| s.entry_price_hint.is_some())
             .map(|(id, _)| id.clone())
@@ -723,6 +791,8 @@ impl StrategyEngine {
     // ── Core evaluation ───────────────────────────────────────────────────────
 
     /// Evaluate all enabled strategies and select the best actionable decision.
+    ///
+    /// Phase 1 (primary) is evaluated first. Legacy micro strategies follow.
     ///
     /// Selection rules:
     ///   1. Only enabled strategies are considered.
@@ -745,6 +815,42 @@ impl StrategyEngine {
         let dynamic_threshold = self.dynamic_confidence_threshold();
         let participation_ok = self.participation_ok(metrics);
 
+        // ── Phase 1 evaluation (primary strategy path) ────────────────────────
+        // Phase1 runs before legacy strategies and has highest priority.
+        // It maintains its own rolling history so we must call it mutably here.
+        let phase1_decision = if self.phase1_enabled {
+            let result = self.phase1.evaluate(metrics, truth);
+            let decision = Self::phase1_result_to_decision(result, metrics);
+            // Cache the setup so on_entry_submitted can confirm it later.
+            if let StrategyAction::BuyCandidate = &decision.action {
+                self.phase1_last_setup = self.phase1.last_setup.clone();
+            }
+            Some(decision)
+        } else {
+            // Record disabled placeholder so the UI can show it.
+            Some(StrategyDecision {
+                strategy_id: StrategyId::Phase1SpotDaySwing,
+                action:      StrategyAction::StandDown,
+                confidence:  0.0,
+                reason:      "disabled".into(),
+            })
+        };
+
+        if let Some(d) = phase1_decision {
+            debug!(
+                strategy = %d.strategy_id,
+                action   = %d.action,
+                conf     = d.confidence,
+                reason   = %d.reason,
+                "[STRATEGY] Phase1 decision"
+            );
+            if d.action.is_actionable() {
+                candidates.push(d.clone());
+            }
+            all_decisions.push(d);
+        }
+
+        // ── Legacy strategies (micro/agent) ───────────────────────────────────
         for strategy in &self.strategies {
             if !self.is_enabled(strategy.id()) {
                 // Record a placeholder so the UI can show disabled state
@@ -840,13 +946,13 @@ impl StrategyEngine {
                 all_decisions.iter()
                     .find(|d| d.reason != "disabled")
                     .cloned()
-                    .unwrap_or_else(|| StrategyDecision::stand_down(StrategyId::MomentumMicro, "no strategies enabled"))
+                    .unwrap_or_else(|| StrategyDecision::stand_down(StrategyId::Phase1SpotDaySwing, "no strategies enabled"))
             }
         };
 
         if self.should_force_exit_for_edge_decay(metrics, truth, &chosen) {
             chosen = StrategyDecision {
-                strategy_id: self.active_strategy_hint.clone().unwrap_or(StrategyId::MomentumMicro),
+                strategy_id: self.active_strategy_hint.clone().unwrap_or(StrategyId::Phase1SpotDaySwing),
                 action: StrategyAction::ExitCandidate { reason: "EDGE_DECAY".into() },
                 confidence: 1.0,
                 reason: "Edge velocity decayed rapidly; forcing immediate exit".into(),
@@ -854,6 +960,82 @@ impl StrategyEngine {
         }
 
         (chosen, all_decisions)
+    }
+
+    /// Convert a Phase1Result into a StrategyDecision.
+    ///
+    /// This is called during evaluate() to integrate Phase1 into the
+    /// standard strategy selection pipeline.
+    fn phase1_result_to_decision(result: Phase1Result, metrics: &SignalMetrics) -> StrategyDecision {
+        match result {
+            Phase1Result::Setup(setup) => {
+                // Confidence is the setup quality (0..1).
+                let confidence = setup.setup_quality;
+                let reason = format!(
+                    "phase1:{} mode={} entry={:.2} stop={:.2} target={:.2} quality={:.2}",
+                    setup.setup_type.as_str(),
+                    setup.mode.as_str(),
+                    setup.entry,
+                    setup.stop,
+                    setup.target,
+                    setup.setup_quality,
+                );
+                StrategyDecision {
+                    strategy_id: StrategyId::Phase1SpotDaySwing,
+                    action:      StrategyAction::BuyCandidate,
+                    confidence,
+                    reason,
+                }
+            }
+            Phase1Result::Exit { reason } => StrategyDecision {
+                strategy_id: StrategyId::Phase1SpotDaySwing,
+                action:      StrategyAction::ExitCandidate { reason: reason.clone() },
+                confidence:  1.0,
+                reason:      format!("phase1:exit reason={}", reason),
+            },
+            Phase1Result::HoldPosition { regime, position_note } => StrategyDecision {
+                strategy_id: StrategyId::Phase1SpotDaySwing,
+                action:      StrategyAction::Wait,
+                confidence:  0.0,
+                reason:      format!("phase1:hold regime={} {}", regime.as_str(), position_note),
+            },
+            Phase1Result::NoTrade { regime, block_reason } => {
+                let _ = metrics; // metrics available for future use
+                StrategyDecision {
+                    strategy_id: StrategyId::Phase1SpotDaySwing,
+                    action:      StrategyAction::Wait,
+                    confidence:  0.0,
+                    reason:      format!("phase1:no_trade regime={} block={}", regime.as_str(), block_reason),
+                }
+            }
+        }
+    }
+
+    /// Return a snapshot of Phase1Engine state for UI display.
+    pub fn phase1_status(&self) -> Phase1Status {
+        let pos = self.phase1.open_position.as_ref();
+        let setup = self.phase1.last_setup.as_ref();
+        Phase1Status {
+            enabled:         self.phase1_enabled,
+            regime:          self.phase1.last_regime,
+            block_reason:    self.phase1.last_block_reason.clone(),
+            last_setup_type: setup.map(|s| s.setup_type),
+            last_setup_mode: setup.map(|s| s.mode),
+            last_entry:      setup.map(|s| s.entry),
+            last_stop:       setup.map(|s| s.stop),
+            last_target:     setup.map(|s| s.target),
+            last_quality:    setup.map(|s| s.setup_quality),
+            in_position:     pos.is_some(),
+            position_stop:   pos.map(|p| p.stop_price),
+            position_target: pos.map(|p| p.target_price),
+            break_even:      pos.map(|p| p.break_even_triggered).unwrap_or(false),
+            high_water:      pos.map(|p| p.high_water_mark),
+        }
+    }
+
+    /// Compute Phase1 position size for a given setup.
+    pub fn phase1_size_from_risk(&self, entry: f64, stop: f64) -> f64 {
+        self.phase1.size_from_risk(entry, stop)
     }
 
     pub fn compute_position_size(
@@ -952,10 +1134,13 @@ impl StrategyDecision {
             StrategyAction::BuyCandidate => crate::signal::SignalDecision::Buy,
             StrategyAction::ExitCandidate { reason } => {
                 let exit_reason = match reason.as_str() {
-                    "STOP_LOSS"    => crate::signal::ExitReason::StopLoss,
-                    "TAKE_PROFIT"  => crate::signal::ExitReason::TakeProfit,
-                    "MAX_HOLD_TIME"=> crate::signal::ExitReason::MaxHoldTime,
-                    _              => crate::signal::ExitReason::MaxHoldTime, // safe fallback
+                    "STOP_LOSS"
+                    | "BREAK_EVEN_STOP"
+                    | "TRAILING_STOP"  => crate::signal::ExitReason::StopLoss,
+                    "TAKE_PROFIT"      => crate::signal::ExitReason::TakeProfit,
+                    "MAX_HOLD_TIME"
+                    | "TIME_EXIT"      => crate::signal::ExitReason::MaxHoldTime,
+                    _                  => crate::signal::ExitReason::MaxHoldTime, // safe fallback
                 };
                 crate::signal::SignalDecision::Exit { reason: exit_reason }
             }
@@ -1009,12 +1194,15 @@ mod tests {
 
     #[test]
     fn test_strategy_id_priority_order() {
+        // Phase1SpotDaySwing is highest priority (lowest number)
+        assert!(StrategyId::Phase1SpotDaySwing.priority() < StrategyId::MomentumMicro.priority());
         assert!(StrategyId::MomentumMicro.priority() < StrategyId::MeanReversionMicro.priority());
         assert!(StrategyId::MeanReversionMicro.priority() < StrategyId::BreakoutMicro.priority());
     }
 
     #[test]
     fn test_strategy_id_display() {
+        assert_eq!(StrategyId::Phase1SpotDaySwing.to_string(), "Phase1SpotDaySwing");
         assert_eq!(StrategyId::MomentumMicro.to_string(), "MomentumMicro");
         assert_eq!(StrategyId::MeanReversionMicro.to_string(), "MeanReversionMicro");
         assert_eq!(StrategyId::BreakoutMicro.to_string(), "BreakoutMicro");
@@ -1227,7 +1415,8 @@ mod tests {
     fn test_engine_tie_uses_priority_order() {
         // Build two strategies with exactly equal confidence output.
         // We can simulate this by checking priority tiebreaking logic directly.
-        // MomentumMicro priority (0) < MeanReversionMicro (1) < BreakoutMicro (2)
+        // MomentumMicro priority (1) < MeanReversionMicro (2) < BreakoutMicro (3)
+        // Phase1SpotDaySwing priority (0) beats all.
         let a = StrategyDecision {
             strategy_id: StrategyId::MeanReversionMicro,
             action:      StrategyAction::BuyCandidate,
@@ -1249,7 +1438,14 @@ mod tests {
             } else { best }
         }).unwrap();
         assert_eq!(winner.strategy_id, StrategyId::MomentumMicro,
-            "MomentumMicro (priority 0) must win tie");
+            "MomentumMicro (priority 1) must win tie vs MeanReversionMicro (priority 2)");
+    }
+
+    #[test]
+    fn test_phase1_has_highest_priority() {
+        assert_eq!(StrategyId::Phase1SpotDaySwing.priority(), 0,
+            "Phase1SpotDaySwing must have priority 0 (highest)");
+        assert!(StrategyId::Phase1SpotDaySwing.priority() < StrategyId::MomentumMicro.priority());
     }
 
     #[test]

@@ -7,6 +7,7 @@ mod npc;
 mod executor;
 mod feed;
 mod orders;
+mod phase1;
 mod portfolio;
 mod position;
 mod profile;
