@@ -132,18 +132,29 @@ pub struct Phase1Config {
     /// All positions are sized so that hitting the stop costs exactly this amount.
     pub dollar_risk_per_trade: f64,
 
-    /// "4H bias" window in seconds: trend direction over this lookback.
-    /// Equivalent to the higher-timeframe trend filter.
+    /// Longer-term trend bias window in seconds.
+    ///
+    /// Acts as the "4H bias" filter in the multi-timeframe stack.
+    /// NOTE: The live feed only retains a rolling window of recent ticks
+    /// (max_window ≈ a few minutes). This value is therefore a *relative*
+    /// lookback within the available history — not 4 literal hours.
+    /// Use 240.0 (default) for the widest lookback the feed can sustain.
     pub trend_window_secs: f64,
 
-    /// "1H setup" window in seconds: setup direction validation.
+    /// Setup validation window in seconds.
+    ///
+    /// Acts as the "1H setup" filter — a medium-term trend confirmation.
+    /// Default 60.0 seconds; relative to the available tick history.
     pub setup_window_secs: f64,
 
-    /// "15M execution" window in seconds: execution trigger confirmation.
+    /// Execution trigger window in seconds.
+    ///
+    /// Acts as the "15M execution" trigger — short-term momentum confirmation.
+    /// Default 15.0 seconds; relative to the available tick history.
     pub trigger_window_secs: f64,
 
     /// Minimum net drift (fraction) over trend_window to declare TREND_UP/TREND_DOWN.
-    /// E.g. 0.001 = 0.10% over the trend window.
+    /// E.g. 0.0008 = 0.08% over the trend window.
     pub min_trend_drift: f64,
 
     /// Maximum spread in basis points allowed at entry.
@@ -175,15 +186,31 @@ pub struct Phase1Config {
 
     /// Minimum mid-price samples required before computing regime or setups.
     pub min_samples: usize,
+
+    /// Pullback: maximum allowed flush depth (fraction below trigger-window entry).
+    /// Pullbacks deeper than this are ignored (too risky / might be a trend break).
+    pub pullback_max_flush_pct: f64,
+
+    /// Pullback: threshold below which a pullback becomes SWING (vs DAY) mode.
+    /// Pullback depth < this → DAY; depth >= this → SWING.
+    pub pullback_swing_depth_pct: f64,
+
+    /// Breakout: minimum 1s momentum required to confirm acceleration.
+    /// Prevents entering on drifting price action with no real volume.
+    pub breakout_min_momentum_1s: f64,
+
+    /// For Range regime: both 4H and 1H must be below (min_trend_drift * this factor).
+    /// Lower factor = stricter range qualification.
+    pub range_setup_factor: f64,
 }
 
 impl Default for Phase1Config {
     fn default() -> Self {
         Self {
             dollar_risk_per_trade:  25.0,
-            trend_window_secs:     240.0,   // ~4H equivalent lookback
-            setup_window_secs:      60.0,   // ~1H equivalent lookback
-            trigger_window_secs:    15.0,   // ~15M equivalent lookback
+            trend_window_secs:     240.0,
+            setup_window_secs:      60.0,
+            trigger_window_secs:    15.0,
             min_trend_drift:        0.0008, // 0.08% drift to confirm trend direction
             max_spread_bps:         8.0,
             pullback_stop_pct:      0.0030, // 0.30% below entry
@@ -195,6 +222,10 @@ impl Default for Phase1Config {
             break_even_trigger_pct: 0.0050, // 0.50% rise triggers break-even
             trailing_stop_pct:      0.0040, // trail 0.40% below high-water mark
             min_samples:            10,
+            pullback_max_flush_pct:  0.012, // ignore pullbacks > 1.2% (possible trend break)
+            pullback_swing_depth_pct: 0.003, // pullbacks < 0.3% are DAY; deeper are SWING
+            breakout_min_momentum_1s: 0.0001, // minimum 1s momentum to confirm breakout
+            range_setup_factor:      0.5,   // 1H must be < min_trend_drift * 0.5 for RANGE
         }
     }
 }
@@ -351,7 +382,7 @@ impl Phase1Engine {
                 DaySwingRegime::TrendDown,
                 format!("4H_drift={:+.4}% 1H_drift={:+.4}%", td * 100.0, sd * 100.0),
             )
-        } else if td.abs() < min && sd.abs() < min * 0.5 {
+        } else if td.abs() < min && sd.abs() < min * self.cfg.range_setup_factor {
             (
                 DaySwingRegime::Range,
                 format!("4H_drift={:+.4}% 1H_drift={:+.4}% (flat)", td * 100.0, sd * 100.0),
@@ -376,10 +407,11 @@ impl Phase1Engine {
         let sd = self.drift(self.cfg.setup_window_secs, mid)?;
         if sd < self.cfg.min_trend_drift { return None; }
 
-        // 15M window must show a dip (negative drift but not catastrophic).
+        // Trigger: 15M window must show a dip (negative drift but not a catastrophic flush).
         let td = self.drift(self.cfg.trigger_window_secs, mid)?;
         if td >= 0.0 { return None; }             // not pulling back
-        if td < -0.012 { return None; }            // too deep a flush
+        // Ignore if flush is deeper than configured max (may be a trend break, not a pullback).
+        if td < -self.cfg.pullback_max_flush_pct { return None; }
 
         // Medium-term momentum (5s) must still be positive — trend intact.
         if metrics.momentum_5s <= 0.0 { return None; }
@@ -394,8 +426,8 @@ impl Phase1Engine {
         let quality = (trend_score * 0.45 + pullback_depth * 0.30 + spread_score * 0.25)
             .clamp(0.0, 1.0);
 
-        // Shallow pullback = DAY trade; deeper pullback = SWING.
-        let mode = if td.abs() < 0.003 { TradeMode::Day } else { TradeMode::Swing };
+        // Shallow pullback (< pullback_swing_depth_pct) = DAY trade; deeper = SWING.
+        let mode = if td.abs() < self.cfg.pullback_swing_depth_pct { TradeMode::Day } else { TradeMode::Swing };
 
         Some(Phase1Setup {
             setup_type: SetupType::PullbackLong,
@@ -422,11 +454,12 @@ impl Phase1Engine {
         let td = self.drift(self.cfg.trigger_window_secs, mid)?;
         if td < self.cfg.min_trend_drift * 0.5 { return None; }
 
-        // Strong buy imbalance required (volume confirms the move).
+        // Strong buy imbalance required — volume must confirm the move.
         if metrics.imbalance_1s < 0.20 { return None; }
 
-        // Short-term momentum must be strongly positive (acceleration).
-        if metrics.momentum_1s < 0.0001 { return None; }
+        // 1s momentum must meet the configured minimum to confirm acceleration.
+        // Without acceleration, the "breakout" could be a false start.
+        if metrics.momentum_1s < self.cfg.breakout_min_momentum_1s { return None; }
 
         let entry  = metrics.ask;
         let stop   = entry * (1.0 - self.cfg.breakout_stop_pct);

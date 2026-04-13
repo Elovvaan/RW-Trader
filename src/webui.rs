@@ -1523,9 +1523,18 @@ async fn page_events(state: &AppState, query: &str) -> String {
         } else {
             "<span style='background:rgba(130,144,159,.14);color:#82909f;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:700'>DISABLED</span>"
         };
-        let block_row = if phase1_status.enabled && !phase1_status.block_reason.is_empty()
-            && phase1_status.regime != crate::phase1::DaySwingRegime::TrendUp
+        let block_row = if !phase1_status.enabled {
+            "<div style='margin-top:6px;padding:6px 8px;background:rgba(130,144,159,.08);\
+             border:1px solid rgba(130,144,159,.25);border-radius:8px;font-size:11px'>\
+             <span style='color:#82909f;font-weight:700'>Phase 1 disabled — legacy strategies are active</span>\
+             </div>".to_string()
+        } else if phase1_status.regime == crate::phase1::DaySwingRegime::TrendUp
+            && phase1_status.block_reason.is_empty()
         {
+            "<div style='margin-top:6px;padding:6px 8px;background:rgba(34,197,94,.08);\
+             border:1px solid rgba(34,197,94,.25);border-radius:8px;font-size:11px'>\
+             <span style='color:#22C55E;font-weight:700'>✓ TREND_UP — scanning for setup</span></div>".to_string()
+        } else if !phase1_status.block_reason.is_empty() {
             format!(
                 "<div style='margin-top:6px;padding:6px 8px;background:rgba(239,68,68,.08);\
                  border:1px solid rgba(239,68,68,.25);border-radius:8px;font-size:11px'>\
@@ -1533,12 +1542,6 @@ async fn page_events(state: &AppState, query: &str) -> String {
                  <span style='color:#d0d6dd'>{}</span></div>",
                 esc(&phase1_status.block_reason)
             )
-        } else if phase1_status.enabled && phase1_status.block_reason.is_empty()
-            && phase1_status.regime == crate::phase1::DaySwingRegime::TrendUp
-        {
-            "<div style='margin-top:6px;padding:6px 8px;background:rgba(34,197,94,.08);\
-             border:1px solid rgba(34,197,94,.25);border-radius:8px;font-size:11px'>\
-             <span style='color:#22C55E;font-weight:700'>✓ TREND_UP — scanning for setup</span></div>".to_string()
         } else {
             String::new()
         };
