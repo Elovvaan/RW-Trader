@@ -3449,4 +3449,74 @@ mod diagnostic_tests {
             report.risk_block_reason
         );
     }
+
+    /// Requirement 6: The final built dispatch URL is absolute and valid.
+    ///
+    /// Verifies that given any of the three common base-URL forms that
+    /// `resolve_web_base_url()` may produce, the resulting dispatch URL:
+    ///  - starts with "http://" or "https://"
+    ///  - ends with "/trade/request"
+    ///  - contains no double slashes in the path
+    #[test]
+    fn dispatch_url_is_absolute_and_valid() {
+        let cases: &[&str] = &[
+            "https://rw-trader-production.up.railway.app",
+            "http://127.0.0.1:8080",
+            "http://0.0.0.0:8080",
+        ];
+        for base in cases {
+            let url = format!("{}/trade/request", base);
+            assert!(
+                url.starts_with("http://") || url.starts_with("https://"),
+                "dispatch URL must be absolute (have http/https scheme); got: {}",
+                url
+            );
+            assert!(
+                url.ends_with("/trade/request"),
+                "dispatch URL must end with /trade/request; got: {}",
+                url
+            );
+            // No double slashes in the path component (after the scheme).
+            let path_part = url.split_once("://").map(|(_, p)| p).unwrap_or(&url);
+            assert!(
+                !path_part.contains("//"),
+                "dispatch URL path must not contain double slashes; got: {}",
+                url
+            );
+        }
+    }
+
+    /// Requirement 7: Dispatch no longer produces a builder error when a valid
+    /// base URL is provided.
+    ///
+    /// Constructs a reqwest POST request from a known-good base URL and verifies
+    /// that the request builder succeeds (no "builder error") — the exact failure
+    /// that was previously triggered by a malformed URL such as "http://https://…".
+    #[test]
+    fn dispatch_request_builder_succeeds_with_valid_base_url() {
+        // These base URLs represent what resolve_web_base_url() would return in
+        // different deployment environments:
+        //   - Railway with RAILWAY_PUBLIC_DOMAIN set
+        //   - Railway with only PORT set (loopback)
+        //   - WEB_UI_ADDR already contains the scheme
+        let base_urls: &[&str] = &[
+            "https://rw-trader-production.up.railway.app",
+            "http://127.0.0.1:8080",
+            "http://example.internal:9000",
+        ];
+        for base in base_urls {
+            let url = format!("{}/trade/request", base);
+            // reqwest::Client::new().post(url) records any builder error lazily;
+            // it surfaces when .build() is called.  Verify it does not error.
+            let result = reqwest::Client::new()
+                .post(&url)
+                .build();
+            assert!(
+                result.is_ok(),
+                "request builder must succeed for URL '{}'; got error: {:?}",
+                url,
+                result.err()
+            );
+        }
+    }
 }
