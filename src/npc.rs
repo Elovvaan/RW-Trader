@@ -332,7 +332,13 @@ impl ScoreBreakdown {
     }
 
     /// Returns a formatted string naming the top-3 penalty components by magnitude,
-    /// descending. Used in telemetry to show which factors suppressed the score.
+    /// descending. There are 4 trackable penalty components (spread_cost, vol_penalty,
+    /// slippage_risk, conflict); we report the top 3 by value. Positive contributors
+    /// (liquidity_quality, hold_efficiency, edge_estimate) are excluded — this method
+    /// is specifically for diagnosing what suppressed the score.
+    ///
+    /// NaN values cannot arise here because all penalty fields are produced by
+    /// `.clamp()` operations on finite inputs; `unwrap_or(Equal)` is a safe fallback.
     fn top_penalties_str(&self) -> String {
         let mut penalties = [
             ("spread_cost",    self.spread_cost),
@@ -1887,6 +1893,11 @@ fn score_candidate(
     // a micro account operating in normal market conditions.
     // Hard guards (spread bps, slippage bps) still check the raw market values —
     // this dampening only affects the scoring priority, not safety enforcement.
+    //
+    // Dampening is applied *after* clamping (to the clamped ratio value).  This is
+    // intentional: the guard layer has already blocked any inputs that would exceed
+    // the ratio ceiling; the clamped value therefore represents an already-bounded
+    // cost and halving it is a straightforward linear adjustment.
     let penalty_factor = if is_micro_active { MICRO_PENALTY_DAMPEN } else { 1.0 };
 
     let volatility_penalty = (realized_volatility_bps(&rt.mid_history, 8).unwrap_or(0.0) / cfg.alpha.vol_spike_bps.max(1.0)).clamp(0.0, 3.0) * penalty_factor;
