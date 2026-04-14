@@ -124,7 +124,7 @@ No hardware or network interaction occurs.  Safe to use in unit tests.
 2. If the autopilot does not ACK within `MAVLINK_ACK_TIMEOUT` ms,
    `SET_ACTUATOR_CONTROL_TARGET` (message 140) is broadcast as a fallback.
    - `controls[0..3]` = motors A–D; `controls[4..7] = 0`.
-   - `group_mlx = 0`.
+   - `group_mlx = 0` (`group_mlx` is the official MAVLink wire-field name for the actuator group selector).
 
 **Arming / disarming / takeoff / land** use `COMMAND_LONG` with the same
 command ids as before — these paths are unchanged.

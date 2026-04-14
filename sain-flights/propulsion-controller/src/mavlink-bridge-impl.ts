@@ -172,7 +172,7 @@ function encodeCommandLong(
  *
  * uint64  time_usec  @ offset 0
  * float32 controls[8] @ offset 8
- * uint8   group_mlx  @ offset 40
+ * uint8   group_mlx  @ offset 40   (`group_mlx` is the official MAVLink field name)
  */
 function encodeActuatorControlTarget(
   timeUsec: bigint,

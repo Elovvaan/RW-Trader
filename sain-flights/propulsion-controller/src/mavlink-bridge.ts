@@ -35,7 +35,9 @@ export interface MavlinkBridge {
    * Used as the fallback actuator-write path when MAV_CMD_DO_SET_ACTUATOR
    * is not acknowledged.
    *
-   * @param groupMix  Actuator group: 0 = main motors, 1 = flaps, etc.
+   * @param groupMix  Actuator group (maps to the `group_mlx` wire field in
+   *                  SET_ACTUATOR_CONTROL_TARGET — `_mlx` is the official MAVLink
+   *                  field name, not a typo).  0 = main motors, 1 = flaps, etc.
    * @param controls  Exactly 8 normalised control values in [0..1].
    *                  Indices 0–3 map to the four main motors.
    */

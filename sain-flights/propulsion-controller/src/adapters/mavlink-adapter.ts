@@ -23,7 +23,7 @@
  * Fallback: SET_ACTUATOR_CONTROL_TARGET (message id 140) when the autopilot
  *   does not ACK MAV_CMD_DO_SET_ACTUATOR within MAVLINK_ACK_TIMEOUT ms.
  *   controls[0..3] = motors A–D;  controls[4..7] = 0.
- *   group_mlx = 0 (main motor group).
+ *   group_mlx = 0 (main motor group — `group_mlx` is the official MAVLink field name).
  *
  * Arming/disarming, takeoff, and land are unchanged from the legacy path.
  * setThrottle (legacy avgLift mode) maps a single value to equal outputs
