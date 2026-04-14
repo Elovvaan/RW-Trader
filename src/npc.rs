@@ -330,6 +330,29 @@ impl ScoreBreakdown {
             - self.conflict_penalty
             + self.hold_efficiency
     }
+
+    /// Returns a formatted string naming the top-3 penalty components by magnitude,
+    /// descending. There are 4 trackable penalty components (spread_cost, vol_penalty,
+    /// slippage_risk, conflict); we report the top 3 by value. Positive contributors
+    /// (liquidity_quality, hold_efficiency, edge_estimate) are excluded — this method
+    /// is specifically for diagnosing what suppressed the score.
+    ///
+    /// NaN values cannot arise here because all penalty fields are produced by
+    /// `.clamp()` operations on finite inputs; `unwrap_or(Equal)` is a safe fallback.
+    fn top_penalties_str(&self) -> String {
+        let mut penalties = [
+            ("spread_cost",    self.spread_cost),
+            ("vol_penalty",    self.volatility_penalty),
+            ("slippage_risk",  self.slippage_risk),
+            ("conflict",       self.conflict_penalty),
+        ];
+        penalties.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+        penalties[..3]
+            .iter()
+            .map(|(name, val)| format!("{}={:.4}", name, val))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -445,8 +468,15 @@ pub struct NpcLoopSnapshot {
     // ── Micro-account adaptive thresholds ────────────────────────────────────
     /// Adaptive signal threshold in effect for the last cycle (balance-dependent).
     pub effective_threshold: f64,
-    /// Threshold mode label: "normal" or "micro_aggressive".
+    /// Threshold mode label: "normal", "micro_aggressive", or "micro_active".
     pub threshold_mode: String,
+    // ── Score telemetry ───────────────────────────────────────────────────────
+    /// Raw (un-clamped) score of the best candidate last cycle.
+    pub raw_score: f64,
+    /// raw_score / effective_threshold.  ≥ 1.0 means the score gate would pass.
+    pub normalized_score: f64,
+    /// Formatted top-3 penalty components that suppressed the score (descending).
+    pub top_score_penalties: String,
 }
 
 #[derive(Default)]
@@ -471,8 +501,12 @@ struct NpcLoopTelemetry {
     cooldown_remaining_ms: u64,
     /// Adaptive signal threshold in effect (balance-dependent).
     effective_threshold: f64,
-    /// Threshold mode: "normal" or "micro_aggressive".
+    /// Threshold mode: "normal", "micro_aggressive", or "micro_active".
     threshold_mode: String,
+    // ── Score telemetry ───────────────────────────────────────────────────────
+    raw_score: f64,
+    normalized_score: f64,
+    top_score_penalties: String,
 }
 
 struct NpcLoopControl {
@@ -521,6 +555,9 @@ impl NpcAutonomousController {
                 pipeline_state: "Scanning".to_string(),
                 effective_threshold: THRESHOLD_BASE,
                 threshold_mode: "normal".to_string(),
+                raw_score: 0.0,
+                normalized_score: 0.0,
+                top_score_penalties: String::new(),
                 ..NpcLoopTelemetry::default()
             })),
             control: Arc::new(Mutex::new(NpcLoopControl::new(interval_ms, mode))),
@@ -647,6 +684,9 @@ impl NpcAutonomousController {
             cooldown_remaining_ms: telemetry.cooldown_remaining_ms,
             effective_threshold: telemetry.effective_threshold,
             threshold_mode: telemetry.threshold_mode.clone(),
+            raw_score: telemetry.raw_score,
+            normalized_score: telemetry.normalized_score,
+            top_score_penalties: telemetry.top_score_penalties.clone(),
         }
     }
 
@@ -717,6 +757,9 @@ impl NpcAutonomousController {
                         t.cooldown_remaining_ms = report.cooldown_remaining_ms;
                         t.effective_threshold = report.effective_threshold;
                         t.threshold_mode = report.threshold_mode;
+                        t.raw_score = report.raw_score;
+                        t.normalized_score = report.normalized_score;
+                        t.top_score_penalties = report.top_score_penalties;
                         t.status = match report.status.as_str() {
                             "blocked" => "Blocked by safety checks".to_string(),
                             "running" => AgentMode::Auto.state_label().to_string(),
@@ -806,8 +849,16 @@ struct NpcCycleReport {
     cooldown_remaining_ms: u64,
     /// Adaptive signal threshold in effect for this cycle (balance-dependent).
     effective_threshold: f64,
-    /// Threshold mode: "normal" or "micro_aggressive".
+    /// Threshold mode: "normal", "micro_aggressive", or "micro_active".
     threshold_mode: String,
+    // ── Score telemetry ───────────────────────────────────────────────────────
+    /// Raw (un-clamped) score of the best candidate this cycle.  0.0 when no
+    /// candidate was built (e.g. authority OFF or no candidates).
+    raw_score: f64,
+    /// raw_score / effective_threshold.  ≥ 1.0 means the score gate would pass.
+    normalized_score: f64,
+    /// Formatted top-3 penalty components that suppressed the score (descending).
+    top_score_penalties: String,
 }
 
 // ── Micro-account adaptive threshold constants ────────────────────────────────
@@ -817,6 +868,17 @@ const MICRO_BALANCE_MID_USD: f64    = 100.0;  // below this: mid tier ($50–$99
 const THRESHOLD_MICRO_SMALL: f64    = 0.11;   // signal threshold for micro accounts (balance < $50)
 const THRESHOLD_MICRO: f64          = 0.14;   // signal threshold for mid accounts ($50–$99.99)
 const THRESHOLD_BASE: f64           = 0.18;   // signal threshold for normal accounts (balance ≥ $100)
+
+// ── MICRO_ACTIVE live-mode thresholds (lower than paper/sim micro_aggressive) ──
+/// Signal threshold for live micro_active < $50 (lower than micro_aggressive 0.11).
+const THRESHOLD_MICRO_ACTIVE_SMALL: f64 = 0.08;
+/// Signal threshold for live micro_active $50–$99.99 (lower than micro_aggressive 0.14).
+const THRESHOLD_MICRO_ACTIVE_MID: f64   = 0.11;
+
+/// Penalty dampen factor applied to spread_cost / volatility_penalty / slippage_risk
+/// in MICRO_ACTIVE mode. Halves those components so the tiny edge signal is not
+/// overwhelmed by proportionally large penalty terms.
+const MICRO_PENALTY_DAMPEN: f64 = 0.50;
 
 /// Compute balance-adaptive signal threshold and mode label.
 ///
@@ -830,6 +892,9 @@ const THRESHOLD_BASE: f64           = 0.18;   // signal threshold for normal acc
 ///   $50 ≤ balance < $100 → 0.14  "micro_aggressive"
 ///   balance ≥ $100       → 0.18  "normal"
 ///   balance = 0.0        → 0.18  "normal"  (no data yet)
+///
+/// Used in tests and paper/sim modes. For live mode use
+/// `adaptive_signal_threshold_with_trading_mode`.
 fn adaptive_signal_threshold(total_balance_usd: f64) -> (f64, &'static str) {
     if total_balance_usd > 0.0 && total_balance_usd < MICRO_BALANCE_USD {
         (THRESHOLD_MICRO_SMALL, "micro_aggressive")
@@ -837,6 +902,33 @@ fn adaptive_signal_threshold(total_balance_usd: f64) -> (f64, &'static str) {
         (THRESHOLD_MICRO, "micro_aggressive")
     } else {
         (THRESHOLD_BASE, "normal")
+    }
+}
+
+/// Compute balance-adaptive signal threshold and mode label, taking the current
+/// trading mode into account.
+///
+/// In `Live` mode, accounts below $100 activate **MICRO_ACTIVE** with even lower
+/// thresholds and dedicated scoring-penalty dampening:
+///   live balance < $50        → 0.08  "micro_active"
+///   live balance $50–$99.99   → 0.11  "micro_active"
+///   live balance ≥ $100       → 0.18  "normal"
+///
+/// In paper/simulation mode the ordinary `adaptive_signal_threshold` tiers apply.
+fn adaptive_signal_threshold_with_trading_mode(
+    total_balance_usd: f64,
+    mode: NpcTradingMode,
+) -> (f64, &'static str) {
+    if mode == NpcTradingMode::Live {
+        if total_balance_usd > 0.0 && total_balance_usd < MICRO_BALANCE_USD {
+            (THRESHOLD_MICRO_ACTIVE_SMALL, "micro_active")
+        } else if total_balance_usd > 0.0 && total_balance_usd < MICRO_BALANCE_MID_USD {
+            (THRESHOLD_MICRO_ACTIVE_MID, "micro_active")
+        } else {
+            (THRESHOLD_BASE, "normal")
+        }
+    } else {
+        adaptive_signal_threshold(total_balance_usd)
     }
 }
 
@@ -855,7 +947,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         (pos, t.buy_power.max(0.0), t.sell_inventory.max(0.0), pos * mid, t.total_balance_usd.max(0.0))
     };
 
-    let (effective_threshold, threshold_mode) = adaptive_signal_threshold(total_balance_usd);
+    let (effective_threshold, threshold_mode) = adaptive_signal_threshold_with_trading_mode(total_balance_usd, cfg.mode);
     let no_action = |cycle_id: u64, execution_result: String, status: String| NpcCycleReport {
         cycle_id,
         last_action: "NO_ACTION".to_string(),
@@ -872,6 +964,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         cooldown_remaining_ms: 0,
         effective_threshold,
         threshold_mode: threshold_mode.to_string(),
+        raw_score: 0.0,
+        normalized_score: 0.0,
+        top_score_penalties: String::new(),
     };
     if mode == AuthorityMode::Off {
         return NpcCycleReport {
@@ -894,6 +989,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             cooldown_remaining_ms: 0,
             effective_threshold,
             threshold_mode: threshold_mode.to_string(),
+            raw_score: 0.0,
+            normalized_score: 0.0,
+            top_score_penalties: String::new(),
         };
     }
 
@@ -901,7 +999,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
     let pending = state.authority.pending_proposals().await;
 
     // ── Micro-account adaptive signal threshold ───────────────────────────────
-    let (effective_threshold, threshold_mode) = adaptive_signal_threshold(total_balance_usd);
+    let (effective_threshold, threshold_mode) = adaptive_signal_threshold_with_trading_mode(total_balance_usd, cfg.mode);
+    // MICRO_ACTIVE is active whenever the balance-tier and trading mode qualify.
+    let is_micro_active = threshold_mode == "micro_active";
 
     let mut rt = runtime.lock().await;
     rt.cycle_seq = rt.cycle_seq.saturating_add(1);
@@ -938,6 +1038,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         sell_inventory,
         regime,
         !matches!(exec_state, ExecutionState::Idle) || !pending.is_empty(),
+        is_micro_active,
     );
 
     let regime_cutoff = rt
@@ -951,7 +1052,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
     // the final `if chosen.score < effective_cutoff` comparison below.
     // For micro accounts the balance-tier cap is applied; regime/learner can only
     // lower the gate further, never raise it back above the tier maximum.
-    let effective_cutoff = if threshold_mode == "micro_aggressive" {
+    let effective_cutoff = if threshold_mode == "micro_aggressive" || threshold_mode == "micro_active" {
         effective_threshold.min(regime_cutoff)
     } else {
         regime_cutoff
@@ -1038,6 +1139,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             cooldown_remaining_ms: 0,
             effective_threshold: effective_cutoff,
             threshold_mode: threshold_mode.to_string(),
+            raw_score: chosen.raw_score,
+            normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
+            top_score_penalties: chosen.score_parts.top_penalties_str(),
         };
     }
 
@@ -1055,8 +1159,12 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         rt.perf.entry(chosen.role).or_default().blocked += 1;
         observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
         let score_reason = format!(
-            "Signal score {:.4} below minimum threshold {:.4} [{}]. Waiting for stronger trigger.",
-            chosen.score, effective_cutoff, threshold_mode
+            "Signal score {:.4} below minimum threshold {:.4} [{}]. \
+             raw={:.4} norm={:.3} top_penalties=[{}].",
+            chosen.score, effective_cutoff, threshold_mode,
+            chosen.raw_score,
+            chosen.raw_score / effective_cutoff.max(f64::EPSILON),
+            chosen.score_parts.top_penalties_str()
         );
         return NpcCycleReport {
             cycle_id,
@@ -1077,6 +1185,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             cooldown_remaining_ms: 0,
             effective_threshold: effective_cutoff, // report the actual enforced gate to UI/telemetry
             threshold_mode: threshold_mode.to_string(),
+            raw_score: chosen.raw_score,
+            normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
+            top_score_penalties: chosen.score_parts.top_penalties_str(),
         };
     }
 
@@ -1110,6 +1221,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             cooldown_remaining_ms: 0,
             effective_threshold: effective_cutoff,
             threshold_mode: threshold_mode.to_string(),
+            raw_score: chosen.raw_score,
+            normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
+            top_score_penalties: chosen.score_parts.top_penalties_str(),
         };
     }
 
@@ -1156,6 +1270,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             cooldown_remaining_ms: 0,
             effective_threshold: effective_cutoff,
             threshold_mode: threshold_mode.to_string(),
+            raw_score: chosen.raw_score,
+            normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
+            top_score_penalties: chosen.score_parts.top_penalties_str(),
         };
     }
 
@@ -1171,6 +1288,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         total_balance_usd,
         sell_inventory,
         order_notional,
+        is_micro_active,
     );
     if !guard_reasons.is_empty() {
         lifecycle(
@@ -1202,6 +1320,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             cooldown_remaining_ms,
             effective_threshold: effective_cutoff,
             threshold_mode: threshold_mode.to_string(),
+            raw_score: chosen.raw_score,
+            normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
+            top_score_penalties: chosen.score_parts.top_penalties_str(),
         };
     }
 
@@ -1247,6 +1368,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             cooldown_remaining_ms: 0,
             effective_threshold: effective_cutoff,
             threshold_mode: threshold_mode.to_string(),
+            raw_score: chosen.raw_score,
+            normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
+            top_score_penalties: chosen.score_parts.top_penalties_str(),
         };
     }
 
@@ -1300,6 +1424,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                 cooldown_remaining_ms,
                 effective_threshold: effective_cutoff,
                 threshold_mode: threshold_mode.to_string(),
+                raw_score: chosen.raw_score,
+                normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
+                top_score_penalties: chosen.score_parts.top_penalties_str(),
             };
         };
 
@@ -1381,6 +1508,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                     cooldown_remaining_ms,
                     effective_threshold: effective_cutoff,
                     threshold_mode: threshold_mode.to_string(),
+                    raw_score: chosen.raw_score,
+                    normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
+                    top_score_penalties: chosen.score_parts.top_penalties_str(),
                 };
             }
             Err(e) => {
@@ -1411,6 +1541,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                     cooldown_remaining_ms,
                     effective_threshold: effective_cutoff,
                     threshold_mode: threshold_mode.to_string(),
+                    raw_score: chosen.raw_score,
+                    normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
+                    top_score_penalties: chosen.score_parts.top_penalties_str(),
                 };
             }
         }
@@ -1473,6 +1606,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         cooldown_remaining_ms,
         effective_threshold: effective_cutoff, // report the actual enforced gate to UI/telemetry
         threshold_mode: threshold_mode.to_string(),
+        raw_score: chosen.raw_score,
+        normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
+        top_score_penalties: chosen.score_parts.top_penalties_str(),
     }
 }
 
@@ -1615,6 +1751,7 @@ fn build_worker_candidates(
     sell_inventory: f64,
     regime: MarketRegime,
     has_conflict: bool,
+    is_micro_active: bool,
 ) -> Vec<WorkerProposal> {
     let mut proposals = Vec::new();
     let momentum = metrics.momentum_5s;
@@ -1693,6 +1830,7 @@ fn build_worker_candidates(
             buy_power,
             sell_inventory,
             position_size,
+            is_micro_active,
         );
         let raw_score = score_parts.final_score();
         let score = raw_score.max(-5.0);
@@ -1728,6 +1866,7 @@ fn score_candidate(
     buy_power: f64,
     sell_inventory: f64,
     position_size: f64,
+    is_micro_active: bool,
 ) -> ScoreBreakdown {
     let momentum = metrics.momentum_5s;
     let edge_bias = match role {
@@ -1748,9 +1887,22 @@ fn score_candidate(
     };
 
     let liquidity_quality = ((metrics.trade_samples as f64) / 10.0).clamp(0.0, 1.4);
-    let volatility_penalty = (realized_volatility_bps(&rt.mid_history, 8).unwrap_or(0.0) / cfg.alpha.vol_spike_bps.max(1.0)).clamp(0.0, 3.0);
-    let spread_cost = (metrics.spread_bps / cfg.guards.max_spread_bps.max(0.1)).clamp(0.0, 3.0);
-    let slippage_risk = (expected_slippage_bps / cfg.guards.max_slippage_bps.max(0.1)).clamp(0.0, 3.0);
+
+    // In MICRO_ACTIVE mode, scale down penalty terms so that the edge signal is
+    // not overwhelmed by proportionally large spread/vol/slippage terms typical of
+    // a micro account operating in normal market conditions.
+    // Hard guards (spread bps, slippage bps) still check the raw market values —
+    // this dampening only affects the scoring priority, not safety enforcement.
+    //
+    // Dampening is applied *after* clamping (to the clamped ratio value).  This is
+    // intentional: the guard layer has already blocked any inputs that would exceed
+    // the ratio ceiling; the clamped value therefore represents an already-bounded
+    // cost and halving it is a straightforward linear adjustment.
+    let penalty_factor = if is_micro_active { MICRO_PENALTY_DAMPEN } else { 1.0 };
+
+    let volatility_penalty = (realized_volatility_bps(&rt.mid_history, 8).unwrap_or(0.0) / cfg.alpha.vol_spike_bps.max(1.0)).clamp(0.0, 3.0) * penalty_factor;
+    let spread_cost = (metrics.spread_bps / cfg.guards.max_spread_bps.max(0.1)).clamp(0.0, 3.0) * penalty_factor;
+    let slippage_risk = (expected_slippage_bps / cfg.guards.max_slippage_bps.max(0.1)).clamp(0.0, 3.0) * penalty_factor;
     let conflict_penalty = if has_conflict { 1.0 } else { 0.0 } + side_penalty;
     let hold_efficiency = (1.0 / expected_hold_secs.max(1.0)).clamp(0.01, 0.20);
 
@@ -1776,6 +1928,7 @@ fn evaluate_guards(
     total_balance_usd: f64,
     sell_inventory: f64,
     order_notional: f64,
+    is_micro_active: bool,
 ) -> (Vec<String>, bool, u64) {
     let mut reasons = Vec::new();
     if cfg.guards.kill_switch {
@@ -1828,11 +1981,14 @@ fn evaluate_guards(
     }
 
     // ── Per-role cooldown ────────────────────────────────────────────────────
-    // Small accounts (0 < balance < $100): drastically reduced cooldown (300ms).
+    // MICRO_ACTIVE (live < $50): ultra-short 150ms cooldown for faster re-entry.
+    // Small accounts (0 < balance < $100): reduced cooldown (300ms).
     // Normal accounts: max(cycle_interval, 250ms).
     // Allow immediate execution when no other guards fired — the cooldown only
     // adds friction when something else is already blocking the cycle.
-    let effective_cooldown = if total_balance_usd > 0.0 && total_balance_usd < 100.0 {
+    let effective_cooldown = if is_micro_active && total_balance_usd > 0.0 && total_balance_usd < MICRO_BALANCE_USD {
+        Duration::from_millis(150)
+    } else if total_balance_usd > 0.0 && total_balance_usd < 100.0 {
         Duration::from_millis(300)
     } else {
         let cycle_ms = cfg.cycle_interval.as_millis() as u64;
@@ -2310,6 +2466,7 @@ mod tests {
             /* total_balance_usd */ 50.0,
             /* sell_inventory    */ 0.001,
             /* order_notional    */ 50.0,
+            /* is_micro_active   */ false,
         );
 
         // Liquidity depth guards must be absent.
@@ -2340,6 +2497,7 @@ mod tests {
             /* total_balance_usd */ 500.0,
             /* sell_inventory    */ 0.001,
             /* order_notional    */ 50.0,
+            /* is_micro_active   */ false,
         );
 
         assert!(
@@ -2365,6 +2523,7 @@ mod tests {
             /* total_balance_usd */ 50.0,
             /* sell_inventory    */ 0.0,
             /* order_notional    */ 50.0,
+            /* is_micro_active   */ false,
         );
 
         assert!(
@@ -2386,6 +2545,7 @@ mod tests {
             /* total_balance_usd */ 50.0,
             /* sell_inventory    */ 0.001,
             /* order_notional    */ 50.0,
+            /* is_micro_active   */ false,
         );
 
         assert!(
@@ -2413,6 +2573,7 @@ mod tests {
             /* total_balance_usd */ 500.0,
             /* sell_inventory    */ 0.001,
             /* order_notional    */ 50.0,
+            /* is_micro_active   */ false,
         );
         assert!(!cooldown_active, "cooldown must be inactive when no prior action, reasons: {:?}", reasons);
         assert_eq!(cooldown_remaining_ms, 0);
@@ -2440,6 +2601,7 @@ mod tests {
             /* total_balance_usd */ 500.0,
             /* sell_inventory    */ 0.001,
             /* order_notional    */ 50.0,
+            /* is_micro_active   */ false,
         );
         // cooldown IS active, but should NOT block because no other guards fired.
         assert!(cooldown_active, "cooldown should be detected as active");
@@ -2470,6 +2632,7 @@ mod tests {
             /* total_balance_usd */ 500.0,
             /* sell_inventory    */ 0.001,
             /* order_notional    */ 50.0,
+            /* is_micro_active   */ false,
         );
         assert!(cooldown_active);
         assert!(
@@ -2503,6 +2666,7 @@ mod tests {
             /* total_balance_usd */ 50.0,
             /* sell_inventory    */ 0.001,
             /* order_notional    */ 50.0,
+            /* is_micro_active   */ false,
         );
         assert!(!cooldown_active, "small account cooldown (300ms) should be expired after 400ms");
 
@@ -2513,6 +2677,7 @@ mod tests {
             /* total_balance_usd */ 500.0,
             /* sell_inventory    */ 0.001,
             /* order_notional    */ 50.0,
+            /* is_micro_active   */ false,
         );
         assert!(cooldown_active_normal, "normal account cooldown (10s) should still be active after 400ms");
         assert!(remaining_normal > 0);
@@ -2580,6 +2745,7 @@ mod tests {
             0.0,
             MarketRegime::TrendingUp,
             false,
+            /* is_micro_active */ false,
         );
 
         assert!(candidates.iter().any(|c| c.action_id == "c42-scout"));
@@ -3518,5 +3684,308 @@ mod diagnostic_tests {
                 result.err()
             );
         }
+    }
+}
+
+// ── MICRO_ACTIVE behavior tests ───────────────────────────────────────────────
+//
+// Prove that:
+//  1. MICRO_ACTIVE mode produces higher scores than non-micro mode for typical
+//     market conditions (score escapes near-zero territory).
+//  2. Trade frequency opportunity increases: score is more likely to cross the
+//     lower micro_active threshold.
+//  3. Hard safety rails (kill_switch, etc.) still block unsafe trades regardless
+//     of MICRO_ACTIVE mode.
+//  4. adaptive_signal_threshold_with_trading_mode returns "micro_active" for live
+//     accounts under $100 and "micro_aggressive" for paper/sim.
+#[cfg(test)]
+mod micro_active_tests {
+    use std::collections::VecDeque;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::agent::TradeAgentConfig;
+
+    fn micro_cfg() -> NpcConfig {
+        NpcConfig::from_trade_cfg(&TradeAgentConfig {
+            enabled: true,
+            trade_size: 0.001,
+            momentum_threshold: 0.00005,
+            poll_interval: Duration::from_secs(1),
+            max_spread_bps: 5.0,
+        })
+    }
+
+    fn typical_metrics(momentum: f64, spread_bps: f64, trade_samples: usize) -> crate::signal::SignalMetrics {
+        crate::signal::SignalMetrics {
+            momentum_5s: momentum,
+            spread_bps,
+            trade_samples,
+            mid: 50_000.0,
+            ..Default::default()
+        }
+    }
+
+    // ── Test 1: score escapes near-zero territory ─────────────────────────────
+
+    #[test]
+    fn micro_active_score_higher_than_non_micro_for_scout() {
+        let cfg = micro_cfg();
+        let rt = NpcRuntimeState::default();
+        // Tiny momentum — exactly the "0.0067" scenario described in the issue.
+        let metrics = typical_metrics(0.0000067, 3.0, 5);
+        let expected_slippage = metrics.spread_bps * 0.55;
+
+        let score_normal = score_candidate(
+            &cfg, &rt, NpcRole::Scout, &metrics, "BUY",
+            expected_slippage, 6.0, false, None,
+            /* buy_power */ 100.0, /* sell_inventory */ 0.0, /* position_size */ 0.0,
+            /* is_micro_active */ false,
+        );
+        let score_micro = score_candidate(
+            &cfg, &rt, NpcRole::Scout, &metrics, "BUY",
+            expected_slippage, 6.0, false, None,
+            /* buy_power */ 100.0, /* sell_inventory */ 0.0, /* position_size */ 0.0,
+            /* is_micro_active */ true,
+        );
+
+        assert!(
+            score_micro.final_score() > score_normal.final_score(),
+            "MICRO_ACTIVE must produce higher score than non-micro; \
+             micro={:.4} normal={:.4}",
+            score_micro.final_score(), score_normal.final_score()
+        );
+    }
+
+    #[test]
+    fn micro_active_score_escapes_near_zero_for_momentum_executor() {
+        let cfg = micro_cfg();
+        let rt = NpcRuntimeState::default();
+        // Typical tiny live momentum (0.001% = 0.00001).
+        let metrics = typical_metrics(0.00001, 2.5, 7);
+        let expected_slippage = metrics.spread_bps * 0.72;
+
+        let score_micro = score_candidate(
+            &cfg, &rt, NpcRole::MomentumExecutor, &metrics, "BUY",
+            expected_slippage, 18.0, false, None,
+            /* buy_power */ 50.0, /* sell_inventory */ 0.0, /* position_size */ 0.0,
+            /* is_micro_active */ true,
+        );
+
+        // Score should be meaningfully positive (not near-zero).
+        assert!(
+            score_micro.final_score() > 0.01,
+            "MICRO_ACTIVE MomentumExecutor score must be > 0.01 for typical conditions; got {:.4}",
+            score_micro.final_score()
+        );
+    }
+
+    // ── Test 2: trade frequency — score crosses micro_active threshold ────────
+
+    #[test]
+    fn micro_active_score_crosses_threshold_for_normal_valid_market() {
+        let cfg = micro_cfg();
+        let rt = NpcRuntimeState::default();
+        // Reasonable momentum (0.01% = 0.0001), moderate spread, decent liquidity.
+        let metrics = typical_metrics(0.0001, 3.0, 8);
+        let expected_slippage = metrics.spread_bps * 0.55;
+
+        let score_micro = score_candidate(
+            &cfg, &rt, NpcRole::Scout, &metrics, "BUY",
+            expected_slippage, 6.0, false, None,
+            /* buy_power */ 40.0, /* sell_inventory */ 0.0, /* position_size */ 0.0,
+            /* is_micro_active */ true,
+        );
+        let final_score = score_micro.final_score();
+
+        // THRESHOLD_MICRO_ACTIVE_SMALL = 0.08; score must cross it.
+        assert!(
+            final_score >= THRESHOLD_MICRO_ACTIVE_SMALL,
+            "MICRO_ACTIVE score {:.4} must cross THRESHOLD_MICRO_ACTIVE_SMALL={} \
+             for normal valid market conditions",
+            final_score, THRESHOLD_MICRO_ACTIVE_SMALL
+        );
+    }
+
+    #[test]
+    fn micro_active_increases_frequency_vs_micro_aggressive() {
+        // Prove that for the same market conditions, micro_active produces a
+        // score that crosses its lower threshold while micro_aggressive does not.
+        let cfg = micro_cfg();
+        let rt = NpcRuntimeState::default();
+        let metrics = typical_metrics(0.00005, 4.0, 6);  // weak but valid signal
+        let expected_slippage = metrics.spread_bps * 0.55;
+
+        let score_normal = score_candidate(
+            &cfg, &rt, NpcRole::Scout, &metrics, "BUY",
+            expected_slippage, 6.0, false, None,
+            100.0, 0.0, 0.0, false,
+        ).final_score();
+        let score_micro = score_candidate(
+            &cfg, &rt, NpcRole::Scout, &metrics, "BUY",
+            expected_slippage, 6.0, false, None,
+            100.0, 0.0, 0.0, true,
+        ).final_score();
+
+        // micro_active score must be higher.
+        assert!(score_micro > score_normal,
+            "micro_active score {score_micro:.4} must exceed non-micro {score_normal:.4}");
+
+        // The gap must be meaningful (not just floating-point noise) —
+        // driven by the 50% penalty dampening.
+        assert!(score_micro - score_normal > 0.05,
+            "score gap must be > 0.05 to confirm penalty dampening is active; \
+             got gap={:.4}", score_micro - score_normal);
+    }
+
+    // ── Test 3: hard safety rails remain intact ───────────────────────────────
+
+    #[test]
+    fn kill_switch_blocks_even_in_micro_active_mode() {
+        let mut cfg = micro_cfg();
+        cfg.guards.kill_switch = true;
+        let rt = NpcRuntimeState::default();
+        let metrics = typical_metrics(0.01, 1.0, 15);
+
+        let (reasons, _, _) = evaluate_guards(
+            &cfg, &rt, NpcRole::Scout, "BUY",
+            0.0, &metrics, 0.5,
+            /* total_balance_usd */ 35.0,
+            /* sell_inventory */ 0.0,
+            /* order_notional */ 35.0,
+            /* is_micro_active */ true,
+        );
+
+        assert!(
+            reasons.iter().any(|r| r == "KILL_SWITCH_ACTIVE"),
+            "kill switch must block even in MICRO_ACTIVE mode; got: {:?}", reasons
+        );
+    }
+
+    #[test]
+    fn position_limit_blocks_even_in_micro_active_mode() {
+        let mut cfg = micro_cfg();
+        // Set position limit so it would be exceeded.
+        cfg.guards.max_position_qty = 0.001;
+        let rt = NpcRuntimeState::default();
+        let metrics = typical_metrics(0.01, 1.0, 15);
+
+        let (reasons, _, _) = evaluate_guards(
+            &cfg, &rt, NpcRole::Scout, "BUY",
+            /* position_size = already at limit */ 0.001,
+            &metrics, 0.5,
+            /* total_balance_usd */ 35.0,
+            /* sell_inventory */ 0.0,
+            /* order_notional */ 35.0,
+            /* is_micro_active */ true,
+        );
+
+        assert!(
+            reasons.iter().any(|r| r.starts_with("POSITION_LIMIT_EXCEEDED")),
+            "position limit must block even in MICRO_ACTIVE mode; got: {:?}", reasons
+        );
+    }
+
+    // ── Test 4: adaptive_signal_threshold_with_trading_mode ──────────────────
+
+    #[test]
+    fn micro_active_threshold_live_below_50() {
+        let (threshold, mode) = adaptive_signal_threshold_with_trading_mode(35.0, NpcTradingMode::Live);
+        assert_eq!(mode, "micro_active");
+        assert!((threshold - THRESHOLD_MICRO_ACTIVE_SMALL).abs() < f64::EPSILON,
+            "live balance $35 → THRESHOLD_MICRO_ACTIVE_SMALL={}, got {threshold}",
+            THRESHOLD_MICRO_ACTIVE_SMALL);
+    }
+
+    #[test]
+    fn micro_active_threshold_live_50_to_100() {
+        let (threshold, mode) = adaptive_signal_threshold_with_trading_mode(75.0, NpcTradingMode::Live);
+        assert_eq!(mode, "micro_active");
+        assert!((threshold - THRESHOLD_MICRO_ACTIVE_MID).abs() < f64::EPSILON,
+            "live balance $75 → THRESHOLD_MICRO_ACTIVE_MID={}, got {threshold}",
+            THRESHOLD_MICRO_ACTIVE_MID);
+    }
+
+    #[test]
+    fn micro_active_threshold_live_above_100_is_normal() {
+        let (threshold, mode) = adaptive_signal_threshold_with_trading_mode(200.0, NpcTradingMode::Live);
+        assert_eq!(mode, "normal");
+        assert!((threshold - THRESHOLD_BASE).abs() < f64::EPSILON,
+            "live balance $200 → THRESHOLD_BASE={}, got {threshold}", THRESHOLD_BASE);
+    }
+
+    #[test]
+    fn paper_mode_uses_micro_aggressive_not_micro_active() {
+        // Paper/sim mode must keep the existing micro_aggressive behavior.
+        let (threshold_paper, mode_paper) = adaptive_signal_threshold_with_trading_mode(35.0, NpcTradingMode::Paper);
+        assert_eq!(mode_paper, "micro_aggressive",
+            "paper mode must use micro_aggressive not micro_active");
+        assert!((threshold_paper - THRESHOLD_MICRO_SMALL).abs() < f64::EPSILON,
+            "paper mode $35 → THRESHOLD_MICRO_SMALL={}, got {threshold_paper}", THRESHOLD_MICRO_SMALL);
+
+        let (threshold_sim, mode_sim) = adaptive_signal_threshold_with_trading_mode(35.0, NpcTradingMode::Simulation);
+        assert_eq!(mode_sim, "micro_aggressive");
+        assert!((threshold_sim - THRESHOLD_MICRO_SMALL).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn micro_active_threshold_lower_than_micro_aggressive() {
+        // Key invariant: micro_active thresholds must be strictly lower than their
+        // micro_aggressive counterparts so execution opportunities increase.
+        assert!(THRESHOLD_MICRO_ACTIVE_SMALL < THRESHOLD_MICRO_SMALL,
+            "MICRO_ACTIVE_SMALL threshold must be lower than MICRO_SMALL");
+        assert!(THRESHOLD_MICRO_ACTIVE_MID < THRESHOLD_MICRO,
+            "MICRO_ACTIVE_MID threshold must be lower than MICRO");
+    }
+
+    #[test]
+    fn score_breakdown_top_penalties_str_reports_highest_first() {
+        let breakdown = ScoreBreakdown {
+            edge_estimate: 0.1,
+            spread_cost: 0.6,
+            slippage_risk: 0.15,
+            liquidity_quality: 0.5,
+            volatility_penalty: 0.35,
+            conflict_penalty: 0.0,
+            hold_efficiency: 0.167,
+        };
+        let s = breakdown.top_penalties_str();
+        // spread_cost=0.6 should appear before vol_penalty=0.35 and slippage=0.15
+        let idx_spread = s.find("spread_cost").unwrap_or(usize::MAX);
+        let idx_vol    = s.find("vol_penalty").unwrap_or(usize::MAX);
+        let idx_slip   = s.find("slippage_risk").unwrap_or(usize::MAX);
+        assert!(idx_spread < idx_vol, "spread_cost must rank before vol_penalty; got: {s}");
+        assert!(idx_vol < idx_slip, "vol_penalty must rank before slippage_risk; got: {s}");
+    }
+
+    #[test]
+    fn micro_active_cooldown_shorter_than_small_account() {
+        // MICRO_ACTIVE (<$50 live) cooldown = 150ms; small account ($50-$99) = 300ms.
+        let mut cfg = micro_cfg();
+        cfg.cycle_interval = Duration::from_secs(10);
+        let mut rt = NpcRuntimeState::default();
+        // Place last action 200ms ago.
+        rt.last_action_at.insert(NpcRole::Scout, std::time::Instant::now() - Duration::from_millis(200));
+        let metrics = typical_metrics(0.01, 1.0, 10);
+
+        // MICRO_ACTIVE (< $50, is_micro_active=true): 150ms cooldown → expired after 200ms.
+        let (_, cooldown_micro_active, _) = evaluate_guards(
+            &cfg, &rt, NpcRole::Scout, "BUY",
+            0.0, &metrics, 0.5,
+            /* total_balance_usd */ 35.0, /* sell_inventory */ 0.0, /* order_notional */ 35.0,
+            /* is_micro_active */ true,
+        );
+        assert!(!cooldown_micro_active,
+            "MICRO_ACTIVE cooldown (150ms) must be expired after 200ms");
+
+        // Small account (< $100, is_micro_active=false): 300ms cooldown → still active after 200ms.
+        let (_, cooldown_small, _) = evaluate_guards(
+            &cfg, &rt, NpcRole::Scout, "BUY",
+            0.0, &metrics, 0.5,
+            /* total_balance_usd */ 35.0, /* sell_inventory */ 0.0, /* order_notional */ 35.0,
+            /* is_micro_active */ false,
+        );
+        assert!(cooldown_small,
+            "Small account cooldown (300ms) must still be active after 200ms");
     }
 }

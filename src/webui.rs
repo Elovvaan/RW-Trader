@@ -1297,7 +1297,14 @@ async fn page_events(state: &AppState, query: &str) -> String {
         } else {
             "inactive".to_string()
         };
-        let micro_mode_badge = if npc_loop.threshold_mode == "micro_aggressive" {
+        let micro_mode_badge = if npc_loop.threshold_mode == "micro_active" {
+            format!(
+                "<div style='grid-column:1/-1;padding:4px 8px;background:rgba(34,197,94,.12);\
+                 border:1px solid rgba(34,197,94,.4);border-radius:8px;color:#22c55e;font-weight:700'>\
+                 ⚡ MICRO_ACTIVE (live) — threshold {:.2}, penalty dampening ON</div>",
+                npc_loop.effective_threshold
+            )
+        } else if npc_loop.threshold_mode == "micro_aggressive" {
             format!(
                 "<div style='grid-column:1/-1;padding:4px 8px;background:rgba(240,185,11,.12);\
                  border:1px solid rgba(240,185,11,.4);border-radius:8px;color:#f0b90b;font-weight:700'>\
@@ -1310,12 +1317,30 @@ async fn page_events(state: &AppState, query: &str) -> String {
                 npc_loop.effective_threshold, esc(&npc_loop.threshold_mode)
             )
         };
+        let score_telemetry = {
+            let raw = npc_loop.raw_score;
+            let norm = npc_loop.normalized_score;
+            let top = esc(&npc_loop.top_score_penalties);
+            let norm_pct = (norm * 100.0).round() as i64;
+            let bar_color = if norm >= 1.0 { "#22c55e" } else if norm >= 0.5 { "#f0b90b" } else { "#ef4444" };
+            format!(
+                "<div style='grid-column:1/-1;margin-top:4px;padding:4px 8px;border:1px solid rgba(130,144,159,.2);border-radius:6px;background:rgba(0,0,0,.15)'>\
+                 <span class='dim' style='font-size:10px'>Score: </span>\
+                 <span style='color:#e2e8f0'>raw={:.4}</span>\
+                 <span class='dim'> | </span>\
+                 <span style='color:{bar_color}'>norm={:.3} ({norm_pct}%)</span>\
+                 <span class='dim'> | threshold={:.3}</span>\
+                 <br><span class='dim' style='font-size:10px'>Top penalties: </span><span style='color:#94a3b8'>{top}</span></div>",
+                raw, norm, npc_loop.effective_threshold
+            )
+        };
         format!(
             "<div style='display:grid;grid-template-columns:repeat(2,1fr);gap:6px;margin-top:6px;font-size:11px'>\
                <div><span class='dim'>Final decision: </span>{final_dec}</div>\
                <div><span class='dim'>Drawdown: </span>{dd_info}</div>\
                <div><span class='dim'>Cooldown: </span>{cooldown_info}</div>\
                {micro_mode_badge}\
+               {score_telemetry}\
                <div style='grid-column:1/-1'><span class='dim'>Balance block: </span>{}</div>\
                <div style='grid-column:1/-1'><span class='dim'>Risk block: </span>{}</div>\
                <div style='grid-column:1/-1'><span class='dim'>Execution block: </span>{}</div>\
