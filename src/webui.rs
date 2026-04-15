@@ -2256,6 +2256,7 @@ async fn page_assistant(state: &AppState, query: &str) -> String {
         ("MICRO_TEST",   "Micro-Test — faster decisions for small balances"),
         ("MICRO_ACTIVE", "⚡ Micro Active — high-frequency mode for balances under $100"),
         ("FLIP_HYPER",   "🔄 Flip Hyper — rapid capital-rotation mode for sub-$100 live accounts"),
+        ("SWING",        "📈 Swing — directional trend mode (minutes to hours)"),
     ]
     .iter()
     .map(|(val, label)| {

@@ -39,6 +39,11 @@ pub enum RuntimeProfile {
     /// rails (kill switch, exchange filters, valid sizing, spread/slippage guards,
     /// authority mode, reconcile truth) remain fully active.
     FlipHyper,
+    /// Directional swing mode for larger moves (minutes→hours).
+    ///
+    /// Disables micro-rotation behavior and focuses on trend-aligned pullback
+    /// entries with momentum-resume confirmation.
+    Swing,
 }
 
 impl RuntimeProfile {
@@ -50,6 +55,7 @@ impl RuntimeProfile {
             "MICRO_TEST" | "MICROTEST"     => Self::MicroTest,
             "MICRO_ACTIVE" | "MICROACTIVE" => Self::MicroActive,
             "FLIP_HYPER" | "FLIPHYPER"     => Self::FlipHyper,
+            "SWING" | "SWING_TRADER"       => Self::Swing,
             _              => Self::default(),
         }
     }
@@ -61,6 +67,7 @@ impl RuntimeProfile {
             Self::MicroTest    => "MICRO_TEST",
             Self::MicroActive  => "MICRO_ACTIVE",
             Self::FlipHyper    => "FLIP_HYPER",
+            Self::Swing        => "SWING",
         }
     }
 
@@ -72,6 +79,7 @@ impl RuntimeProfile {
             Self::MicroTest    => "Micro-Test — faster decisions for small balances",
             Self::MicroActive  => "⚡ Micro Active — high-frequency mode for balances under $100",
             Self::FlipHyper    => "🔄 Flip Hyper — rapid capital-rotation mode for sub-$100 live accounts",
+            Self::Swing        => "📈 Swing — directional trend mode (minutes to hours)",
         }
     }
 
@@ -283,6 +291,27 @@ impl ProfileConfig {
                 strategy_no_trade_lowering_after_secs:   Some(10),
                 strategy_min_abs_imbalance_1s:           Some(0.01),
             },
+            RuntimeProfile::Swing => Self {
+                signal_min_confidence:       0.78,
+                // Swing cooldown is owned by SWING runtime logic in npc.rs (30–120s
+                // adaptive); keep risk cooldown conservative but not micro-fast.
+                entry_cooldown_after_exit:   Duration::from_secs(60),
+                failed_breakout_cooldown:    Duration::from_secs(45),
+                cycle_interval:              Duration::from_millis(1_000),
+                // Keep default Phase1 behavior; SWING gates are implemented in npc.rs.
+                phase1_trigger_window_secs:      None,
+                phase1_min_trend_drift:          None,
+                phase1_min_samples:              None,
+                phase1_breakout_min_momentum_1s: None,
+                phase1_breakout_min_imbalance:   None,
+                signal_momentum_threshold:       None,
+                signal_imbalance_threshold:      None,
+                // Avoid micro hold cycling in swing mode.
+                signal_max_hold_secs:            Some(14_400),
+                strategy_base_confidence_threshold:      None,
+                strategy_no_trade_lowering_after_secs:   None,
+                strategy_min_abs_imbalance_1s:           None,
+            },
         }
     }
 }
@@ -303,6 +332,8 @@ mod tests {
             ("MICROTEST",     RuntimeProfile::MicroTest),
             ("MICRO_ACTIVE",  RuntimeProfile::MicroActive),
             ("MICROACTIVE",   RuntimeProfile::MicroActive),
+            ("SWING",         RuntimeProfile::Swing),
+            ("SWING_TRADER",  RuntimeProfile::Swing),
             ("unknown",       RuntimeProfile::Conservative), // falls back to default
         ] {
             assert_eq!(RuntimeProfile::from_str(input), expected, "input={input}");
@@ -347,6 +378,7 @@ mod tests {
         assert_eq!(RuntimeProfile::MicroTest.to_string(), "MICRO_TEST");
         assert_eq!(RuntimeProfile::Conservative.to_string(), "CONSERVATIVE");
         assert_eq!(RuntimeProfile::MicroActive.to_string(), "MICRO_ACTIVE");
+        assert_eq!(RuntimeProfile::Swing.to_string(), "SWING");
     }
 
     #[test]
@@ -559,5 +591,12 @@ mod tests {
         assert!(fh.strategy_min_abs_imbalance_1s.unwrap()
             < ma.strategy_min_abs_imbalance_1s.unwrap());
     }
-}
 
+    #[test]
+    fn test_swing_profile_config() {
+        let cfg = ProfileConfig::for_profile(RuntimeProfile::Swing);
+        assert!(cfg.signal_min_confidence >= 0.70);
+        assert!(cfg.entry_cooldown_after_exit.as_secs() >= 30);
+        assert_eq!(cfg.signal_max_hold_secs, Some(14_400));
+    }
+}
