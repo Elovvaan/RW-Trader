@@ -1500,18 +1500,198 @@ async fn page_events(state: &AppState, query: &str) -> String {
             balances_rows
         )
     };
-    let event_feed = events.iter().take(10).map(|e| format!(
-        "<div class='event-item'><div class='time'>{} · {}</div><div class='summary'>{}</div>\
-         <details style='margin-top:6px'><summary class='dim'>Details</summary><div class='dim' style='margin-top:4px'>type={} · event_id={}</div></details></div>",
-        e.occurred_at.format("%H:%M:%S"),
-        esc(e.symbol.as_deref().unwrap_or("SYSTEM")),
-        esc(&summarise_event(e)),
-        esc(&e.event_type),
-        esc(&e.event_id),
-    )).collect::<Vec<_>>().join("");
+
+    // ── LAST TRADE panel ─────────────────────────────────────────────────────
+    // Find the most recent fill from ReconcileApplied (with fills) or OrderFilled events.
+    let last_fill_panel = {
+        #[derive(Clone)]
+        struct FillInfo { side: String, qty: f64, price: f64, age_secs: f64 }
+        let now_utc = chrono::Utc::now();
+        let fill_info: Option<FillInfo> = events.iter().find_map(|e| {
+            match &e.payload {
+                crate::events::TradingEvent::ReconcileApplied(p) if !p.fills.is_empty() => {
+                    let f = &p.fills[0];
+                    let age_secs = (now_utc - e.occurred_at).num_milliseconds().max(0) as f64 / 1000.0;
+                    Some(FillInfo { side: f.side.clone(), qty: f.qty, price: f.price, age_secs })
+                }
+                crate::events::TradingEvent::OrderFilled(p) => {
+                    let age_secs = (now_utc - e.occurred_at).num_milliseconds().max(0) as f64 / 1000.0;
+                    Some(FillInfo { side: p.side.clone(), qty: p.filled_qty, price: p.avg_fill_price, age_secs })
+                }
+                _ => None,
+            }
+        });
+        match fill_info {
+            Some(fi) => {
+                let is_buy = fi.side.eq_ignore_ascii_case("BUY");
+                // Live PnL: unrealized gain/loss from fill price to current mid.
+                let live_pnl = if latest_mid > 0.0 && fi.qty > 0.0 {
+                    if is_buy { fi.qty * (latest_mid - fi.price) }
+                    else      { fi.qty * (fi.price - latest_mid) }
+                } else { 0.0 };
+                let pnl_class  = if live_pnl >= 0.0 { "#22C55E" } else { "#ef4444" };
+                let side_color = if is_buy { "#22C55E" } else { "#ef4444" };
+                let side_bg    = if is_buy { "rgba(34,197,94,.12)" } else { "rgba(239,68,68,.12)" };
+                let side_border = if is_buy { "rgba(34,197,94,.40)" } else { "rgba(239,68,68,.40)" };
+                // Flash CSS animation when fill happened within the last 10 seconds.
+                let flash_style = if fi.age_secs < 10.0 {
+                    format!(
+                        "animation:last-trade-flash 1s ease-out;background:{side_bg};\
+                         border:1px solid {side_border};border-radius:10px;padding:10px 12px;margin-bottom:10px"
+                    )
+                } else {
+                    format!(
+                        "background:{side_bg};border:1px solid {side_border};\
+                         border-radius:10px;padding:10px 12px;margin-bottom:10px"
+                    )
+                };
+                // Fill details: show all fills if ReconcileApplied
+                let fill_details_html = {
+                    let fills: Vec<String> = events.iter().find_map(|e| {
+                        if let crate::events::TradingEvent::ReconcileApplied(p) = &e.payload {
+                            if !p.fills.is_empty() {
+                                return Some(p.fills.iter().map(|f| {
+                                    let c = if f.side.eq_ignore_ascii_case("BUY") { "#22C55E" } else { "#ef4444" };
+                                    format!(
+                                        "<div style='font-size:10px;color:#94a3b8'>\
+                                         <span style='color:{c};font-weight:700'>{}</span> \
+                                         {:.6} @ {:.2} \
+                                         <span class='dim'>notional {:.2}</span></div>",
+                                        esc(&f.side), f.qty, f.price, f.qty * f.price
+                                    )
+                                }).collect());
+                            }
+                        }
+                        None
+                    }).unwrap_or_default();
+                    fills.join("")
+                };
+                format!(
+                    "<style>@keyframes last-trade-flash{{\
+                       0%{{box-shadow:0 0 0 0 {side_border}}}\
+                       50%{{box-shadow:0 0 16px 4px {side_border}}}\
+                       100%{{box-shadow:0 0 0 0 transparent}}}}</style>\
+                     <div style='{flash_style}'>\
+                       <div style='display:flex;align-items:center;justify-content:space-between'>\
+                         <div class='label' style='color:#94a3b8'>LAST TRADE</div>\
+                         <div style='font-size:10px;color:#64748b'>{:.0}s ago</div>\
+                       </div>\
+                       <div style='display:grid;grid-template-columns:repeat(2,1fr);gap:6px;margin-top:8px;font-size:12px'>\
+                         <div><span class='dim'>Side: </span>\
+                           <strong style='color:{side_color}'>{}</strong></div>\
+                         <div><span class='dim'>Qty: </span>{:.6}</div>\
+                         <div><span class='dim'>Price: </span>{:.2}</div>\
+                         <div><span class='dim'>Live PnL: </span>\
+                           <strong style='color:{pnl_class}'>{:+.4}</strong></div>\
+                       </div>\
+                       {fill_details_html}\
+                     </div>",
+                    fi.age_secs,
+                    esc(&fi.side.to_uppercase()),
+                    fi.qty,
+                    fi.price,
+                    live_pnl,
+                )
+            }
+            None => String::new(),
+        }
+    };
+
+    // ── Enhanced event feed ──────────────────────────────────────────────────
+    // ReconcileApplied, BalanceUpdated and fill events are highlighted.
+    let event_feed = events.iter().take(10).map(|e| {
+        let (item_style, type_badge) = match &e.payload {
+            crate::events::TradingEvent::ReconcileApplied(p) if p.fills_count > 0 => (
+                "border-left:3px solid #22C55E;padding-left:8px",
+                format!("<span style='color:#22C55E;font-weight:700;font-size:10px'>FILL ×{}</span>", p.fills_count),
+            ),
+            crate::events::TradingEvent::ReconcileApplied(_) => (
+                "border-left:3px solid #52ffa8;padding-left:8px",
+                "<span style='color:#52ffa8;font-size:10px'>RECONCILE</span>".to_string(),
+            ),
+            crate::events::TradingEvent::BalanceUpdated(_) => (
+                "border-left:3px solid #f0b90b;padding-left:8px",
+                "<span style='color:#f0b90b;font-size:10px'>BALANCE</span>".to_string(),
+            ),
+            crate::events::TradingEvent::OrderFilled(_) => (
+                "border-left:3px solid #22C55E;padding-left:8px",
+                "<span style='color:#22C55E;font-weight:700;font-size:10px'>FILL</span>".to_string(),
+            ),
+            crate::events::TradingEvent::OrderSubmitted(_) | crate::events::TradingEvent::OrderAcked(_) => (
+                "border-left:3px solid #3b82f6;padding-left:8px",
+                "<span style='color:#3b82f6;font-size:10px'>ORDER</span>".to_string(),
+            ),
+            _ => (
+                "",
+                format!("<span style='font-size:10px;color:#64748b'>{}</span>", esc(&e.event_type)),
+            ),
+        };
+        format!(
+            "<div class='event-item' style='{item_style}'>\
+             <div class='time'>{} · {} {type_badge}</div>\
+             <div class='summary'>{}</div>\
+             <details style='margin-top:6px'><summary class='dim'>Details</summary>\
+             <div class='dim' style='margin-top:4px'>event_id={}</div></details></div>",
+            e.occurred_at.format("%H:%M:%S"),
+            esc(e.symbol.as_deref().unwrap_or("SYSTEM")),
+            esc(&summarise_event(e)),
+            esc(&e.event_id),
+        )
+    }).collect::<Vec<_>>().join("");
+
+    // ── Balance / ReconcileApplied summary banner ────────────────────────────
+    let recon_balance_banner = {
+        let last_balance = events.iter().find_map(|e| {
+            if let crate::events::TradingEvent::BalanceUpdated(p) = &e.payload {
+                Some(format!(
+                    "total={:.2} buy_power={:.2} inventory={:.8}",
+                    p.total_balance_usd, p.buy_power, p.sell_inventory
+                ))
+            } else { None }
+        });
+        let last_recon = events.iter().find_map(|e| {
+            if let crate::events::TradingEvent::ReconcileApplied(p) = &e.payload {
+                if p.fills_count > 0 {
+                    Some(format!(
+                        "{} fill(s): {}",
+                        p.fills_count,
+                        p.fills.iter().map(|f| format!("{}@{:.2}", esc(&f.side), f.price))
+                            .collect::<Vec<_>>().join(", ")
+                    ))
+                } else { None }
+            } else { None }
+        });
+        match (last_balance, last_recon) {
+            (Some(bal), Some(recon)) => format!(
+                "<div style='margin-top:6px;font-size:11px;display:grid;grid-template-columns:1fr 1fr;gap:6px'>\
+                 <div style='padding:6px 8px;background:rgba(240,185,11,.08);border:1px solid rgba(240,185,11,.3);border-radius:8px'>\
+                 <div style='color:#f0b90b;font-weight:700;font-size:10px'>BALANCE UPDATED</div>\
+                 <div style='color:#d0d6dd'>{bal}</div></div>\
+                 <div style='padding:6px 8px;background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.3);border-radius:8px'>\
+                 <div style='color:#22C55E;font-weight:700;font-size:10px'>RECONCILE APPLIED</div>\
+                 <div style='color:#d0d6dd'>{recon}</div></div></div>"
+            ),
+            (Some(bal), None) => format!(
+                "<div style='margin-top:6px;font-size:11px'>\
+                 <div style='padding:6px 8px;background:rgba(240,185,11,.08);border:1px solid rgba(240,185,11,.3);border-radius:8px'>\
+                 <div style='color:#f0b90b;font-weight:700;font-size:10px'>BALANCE UPDATED</div>\
+                 <div style='color:#d0d6dd'>{bal}</div></div></div>"
+            ),
+            (None, Some(recon)) => format!(
+                "<div style='margin-top:6px;font-size:11px'>\
+                 <div style='padding:6px 8px;background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.3);border-radius:8px'>\
+                 <div style='color:#22C55E;font-weight:700;font-size:10px'>RECONCILE APPLIED</div>\
+                 <div style='color:#d0d6dd'>{recon}</div></div></div>"
+            ),
+            _ => String::new(),
+        }
+    };
+
     let context_body = format!(
-        "<div class='soft-title'>Recent Activity</div>\
-         <div class='event-list tier-3'>{}</div>\
+        "{last_fill_panel}\
+         <div class='soft-title'>Recent Activity</div>\
+         {recon_balance_banner}\
+         <div class='event-list tier-3' style='margin-top:8px'>{event_feed}</div>\
          <div class='sum' style='margin-top:8px'>Position {:.6} · Open orders {} · <a href='{}'>Open timeline view</a></div>\
          <div class='sum' style='margin-top:8px'>\
            <strong>Last agent decision:</strong> {} · cycle {}\
@@ -1520,7 +1700,6 @@ async fn page_events(state: &AppState, query: &str) -> String {
            <strong>Last no-trade reason:</strong> {}\
          </div>\
          <details style='margin-top:10px'><summary class='soft-title' style='cursor:pointer'>Advanced / Diagnostics</summary>{}</details>",
-        event_feed,
         pos_size,
         open_orders,
         corr_link,
