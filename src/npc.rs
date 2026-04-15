@@ -2644,10 +2644,16 @@ fn observe_and_learn(cfg: &NpcConfig, rt: &mut NpcRuntimeState, store: &dyn Even
             );
 
             // ── COMPOUND_EXECUTION: update consecutive loss / profit state ────────
-            rt.compound_session_pnl += pnl;
-            rt.compound_last_trade_pnl = pnl;
-            rt.compound_last_trade_was_profitable = pnl > 0.0;
+            let is_compound_execution_trade = open.regime.as_str() == "micro_active";
+            if is_compound_execution_trade {
+                rt.compound_session_pnl += pnl;
+                rt.compound_last_trade_pnl = pnl;
+                rt.compound_last_trade_was_profitable = pnl > 0.0;
+            }
 
+            // Shadow `pnl` so the existing compound loss/profit logic becomes a no-op
+            // for trades that were not opened in the COMPOUND_EXECUTION regime.
+            let pnl = if is_compound_execution_trade { pnl } else { 0.0 };
             if pnl < 0.0 {
                 rt.compound_consecutive_losses = rt.compound_consecutive_losses.saturating_add(1);
                 // After 2+ consecutive losses: reduce size scalar by COMPOUND_LOSS_SIZE_FACTOR.
