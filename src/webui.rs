@@ -714,7 +714,7 @@ async fn agent_status_json(state: &AppState) -> String {
     let exec_block = snap.execution_block_reason.replace('"', "\\\"");
     let threshold_mode = snap.threshold_mode.replace('"', "\\\"");
     let body = format!(
-        r#"{{"mode":"{mode_str}","state":"{state_label}","agent_state":"{status_str}","last_action":"{last_action}","last_reason":"{last_reason}","last_agent_decision":"{last_decision}","last_no_trade_reason":"{no_trade_reason}","pipeline_state":"{pipeline}","final_decision":"{final_decision}","balance_block_reason":"{balance_block}","risk_block_reason":"{risk_block}","execution_block_reason":"{exec_block}","current_equity":{current_equity},"peak_equity":{peak_equity},"drawdown_pct":{drawdown_pct},"drawdown_limit":{drawdown_limit},"cycle_count":{cycle_count},"running":{running},"cooldown_active":{cooldown_active},"cooldown_remaining_ms":{cooldown_remaining_ms},"effective_threshold":{effective_threshold},"threshold_mode":"{threshold_mode}"}}"#,
+        r#"{{"mode":"{mode_str}","state":"{state_label}","agent_state":"{status_str}","last_action":"{last_action}","last_reason":"{last_reason}","last_agent_decision":"{last_decision}","last_no_trade_reason":"{no_trade_reason}","pipeline_state":"{pipeline}","final_decision":"{final_decision}","balance_block_reason":"{balance_block}","risk_block_reason":"{risk_block}","execution_block_reason":"{exec_block}","current_equity":{current_equity},"peak_equity":{peak_equity},"drawdown_pct":{drawdown_pct},"drawdown_limit":{drawdown_limit},"cycle_count":{cycle_count},"running":{running},"cooldown_active":{cooldown_active},"cooldown_remaining_ms":{cooldown_remaining_ms},"effective_threshold":{effective_threshold},"threshold_mode":"{threshold_mode}","compound_position_size_usd":{compound_pos_usd},"compound_position_size_btc":{compound_pos_btc},"compound_last_trade_pnl":{compound_last_pnl},"compound_session_pnl":{compound_sess_pnl},"compound_peak_balance":{compound_peak_bal},"compound_current_balance":{compound_cur_bal},"compound_consecutive_losses":{compound_consec},"compound_size_scalar":{compound_scalar},"compound_loss_pause_active":{compound_paused}}}"#,
         current_equity  = snap.current_equity,
         peak_equity     = snap.peak_equity,
         drawdown_pct    = snap.drawdown_pct,
@@ -724,6 +724,15 @@ async fn agent_status_json(state: &AppState) -> String {
         cooldown_active       = snap.cooldown_active,
         cooldown_remaining_ms = snap.cooldown_remaining_ms,
         effective_threshold   = snap.effective_threshold,
+        compound_pos_usd   = snap.compound_position_size_usd,
+        compound_pos_btc   = snap.compound_position_size_btc,
+        compound_last_pnl  = snap.compound_last_trade_pnl,
+        compound_sess_pnl  = snap.compound_session_pnl,
+        compound_peak_bal  = snap.compound_peak_balance,
+        compound_cur_bal   = snap.compound_current_balance,
+        compound_consec    = snap.compound_consecutive_losses,
+        compound_scalar    = snap.compound_size_scalar,
+        compound_paused    = snap.compound_loss_pause_active,
     );
     json_resp(&body)
 }
@@ -1351,6 +1360,67 @@ async fn page_events(state: &AppState, query: &str) -> String {
         )
     };
 
+    // ── COMPOUND_EXECUTION status panel ─────────────────────────────────────
+    let compound_panel = if npc_loop.threshold_mode == "micro_active" {
+        let last_pnl_color = if npc_loop.compound_last_trade_pnl > 0.0 { "#22c55e" }
+                             else if npc_loop.compound_last_trade_pnl < 0.0 { "#ef4444" }
+                             else { "#82909f" };
+        let sess_pnl_color = if npc_loop.compound_session_pnl > 0.0 { "#22c55e" }
+                             else if npc_loop.compound_session_pnl < 0.0 { "#ef4444" }
+                             else { "#82909f" };
+        let pause_badge = if npc_loop.compound_loss_pause_active {
+            "<span style='color:#ef4444;font-weight:700'>⛔ LOSS PAUSE</span>"
+        } else {
+            ""
+        };
+        let scalar_color = if npc_loop.compound_size_scalar >= 0.9 { "#22c55e" }
+                           else if npc_loop.compound_size_scalar >= 0.5 { "#f0b90b" }
+                           else { "#ef4444" };
+        let peak_growth = if npc_loop.compound_peak_balance > 0.0 && npc_loop.compound_current_balance > 0.0 {
+            let pct = (npc_loop.compound_current_balance / npc_loop.compound_peak_balance - 1.0) * 100.0;
+            if pct >= 0.0 {
+                format!("<span style='color:#22c55e'>+{:.1}% vs peak</span>", pct)
+            } else {
+                format!("<span style='color:#ef4444'>{:.1}% vs peak</span>", pct)
+            }
+        } else {
+            "—".to_string()
+        };
+        format!(
+            "<div style='margin-top:8px;padding:6px 8px;background:rgba(34,197,94,.06);\
+             border:1px solid rgba(34,197,94,.2);border-radius:8px;font-size:11px'>\
+             <div style='font-weight:700;color:#22c55e;margin-bottom:4px'>⚡ COMPOUND_EXECUTION {pause_badge}</div>\
+             <div style='display:grid;grid-template-columns:repeat(2,1fr);gap:4px'>\
+               <div><span class='dim'>Position: </span>\
+                 <span style='color:#e2e8f0'>${pos_usd:.2} / {pos_btc:.8} BTC</span></div>\
+               <div><span class='dim'>Last trade PnL: </span>\
+                 <span style='color:{last_pnl_color}'>{last_pnl:+.4}</span></div>\
+               <div><span class='dim'>Session PnL: </span>\
+                 <span style='color:{sess_pnl_color}'>{sess_pnl:+.4}</span></div>\
+               <div><span class='dim'>Consec losses: </span>\
+                 <span style='color:{loss_color}'>{consec_losses}</span></div>\
+               <div><span class='dim'>Size scalar: </span>\
+                 <span style='color:{scalar_color}'>{size_scalar:.0}%</span></div>\
+               <div><span class='dim'>Balance: </span>\
+                 ${cur_bal:.2} / peak ${peak_bal:.2} {peak_growth}</div>\
+             </div>\
+             </div>",
+            pos_usd = npc_loop.compound_position_size_usd,
+            pos_btc = npc_loop.compound_position_size_btc,
+            last_pnl = npc_loop.compound_last_trade_pnl,
+            sess_pnl = npc_loop.compound_session_pnl,
+            consec_losses = npc_loop.compound_consecutive_losses,
+            loss_color = if npc_loop.compound_consecutive_losses == 0 { "#22c55e" }
+                         else if npc_loop.compound_consecutive_losses < 3 { "#f0b90b" }
+                         else { "#ef4444" },
+            size_scalar = npc_loop.compound_size_scalar * 100.0,
+            cur_bal = npc_loop.compound_current_balance,
+            peak_bal = npc_loop.compound_peak_balance,
+        )
+    } else {
+        String::new()
+    };
+
     let agent_control_card = format!(
         "<div class='signal-box' style='margin-bottom:12px;{agent_card_glow}'>\
            <div style='display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px'>\
@@ -1367,6 +1437,7 @@ async fn page_events(state: &AppState, query: &str) -> String {
            </div>\
            {sell_blocked_banner}\
            {buy_blocked_banner}\
+           {compound_panel}\
            <details style='margin-top:6px'><summary class='dim' style='cursor:pointer;font-size:11px'>Decision transparency</summary>{decision_transparency}</details>\
            <div style='display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:10px'>\
              <form method='post' action='/agent/mode'><input type='hidden' name='mode' value='off'>\
