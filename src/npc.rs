@@ -445,6 +445,50 @@ pub struct CompletedFlip {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContractSide {
+    Long,
+    Short,
+}
+
+impl ContractSide {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Long => "LONG",
+            Self::Short => "SHORT",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct OpenContractPosition {
+    side: ContractSide,
+    leverage: f64,
+    entry_price: f64,
+    mark_price: f64,
+    notional_usd: f64,
+    qty_base: f64,
+    unrealized_pnl: f64,
+    liquidation_price: f64,
+    stop_loss: f64,
+    take_profit: f64,
+    trailing_stop: f64,
+    opened_at: Instant,
+    high_water_mark: f64,
+    low_water_mark: f64,
+}
+
+#[derive(Clone, Debug)]
+struct CompletedContractTrade {
+    side: ContractSide,
+    leverage: f64,
+    entry_price: f64,
+    exit_price: f64,
+    pnl_usd: f64,
+    duration_secs: f64,
+    exit_reason: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SwingBias {
     LongBias,
     ShortBias,
@@ -542,6 +586,14 @@ struct NpcRuntimeState {
     swing_last_exit_reason: String,
     swing_last_hold_duration_secs: f64,
     swing_cooldown_until: Option<Instant>,
+    // ── CONTRACT_EXECUTOR tracking (paper-mode only) ─────────────────────────
+    contract_paper_mode: bool,
+    contract_leverage: f64,
+    contract_fee_rate: f64,
+    contract_position: Option<OpenContractPosition>,
+    contract_realized_pnl_session: f64,
+    contract_last_trade: Option<CompletedContractTrade>,
+    contract_last_exit_reason: String,
 }
 
 impl Default for NpcRuntimeState {
@@ -585,6 +637,13 @@ impl Default for NpcRuntimeState {
             swing_last_exit_reason: String::new(),
             swing_last_hold_duration_secs: 0.0,
             swing_cooldown_until: None,
+            contract_paper_mode: true,
+            contract_leverage: CONTRACT_DEFAULT_LEVERAGE,
+            contract_fee_rate: 0.0004,
+            contract_position: None,
+            contract_realized_pnl_session: 0.0,
+            contract_last_trade: None,
+            contract_last_exit_reason: String::new(),
         }
     }
 }
@@ -682,6 +741,22 @@ pub struct NpcLoopSnapshot {
     pub flip_min_profit_floor: f64,
     /// Anti-stall blocker reason (non-empty when idle too long with valid inventory).
     pub flip_blocker: String,
+    // ── CONTRACT_EXECUTOR telemetry (paper mode) ─────────────────────────────
+    pub contract_side: String,
+    pub contract_leverage: f64,
+    pub contract_entry_price: f64,
+    pub contract_mark_price: f64,
+    pub contract_notional_usd: f64,
+    pub contract_unrealized_pnl: f64,
+    pub contract_realized_pnl: f64,
+    pub contract_liquidation_price: f64,
+    pub contract_stop_loss: f64,
+    pub contract_take_profit: f64,
+    pub contract_liquidation_buffer_pct: f64,
+    pub contract_duration_secs: f64,
+    pub contract_exit_reason: String,
+    pub contract_last_trade_result: f64,
+    pub contract_paper_mode: bool,
 }
 
 #[derive(Default)]
@@ -859,7 +934,7 @@ impl NpcAutonomousController {
         let telemetry = self.telemetry.lock().await;
         let control = self.control.lock().await;
         let agent_mode = control.mode;
-        let (current_equity, peak_equity, drawdown_pct, compound, flip) = {
+        let (current_equity, peak_equity, drawdown_pct, compound, flip, contract) = {
             // Compute current equity and drawdown from runtime state (same formula as evaluate_portfolio_controls).
             let rt = self.runtime.lock().await;
             let aggregate_pnl: f64 = rt.perf.values().map(|p| p.gross_pnl).sum();
@@ -900,7 +975,56 @@ impl NpcAutonomousController {
                 flip_last_pnl_pct,
                 rt.flip_blocker.clone(),
             );
-            (equity, peak, dd, c, f)
+            let (side, leverage, entry_price, mark_price, notional_usd, unrealized_pnl, liq_price, stop_loss, take_profit, liq_buffer, duration_secs) =
+                if let Some(pos) = rt.contract_position.as_ref() {
+                    (
+                        pos.side.as_str().to_string(),
+                        pos.leverage,
+                        pos.entry_price,
+                        pos.mark_price,
+                        pos.notional_usd,
+                        pos.unrealized_pnl,
+                        pos.liquidation_price,
+                        pos.stop_loss,
+                        pos.take_profit,
+                        contract_liquidation_buffer_pct(pos.side, pos.mark_price, pos.liquidation_price),
+                        pos.opened_at.elapsed().as_secs_f64(),
+                    )
+                } else {
+                    ("FLAT".to_string(), rt.contract_leverage, 0.0, last_mid, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                };
+            let last_result = rt.contract_last_trade.as_ref().map(|t| t.pnl_usd).unwrap_or(0.0);
+            let last_reason = rt
+                .contract_last_trade
+                .as_ref()
+                .map(|t| format!(
+                    "{} {}x {}s {} @{:.2}->{:.2}",
+                    t.side.as_str(),
+                    t.leverage,
+                    t.duration_secs.round() as i64,
+                    t.exit_reason,
+                    t.entry_price,
+                    t.exit_price
+                ))
+                .unwrap_or_else(|| rt.contract_last_exit_reason.clone());
+            let k = (
+                side,
+                leverage,
+                entry_price,
+                mark_price,
+                notional_usd,
+                unrealized_pnl,
+                rt.contract_realized_pnl_session,
+                liq_price,
+                stop_loss,
+                take_profit,
+                liq_buffer,
+                duration_secs,
+                last_reason,
+                last_result,
+                rt.contract_paper_mode,
+            );
+            (equity, peak, dd, c, f, k)
         };
         let (
             compound_pos_btc, compound_pos_usd,
@@ -919,6 +1043,23 @@ impl NpcAutonomousController {
             flip_last_pnl_pct,
             flip_blocker,
         ) = flip;
+        let (
+            contract_side,
+            contract_leverage,
+            contract_entry_price,
+            contract_mark_price,
+            contract_notional_usd,
+            contract_unrealized_pnl,
+            contract_realized_pnl,
+            contract_liquidation_price,
+            contract_stop_loss,
+            contract_take_profit,
+            contract_liquidation_buffer_pct,
+            contract_duration_secs,
+            contract_exit_reason,
+            contract_last_trade_result,
+            contract_paper_mode,
+        ) = contract;
         NpcLoopSnapshot {
             agent_mode,
             autonomous_mode: agent_mode != AgentMode::Off,
@@ -966,6 +1107,21 @@ impl NpcAutonomousController {
             flip_last_pnl_pct,
             flip_min_profit_floor: flip_hyper_profit_floor_for_balance(compound_cur_bal),
             flip_blocker,
+            contract_side,
+            contract_leverage,
+            contract_entry_price,
+            contract_mark_price,
+            contract_notional_usd,
+            contract_unrealized_pnl,
+            contract_realized_pnl,
+            contract_liquidation_price,
+            contract_stop_loss,
+            contract_take_profit,
+            contract_liquidation_buffer_pct,
+            contract_duration_secs,
+            contract_exit_reason,
+            contract_last_trade_result,
+            contract_paper_mode,
         }
     }
 
@@ -1184,6 +1340,14 @@ const SWING_TARGET_MIN_PCT: f64 = 0.003; // 0.3%
 const SWING_TARGET_MAX_PCT: f64 = 0.012; // 1.2%
 const SWING_COOLDOWN_MIN_SECS: u64 = 30;
 const SWING_COOLDOWN_MAX_SECS: u64 = 120;
+const CONTRACT_LEVERAGE_MIN: f64 = 3.0;
+const CONTRACT_LEVERAGE_MAX: f64 = 5.0;
+const CONTRACT_DEFAULT_LEVERAGE: f64 = 3.0;
+const CONTRACT_MAINT_MARGIN_RATE: f64 = 0.005;
+const CONTRACT_MIN_VOL_ESTIMATE: f64 = 0.001;
+const CONTRACT_STOP_VOL_MULT: f64 = 1.5;
+const CONTRACT_TAKE_PROFIT_VOL_MULT: f64 = 3.0;
+const CONTRACT_TRAIL_VOL_MULT: f64 = 1.2;
 
 // ── COMPOUND_EXECUTION mode constants ────────────────────────────────────────
 /// Minimum normalized score (raw_score / threshold) required in COMPOUND_EXECUTION.
@@ -1333,6 +1497,159 @@ fn swing_bias(signals: &SwingRegimeSignals) -> SwingBias {
     }
 }
 
+fn contract_unrealized_pnl(side: ContractSide, entry_price: f64, mark_price: f64, qty_base: f64) -> f64 {
+    let delta = match side {
+        ContractSide::Long => mark_price - entry_price,
+        ContractSide::Short => entry_price - mark_price,
+    };
+    delta * qty_base
+}
+
+fn contract_liquidation_price(side: ContractSide, entry_price: f64, leverage: f64) -> f64 {
+    let lev = leverage.max(1.0);
+    match side {
+        ContractSide::Long => {
+            (entry_price * (1.0 - (1.0 / lev) + CONTRACT_MAINT_MARGIN_RATE)).max(f64::EPSILON)
+        }
+        ContractSide::Short => entry_price * (1.0 + (1.0 / lev) - CONTRACT_MAINT_MARGIN_RATE),
+    }
+}
+
+fn contract_liquidation_buffer_pct(side: ContractSide, mark_price: f64, liquidation_price: f64) -> f64 {
+    if mark_price <= 0.0 || !mark_price.is_finite() {
+        return 0.0;
+    }
+    match side {
+        ContractSide::Long => ((mark_price - liquidation_price) / mark_price).max(0.0),
+        ContractSide::Short => ((liquidation_price - mark_price) / mark_price).max(0.0),
+    }
+}
+
+fn update_contract_executor(
+    rt: &mut NpcRuntimeState,
+    swing_bias: SwingBias,
+    entry_price: f64,
+    mark_price: f64,
+    volatility_estimate: f64,
+    balance_usd: f64,
+) {
+    if !rt.contract_paper_mode || !mark_price.is_finite() || mark_price <= 0.0 {
+        return;
+    }
+    let leverage = rt.contract_leverage.clamp(CONTRACT_LEVERAGE_MIN, CONTRACT_LEVERAGE_MAX);
+    rt.contract_leverage = leverage;
+    let vol = volatility_estimate.abs().max(CONTRACT_MIN_VOL_ESTIMATE);
+    let notional = (balance_usd.max(0.0) * leverage).max(0.0);
+
+    if let Some(pos) = rt.contract_position.as_mut() {
+        pos.mark_price = mark_price;
+        pos.high_water_mark = pos.high_water_mark.max(mark_price);
+        pos.low_water_mark = pos.low_water_mark.min(mark_price);
+        let trail_distance = (vol * CONTRACT_TRAIL_VOL_MULT).max(0.002);
+        pos.trailing_stop = match pos.side {
+            ContractSide::Long => pos.high_water_mark * (1.0 - trail_distance),
+            ContractSide::Short => pos.low_water_mark * (1.0 + trail_distance),
+        };
+        pos.unrealized_pnl = contract_unrealized_pnl(pos.side, pos.entry_price, mark_price, pos.qty_base);
+
+        let stop_hit = match pos.side {
+            ContractSide::Long => mark_price <= pos.stop_loss,
+            ContractSide::Short => mark_price >= pos.stop_loss,
+        };
+        let take_profit_hit = match pos.side {
+            ContractSide::Long => mark_price >= pos.take_profit,
+            ContractSide::Short => mark_price <= pos.take_profit,
+        };
+        let trailing_hit = match pos.side {
+            ContractSide::Long => mark_price <= pos.trailing_stop,
+            ContractSide::Short => mark_price >= pos.trailing_stop,
+        };
+        let liquidation_hit = match pos.side {
+            ContractSide::Long => mark_price <= pos.liquidation_price,
+            ContractSide::Short => mark_price >= pos.liquidation_price,
+        };
+        let bias_flip = match (pos.side, swing_bias) {
+            (ContractSide::Long, SwingBias::LongBias) => false,
+            (ContractSide::Short, SwingBias::ShortBias) => false,
+            _ => true,
+        };
+        let exit_reason = if liquidation_hit {
+            Some("liquidation_guard")
+        } else if stop_hit {
+            Some("stop_loss_hit")
+        } else if take_profit_hit {
+            Some("take_profit_hit")
+        } else if trailing_hit {
+            Some("trailing_stop_hit")
+        } else if bias_flip {
+            Some("swing_bias_flip")
+        } else {
+            None
+        };
+        if let Some(reason) = exit_reason {
+            let exit_fee = pos.notional_usd * rt.contract_fee_rate.max(0.0);
+            let net_realized = pos.unrealized_pnl - exit_fee;
+            rt.contract_realized_pnl_session += net_realized;
+            rt.contract_last_exit_reason = reason.to_string();
+            rt.contract_last_trade = Some(CompletedContractTrade {
+                side: pos.side,
+                leverage: pos.leverage,
+                entry_price: pos.entry_price,
+                exit_price: mark_price,
+                pnl_usd: net_realized,
+                duration_secs: pos.opened_at.elapsed().as_secs_f64(),
+                exit_reason: reason.to_string(),
+            });
+            rt.contract_position = None;
+        }
+    }
+
+    if rt.contract_position.is_none() {
+        let side = match swing_bias {
+            SwingBias::LongBias => Some(ContractSide::Long),
+            SwingBias::ShortBias => Some(ContractSide::Short),
+            SwingBias::NoTrade => None,
+        };
+        if let Some(side) = side {
+            let entry = entry_price.max(f64::EPSILON);
+            let qty_base = if entry > 0.0 { notional / entry } else { 0.0 };
+            let stop_distance = (vol * CONTRACT_STOP_VOL_MULT).max(0.0025);
+            let tp_distance = (vol * CONTRACT_TAKE_PROFIT_VOL_MULT).max(0.004);
+            let stop_loss = match side {
+                ContractSide::Long => entry * (1.0 - stop_distance),
+                ContractSide::Short => entry * (1.0 + stop_distance),
+            };
+            let take_profit = match side {
+                ContractSide::Long => entry * (1.0 + tp_distance),
+                ContractSide::Short => entry * (1.0 - tp_distance),
+            };
+            let liquidation_price = contract_liquidation_price(side, entry, leverage);
+            let trailing_stop = match side {
+                ContractSide::Long => entry * (1.0 - (vol * CONTRACT_TRAIL_VOL_MULT).max(0.002)),
+                ContractSide::Short => entry * (1.0 + (vol * CONTRACT_TRAIL_VOL_MULT).max(0.002)),
+            };
+            let entry_fee = notional * rt.contract_fee_rate.max(0.0);
+            rt.contract_realized_pnl_session -= entry_fee;
+            rt.contract_position = Some(OpenContractPosition {
+                side,
+                leverage,
+                entry_price: entry,
+                mark_price,
+                notional_usd: notional,
+                qty_base,
+                unrealized_pnl: contract_unrealized_pnl(side, entry, mark_price, qty_base),
+                liquidation_price,
+                stop_loss,
+                take_profit,
+                trailing_stop,
+                opened_at: Instant::now(),
+                high_water_mark: mark_price,
+                low_water_mark: mark_price,
+            });
+        }
+    }
+}
+
 async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRuntimeState>>) -> NpcCycleReport {
     let mode = state.authority.mode().await;
     let metrics = {
@@ -1442,6 +1759,18 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         while rt.spread_history.len() > 128 {
             rt.spread_history.pop_front();
         }
+    }
+    if is_swing_profile {
+        let bias = swing_bias(&swing_signals);
+        let vol_estimate = realized_volatility_bps(&rt.mid_history, 16).unwrap_or(0.0) / 10_000.0;
+        update_contract_executor(
+            &mut rt,
+            bias,
+            metrics.mid,
+            metrics.mid,
+            vol_estimate,
+            total_balance_usd,
+        );
     }
 
     // ── SWING_TRADER: update open-position telemetry each cycle ──────────────
@@ -5581,5 +5910,46 @@ mod flip_hyper_tests {
             "Session PnL must accumulate: expected 1.0, got {}", rt.flip_session_pnl);
         assert_eq!(rt.flip_rotation_count, 2,
             "Rotation count must reflect 2 completed flips");
+    }
+
+    #[test]
+    fn contract_pnl_formula_supports_long_and_short() {
+        let qty = 1.0;
+        let long = contract_unrealized_pnl(ContractSide::Long, 100.0, 105.0, qty);
+        let short = contract_unrealized_pnl(ContractSide::Short, 100.0, 95.0, qty);
+        assert!((long - 5.0).abs() < 1e-9, "long pnl mismatch: {}", long);
+        assert!((short - 5.0).abs() < 1e-9, "short pnl mismatch: {}", short);
+    }
+
+    #[test]
+    fn contract_executor_lifecycle_open_and_bias_flip_exit() {
+        let mut rt = NpcRuntimeState::default();
+        rt.contract_fee_rate = 0.0;
+        update_contract_executor(&mut rt, SwingBias::LongBias, 100.0, 100.0, 0.01, 100.0);
+        assert!(rt.contract_position.is_some(), "must open on LONG bias");
+        let side = rt.contract_position.as_ref().map(|p| p.side).unwrap();
+        assert_eq!(side, ContractSide::Long);
+
+        // Bias flip should close LONG and open SHORT in same cycle.
+        update_contract_executor(&mut rt, SwingBias::ShortBias, 99.0, 99.0, 0.01, 100.0);
+        assert!(rt.contract_position.is_some(), "must reopen on SHORT bias");
+        let pos = rt.contract_position.as_ref().unwrap();
+        assert_eq!(pos.side, ContractSide::Short);
+        assert_eq!(rt.contract_last_exit_reason, "swing_bias_flip");
+    }
+
+    #[test]
+    fn contract_executor_applies_entry_and_exit_fees() {
+        let mut rt = NpcRuntimeState::default();
+        rt.contract_fee_rate = 0.001;
+        update_contract_executor(&mut rt, SwingBias::LongBias, 100.0, 100.0, 0.01, 100.0);
+        // Entry fee = 100 * 3x * 0.1% = 0.3
+        assert!((rt.contract_realized_pnl_session + 0.3).abs() < 1e-9);
+
+        // Force close via NO_TRADE bias flip and ensure exit fee is subtracted.
+        update_contract_executor(&mut rt, SwingBias::NoTrade, 101.0, 101.0, 0.01, 100.0);
+        let realized = rt.contract_realized_pnl_session;
+        // Gross pnl: 3.0 ; fees total 0.6 => net 2.4
+        assert!((realized - 2.4).abs() < 1e-6, "expected net 2.4, got {realized}");
     }
 }
