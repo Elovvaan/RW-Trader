@@ -2647,7 +2647,8 @@ fn observe_and_learn(cfg: &NpcConfig, rt: &mut NpcRuntimeState, store: &dyn Even
                 rt.compound_consecutive_losses = rt.compound_consecutive_losses.saturating_add(1);
                 // After 2+ consecutive losses: reduce size scalar by COMPOUND_LOSS_SIZE_FACTOR.
                 if rt.compound_consecutive_losses >= COMPOUND_LOSS_SIZE_REDUCE_THRESHOLD {
-                    rt.compound_size_scalar = (rt.compound_size_scalar * COMPOUND_LOSS_SIZE_FACTOR).max(0.1);
+                    rt.compound_size_scalar =
+                        (rt.compound_size_scalar * COMPOUND_LOSS_SIZE_FACTOR).max(COMPOUND_MIN_SIZE_SCALAR);
                     info!(
                         consecutive_losses = rt.compound_consecutive_losses,
                         new_scalar = rt.compound_size_scalar,
