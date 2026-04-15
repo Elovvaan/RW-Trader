@@ -922,7 +922,7 @@ impl NpcAutonomousController {
             flip_last_exit_price,
             flip_last_pnl_usd,
             flip_last_pnl_pct,
-            flip_min_profit_floor: FLIP_HYPER_MIN_PROFIT_FLOOR_USD,
+            flip_min_profit_floor: flip_hyper_profit_floor_for_balance(compound_cur_bal),
             flip_blocker,
         }
     }
@@ -1125,9 +1125,16 @@ const THRESHOLD_FLIP_HYPER_MID: f64   = 0.055;
 /// Minimum net profit (USD) required to execute a FLIP_HYPER sell.
 /// Never sell for less than this after spread + fees + slippage.
 pub const FLIP_HYPER_MIN_PROFIT_FLOOR_USD: f64 = 0.01;
+/// Minimum net profit (USD) required to execute a FLIP_HYPER sell for
+/// micro accounts (< $50). Tuned for frequent small rotations.
+const FLIP_HYPER_MIN_PROFIT_FLOOR_USD_MICRO: f64 = 0.02;
 /// Seconds without an execution before the anti-stall rule fires and surfaces
 /// an exact blocker reason in telemetry.
 const FLIP_HYPER_STALL_SECS: u64 = 120;
+/// Force-rotation fallback timeout (seconds) for HOLDING_POSITION/SEEK_EXIT.
+const FLIP_HYPER_FORCED_ROTATION_SECS: u64 = 60;
+/// Max loss allowed for forced-rotation fallback exits (0.1%).
+const FLIP_HYPER_FORCED_ROTATION_MAX_LOSS_PCT: f64 = 0.1;
 
 // ── COMPOUND_EXECUTION mode constants ────────────────────────────────────────
 /// Minimum normalized score (raw_score / threshold) required in COMPOUND_EXECUTION.
@@ -1203,6 +1210,14 @@ fn adaptive_signal_threshold_with_trading_mode(
         }
     } else {
         adaptive_signal_threshold(total_balance_usd)
+    }
+}
+
+fn flip_hyper_profit_floor_for_balance(total_balance_usd: f64) -> f64 {
+    if total_balance_usd > 0.0 && total_balance_usd < MICRO_BALANCE_USD {
+        FLIP_HYPER_MIN_PROFIT_FLOOR_USD_MICRO
+    } else {
+        FLIP_HYPER_MIN_PROFIT_FLOOR_USD
     }
 }
 
@@ -1409,6 +1424,23 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                     });
                     rt.flip_session_pnl += realized_pnl_usd;
                     rt.flip_rotation_count = rt.flip_rotation_count.saturating_add(1);
+                    log_npc_event(
+                        &*state.store,
+                        "flip_completed",
+                        &format!(
+                            "cycle={} entry={:.2} exit={:.2} qty={:.8} \
+                             realized_pnl_usd={:.4} realized_pnl_pct={:.4} \
+                             session_pnl={:.4} rotation_count={}",
+                            cycle_id,
+                            rt.flip_last_entry_price,
+                            exit_price,
+                            qty,
+                            realized_pnl_usd,
+                            realized_pnl_pct,
+                            rt.flip_session_pnl,
+                            rt.flip_rotation_count
+                        ),
+                    );
                 }
             }
             rt.flip_last_entry_price = 0.0;
@@ -1959,21 +1991,38 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         && chosen.side.eq_ignore_ascii_case("SELL")
         && rt.flip_last_entry_price > 0.0
     {
+        let min_profit_floor = flip_hyper_profit_floor_for_balance(total_balance_usd);
         let exit_price   = metrics.mid;
         let qty          = allocation.qty;
         let gross_pnl    = qty * (exit_price - rt.flip_last_entry_price);
         let est_fees     = qty * exit_price * 0.001; // ~0.1% fee estimate
         let net_pnl      = gross_pnl - est_fees;
-        if net_pnl < FLIP_HYPER_MIN_PROFIT_FLOOR_USD {
+        let entry_notional = (rt.flip_last_entry_price * qty).max(f64::EPSILON);
+        let net_pnl_pct = (net_pnl / entry_notional) * 100.0;
+        let breakeven_exit_floor = rt.flip_last_entry_price - (exit_price * 0.001);
+        let allow_breakeven_micro =
+            total_balance_usd > 0.0
+                && total_balance_usd < MICRO_BALANCE_USD
+                && exit_price >= breakeven_exit_floor;
+        let forced_rotation_armed = matches!(
+            rt.flip_cycle_phase,
+            FlipCyclePhase::HoldingPosition | FlipCyclePhase::SeekExit
+        ) && rt
+            .flip_last_active
+            .map(|since| since.elapsed().as_secs() > FLIP_HYPER_FORCED_ROTATION_SECS)
+            .unwrap_or(false);
+        let allow_forced_rotation =
+            forced_rotation_armed && net_pnl_pct >= -FLIP_HYPER_FORCED_ROTATION_MAX_LOSS_PCT;
+        if net_pnl < min_profit_floor && !allow_breakeven_micro && !allow_forced_rotation {
             rt.perf.entry(chosen.role).or_default().blocked += 1;
             observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
             let reason = format!(
                 "FLIP_HYPER profit floor: net PnL ${:.4} < floor ${:.2} \
                  (entry={:.2} exit={:.2} qty={:.8} gross={:.4} fees_est={:.4}). \
                  Min profit floor: ${:.2}",
-                net_pnl, FLIP_HYPER_MIN_PROFIT_FLOOR_USD,
+                net_pnl, min_profit_floor,
                 rt.flip_last_entry_price, exit_price, qty, gross_pnl, est_fees,
-                FLIP_HYPER_MIN_PROFIT_FLOOR_USD
+                min_profit_floor
             );
             lifecycle(
                 &*state.store,
@@ -1989,7 +2038,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                 status: "blocked".to_string(),
                 last_agent_decision: format!(
                     "HOLD — SELL blocked: net PnL ${:.4} below floor ${:.2}",
-                    net_pnl, FLIP_HYPER_MIN_PROFIT_FLOOR_USD
+                    net_pnl, min_profit_floor
                 ),
                 no_trade_reason: reason.clone(),
                 pipeline_state: "Scanning".to_string(),
@@ -2006,18 +2055,44 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                 top_score_penalties: chosen.score_parts.top_penalties_str(),
             };
         }
-        // Log that the profit floor was cleared.
-        info!(
-            cycle_id,
-            role = chosen.role.as_str(),
-            entry = rt.flip_last_entry_price,
-            exit = exit_price,
-            qty,
-            net_pnl,
-            floor = FLIP_HYPER_MIN_PROFIT_FLOOR_USD,
-            "[FLIP_HYPER] Profit floor cleared: net={:.4} ≥ floor={:.2}",
-            net_pnl, FLIP_HYPER_MIN_PROFIT_FLOOR_USD
-        );
+        if allow_forced_rotation {
+            info!(
+                cycle_id,
+                role = chosen.role.as_str(),
+                entry = rt.flip_last_entry_price,
+                exit = exit_price,
+                qty,
+                net_pnl,
+                net_pnl_pct,
+                "[FLIP_HYPER] Forced rotation fallback armed: net={:.4} ({:.4}%)",
+                net_pnl, net_pnl_pct
+            );
+        } else if allow_breakeven_micro && net_pnl < min_profit_floor {
+            info!(
+                cycle_id,
+                role = chosen.role.as_str(),
+                entry = rt.flip_last_entry_price,
+                exit = exit_price,
+                qty,
+                net_pnl,
+                floor = min_profit_floor,
+                "[FLIP_HYPER] Micro breakeven exit allowed: net={:.4} floor={:.2}",
+                net_pnl, min_profit_floor
+            );
+        } else {
+            // Log that the profit floor was cleared.
+            info!(
+                cycle_id,
+                role = chosen.role.as_str(),
+                entry = rt.flip_last_entry_price,
+                exit = exit_price,
+                qty,
+                net_pnl,
+                floor = min_profit_floor,
+                "[FLIP_HYPER] Profit floor cleared: net={:.4} ≥ floor={:.2}",
+                net_pnl, min_profit_floor
+            );
+        }
     }
 
     lifecycle(
@@ -2031,7 +2106,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         ),
     );
 
-    if effective_cfg.mode == NpcTradingMode::Live && rt.paper_executions == 0 {
+    if effective_cfg.mode == NpcTradingMode::Live && rt.paper_executions == 0 && !is_flip_hyper {
         lifecycle(
             &*state.store,
             chosen.role,
@@ -2279,48 +2354,12 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             rt.flip_cycle_phase = FlipCyclePhase::Exiting;
             rt.flip_last_active = Some(Instant::now()); // reset stall timer
             rt.flip_blocker.clear();
-            // Record realized PnL at submission time (approximate — based on mid price).
-            if rt.flip_last_entry_price > 0.0 && rt.flip_last_entry_qty > 0.0 {
-                let exit_price       = metrics.mid;
-                let qty              = allocation.qty.min(rt.flip_last_entry_qty);
-                let gross_pnl        = qty * (exit_price - rt.flip_last_entry_price);
-                let est_fees         = qty * exit_price * 0.001;
-                let realized_pnl_usd = gross_pnl - est_fees;
-                let realized_pnl_pct =
-                    (exit_price / rt.flip_last_entry_price - 1.0) * 100.0;
-                info!(
-                    cycle_id,
-                    entry   = rt.flip_last_entry_price,
-                    exit    = exit_price,
-                    qty,
-                    pnl_usd = realized_pnl_usd,
-                    "[FLIP_HYPER] SELL submitted: entry={:.2} exit={:.2} qty={:.8} pnl={:+.4}",
-                    rt.flip_last_entry_price, exit_price, qty, realized_pnl_usd
-                );
-                rt.flip_last_completed = Some(CompletedFlip {
-                    entry_price:      rt.flip_last_entry_price,
-                    exit_price,
-                    qty,
-                    realized_pnl_usd,
-                    realized_pnl_pct,
-                    completed_at:     Instant::now(),
-                });
-                rt.flip_session_pnl += realized_pnl_usd;
-                rt.flip_rotation_count = rt.flip_rotation_count.saturating_add(1);
-                log_npc_event(
-                    &*state.store,
-                    "flip_completed",
-                    &format!(
-                        "cycle={} entry={:.2} exit={:.2} qty={:.8} \
-                         realized_pnl_usd={:.4} realized_pnl_pct={:.4} \
-                         session_pnl={:.4} rotation_count={}",
-                        cycle_id,
-                        rt.flip_last_entry_price, exit_price, qty,
-                        realized_pnl_usd, realized_pnl_pct,
-                        rt.flip_session_pnl, rt.flip_rotation_count
-                    ),
-                );
-            }
+            info!(
+                cycle_id,
+                entry = rt.flip_last_entry_price,
+                qty = allocation.qty,
+                "[FLIP_HYPER] SELL submitted; awaiting fill confirmation for flip completion"
+            );
         }
     }
 
@@ -2745,13 +2784,19 @@ fn evaluate_guards(
     }
 
     // ── Per-role cooldown ────────────────────────────────────────────────────
+    // FLIP_HYPER (live < $50): ultra-short 50ms cooldown for faster rotation.
     // MICRO_ACTIVE (live < $50): ultra-short 100ms cooldown for faster re-entry.
     // Small accounts (0 < balance < $100): reduced cooldown (300ms).
     // Normal accounts: max(cycle_interval, 250ms).
     // Allow immediate execution when no other guards fired — the cooldown only
     // adds friction when something else is already blocking the cycle.
+    let flip_hyper_profile = cfg.behavior_profile.eq_ignore_ascii_case("FLIP_HYPER");
     let effective_cooldown = if is_micro_active && total_balance_usd > 0.0 && total_balance_usd < MICRO_BALANCE_USD {
-        Duration::from_millis(100)
+        if flip_hyper_profile {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_millis(100)
+        }
     } else if total_balance_usd > 0.0 && total_balance_usd < 100.0 {
         Duration::from_millis(300)
     } else {
@@ -4944,15 +4989,16 @@ mod micro_active_tests {
 
     #[test]
     fn micro_active_cooldown_shorter_than_small_account() {
-        // MICRO_ACTIVE (<$50 live) cooldown = 150ms; small account ($50-$99) = 300ms.
+        // FLIP_HYPER profile (<$50 live) cooldown = 50ms; small account ($50-$99) = 300ms.
         let mut cfg = micro_cfg();
+        cfg.behavior_profile = "FLIP_HYPER".to_string();
         cfg.cycle_interval = Duration::from_secs(10);
         let mut rt = NpcRuntimeState::default();
         // Place last action 200ms ago.
         rt.last_action_at.insert(NpcRole::Scout, std::time::Instant::now() - Duration::from_millis(200));
         let metrics = typical_metrics(0.01, 1.0, 10);
 
-        // MICRO_ACTIVE (< $50, is_micro_active=true): 100ms cooldown → expired after 200ms.
+        // FLIP_HYPER profile (< $50, is_micro_active=true): 50ms cooldown → expired after 200ms.
         let (_, cooldown_micro_active, _) = evaluate_guards(
             &cfg, &rt, NpcRole::Scout, "BUY",
             0.0, &metrics, 0.5,
@@ -4960,7 +5006,7 @@ mod micro_active_tests {
             /* is_micro_active */ true,
         );
         assert!(!cooldown_micro_active,
-            "MICRO_ACTIVE cooldown (150ms) must be expired after 200ms");
+            "FLIP_HYPER cooldown (50ms) must be expired after 200ms");
 
         // Small account (< $100, is_micro_active=false): 300ms cooldown → still active after 200ms.
         let (_, cooldown_small, _) = evaluate_guards(
