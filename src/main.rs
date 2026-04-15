@@ -103,7 +103,7 @@ async fn main() -> Result<()> {
                 executor::WatchdogConfig::default(),
             ));
             let stub_truth = Arc::new(Mutex::new(reconciler::TruthState::new("BTCUSDT", 0.0)));
-            let stub_feed = Arc::new(Mutex::new(feed::FeedState::new(Duration::from_secs(10))));
+            let stub_feed = Arc::new(Mutex::new(feed::FeedState::new(Duration::from_secs(1_200))));
             let stub_signal = Arc::new(Mutex::new(signal::SignalEngine::new(signal::SignalConfig {
                 order_qty: 0.0,
                 momentum_threshold: 0.0,
@@ -427,7 +427,8 @@ async fn main() -> Result<()> {
     let execution_quality = Arc::new(Mutex::new(portfolio::ExecutionQualityTracker::default()));
 
     // ── 6. Feed state ────────────────────────────────────────────────────────
-    let feed_state = Arc::new(Mutex::new(feed::FeedState::new(Duration::from_secs(10))));
+    // Keep enough history for SWING mode (15m trend + buffer).
+    let feed_state = Arc::new(Mutex::new(feed::FeedState::new(Duration::from_secs(1_200))));
 
     // ── 6b. Spawn web UI now that all live components exist ───────────────────
     // AppState holds Arc refs to event_store, exec, truth, risk_engine, authority.

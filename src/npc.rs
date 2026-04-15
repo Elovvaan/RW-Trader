@@ -444,6 +444,33 @@ pub struct CompletedFlip {
     pub completed_at:     Instant,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SwingBias {
+    LongBias,
+    ShortBias,
+    NoTrade,
+}
+
+impl SwingBias {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LongBias => "LONG_BIAS",
+            Self::ShortBias => "SHORT_BIAS",
+            Self::NoTrade => "NO_TRADE",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct SwingRegimeSignals {
+    momentum_1m: f64,
+    momentum_5m: f64,
+    trend_bias_15m: f64,
+    pullback_detected: bool,
+    momentum_resumed_up: bool,
+    structure_break_long: bool,
+}
+
 #[derive(Clone, Debug)]
 struct OpenAction {
     role: NpcRole,
@@ -507,6 +534,14 @@ struct NpcRuntimeState {
     flip_last_active: Option<Instant>,
     /// Non-empty when the anti-stall rule has fired and surfaced an exact blocker.
     flip_blocker: String,
+    // ── SWING_TRADER tracking ────────────────────────────────────────────────
+    swing_entry_price: f64,
+    swing_entry_started_at: Option<Instant>,
+    swing_peak_price: f64,
+    swing_peak_unrealized_pct: f64,
+    swing_last_exit_reason: String,
+    swing_last_hold_duration_secs: f64,
+    swing_cooldown_until: Option<Instant>,
 }
 
 impl Default for NpcRuntimeState {
@@ -543,6 +578,13 @@ impl Default for NpcRuntimeState {
             flip_last_entry_qty: 0.0,
             flip_last_active: None,
             flip_blocker: String::new(),
+            swing_entry_price: 0.0,
+            swing_entry_started_at: None,
+            swing_peak_price: 0.0,
+            swing_peak_unrealized_pct: 0.0,
+            swing_last_exit_reason: String::new(),
+            swing_last_hold_duration_secs: 0.0,
+            swing_cooldown_until: None,
         }
     }
 }
@@ -1136,6 +1178,13 @@ const FLIP_HYPER_FORCED_ROTATION_SECS: u64 = 60;
 /// Max loss allowed for forced-rotation fallback exits (0.1%).
 const FLIP_HYPER_FORCED_ROTATION_MAX_LOSS_PCT: f64 = 0.1;
 
+// ── SWING_TRADER constants ───────────────────────────────────────────────────
+const SWING_TRAILING_STOP_PCT: f64 = 0.0045; // ~0.45%
+const SWING_TARGET_MIN_PCT: f64 = 0.003; // 0.3%
+const SWING_TARGET_MAX_PCT: f64 = 0.012; // 1.2%
+const SWING_COOLDOWN_MIN_SECS: u64 = 30;
+const SWING_COOLDOWN_MAX_SECS: u64 = 120;
+
 // ── COMPOUND_EXECUTION mode constants ────────────────────────────────────────
 /// Minimum normalized score (raw_score / threshold) required in COMPOUND_EXECUTION.
 /// Score must be at least 20% above the threshold — not just barely passing.
@@ -1221,12 +1270,79 @@ fn flip_hyper_profit_floor_for_balance(total_balance_usd: f64) -> f64 {
     }
 }
 
+fn compute_swing_signals(feed: &crate::feed::FeedState, current_mid: f64) -> SwingRegimeSignals {
+    let now = Instant::now();
+    let momentum_1m = crate::signal::SignalEngine::compute_momentum(
+        &feed.mid_history,
+        now,
+        Duration::from_secs(60),
+        current_mid,
+    );
+    let momentum_5m = crate::signal::SignalEngine::compute_momentum(
+        &feed.mid_history,
+        now,
+        Duration::from_secs(300),
+        current_mid,
+    );
+    let trend_bias_15m = crate::signal::SignalEngine::compute_momentum(
+        &feed.mid_history,
+        now,
+        Duration::from_secs(900),
+        current_mid,
+    );
+
+    let cutoff_recent = now - Duration::from_secs(60);
+    let cutoff_prior = now - Duration::from_secs(120);
+    let mut recent_low = f64::INFINITY;
+    let mut prior_low = f64::INFINITY;
+    for s in &feed.mid_history {
+        if s.timestamp >= cutoff_recent {
+            recent_low = recent_low.min(s.mid);
+        } else if s.timestamp >= cutoff_prior {
+            prior_low = prior_low.min(s.mid);
+        }
+    }
+    let structure_break_long = recent_low.is_finite()
+        && prior_low.is_finite()
+        && recent_low < prior_low * (1.0 - 0.0002);
+
+    // Pullback + resume rule:
+    // - 5m trend must stay positive
+    // - 1m momentum dips mildly negative (pullback)
+    // - short horizon starts lifting again (resume)
+    let pullback_detected = momentum_5m > 0.0 && momentum_1m < -0.0001;
+    let momentum_resumed_up = momentum_1m > 0.0;
+
+    SwingRegimeSignals {
+        momentum_1m,
+        momentum_5m,
+        trend_bias_15m,
+        pullback_detected,
+        momentum_resumed_up,
+        structure_break_long,
+    }
+}
+
+fn swing_bias(signals: &SwingRegimeSignals) -> SwingBias {
+    if signals.momentum_5m > 0.0 && signals.trend_bias_15m > 0.0 {
+        SwingBias::LongBias
+    } else if signals.momentum_5m < 0.0 && signals.trend_bias_15m < 0.0 {
+        SwingBias::ShortBias
+    } else {
+        SwingBias::NoTrade
+    }
+}
+
 async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRuntimeState>>) -> NpcCycleReport {
     let mode = state.authority.mode().await;
     let metrics = {
         let feed = state.feed.lock().await;
         let signal = state.signal.lock().await;
         signal.compute_metrics_pub(&feed)
+    };
+    let swing_signals = {
+        let feed = state.feed.lock().await;
+        compute_swing_signals(&feed, metrics.mid)
     };
 
     let (position_size, buy_power, sell_inventory, exposure_notional, total_balance_usd) = {
@@ -1290,7 +1406,10 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
     // ── Micro-account adaptive signal threshold ───────────────────────────────
     let (base_threshold, base_threshold_mode) = adaptive_signal_threshold_with_trading_mode(total_balance_usd, cfg.mode);
     // ── FLIP_HYPER: override thresholds when profile is FLIP_HYPER ────────────
-    let (effective_threshold, threshold_mode) = if cfg.behavior_profile == "FLIP_HYPER"
+    let is_swing_profile = cfg.behavior_profile.eq_ignore_ascii_case("SWING");
+    let (effective_threshold, threshold_mode) = if is_swing_profile {
+        (THRESHOLD_BASE, "swing")
+    } else if cfg.behavior_profile == "FLIP_HYPER"
         && cfg.mode == NpcTradingMode::Live
         && total_balance_usd > 0.0
         && total_balance_usd < MICRO_BALANCE_MID_USD
@@ -1307,7 +1426,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
     let is_flip_hyper = threshold_mode == "flip_hyper";
     // MICRO_ACTIVE is active whenever the balance-tier and trading mode qualify,
     // OR when FLIP_HYPER is active (inherits all micro_active behaviors).
-    let is_micro_active = threshold_mode == "micro_active" || is_flip_hyper;
+    let is_micro_active = (threshold_mode == "micro_active" || is_flip_hyper) && !is_swing_profile;
 
     let mut rt = runtime.lock().await;
     rt.cycle_seq = rt.cycle_seq.saturating_add(1);
@@ -1322,6 +1441,32 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         rt.spread_history.push_back(metrics.spread_bps);
         while rt.spread_history.len() > 128 {
             rt.spread_history.pop_front();
+        }
+    }
+
+    // ── SWING_TRADER: update open-position telemetry each cycle ──────────────
+    if is_swing_profile {
+        let btc_held = position_size > 0.0 || sell_inventory > 0.0;
+        if btc_held {
+            if rt.swing_entry_started_at.is_none() {
+                rt.swing_entry_started_at = Some(Instant::now());
+                if rt.swing_entry_price <= 0.0 {
+                    rt.swing_entry_price = metrics.mid;
+                }
+                rt.swing_peak_price = metrics.mid.max(rt.swing_entry_price);
+            } else {
+                rt.swing_peak_price = rt.swing_peak_price.max(metrics.mid);
+            }
+            if rt.swing_entry_price > 0.0 {
+                let u = (metrics.mid / rt.swing_entry_price) - 1.0;
+                rt.swing_peak_unrealized_pct = rt.swing_peak_unrealized_pct.max(u);
+            }
+        } else if rt.swing_entry_started_at.is_some() {
+            // Position flattened externally/reconciler path.
+            rt.swing_entry_price = 0.0;
+            rt.swing_entry_started_at = None;
+            rt.swing_peak_price = 0.0;
+            rt.swing_peak_unrealized_pct = 0.0;
         }
     }
 
@@ -1502,7 +1647,6 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             rt.flip_blocker.clear();
         }
     }
-
     if rt.learner_ranges.is_none() {
         rt.learner_ranges = Some(default_learner_ranges(cfg));
     }
@@ -1595,6 +1739,132 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             NpcLifecycleState::Superseded,
             "lower-ranked candidate superseded by orchestrator ranking",
         );
+    }
+
+    if is_swing_profile {
+        let bias = swing_bias(&swing_signals);
+        let btc_held = position_size > 0.0 || sell_inventory > 0.0;
+        let cooldown_remaining_ms = rt.swing_cooldown_until
+            .and_then(|until| until.checked_duration_since(Instant::now()))
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let swing_entry_ready =
+            bias == SwingBias::LongBias
+                && swing_signals.pullback_detected
+                && swing_signals.momentum_resumed_up;
+        if !btc_held {
+            if cooldown_remaining_ms > 0 {
+                let reason = format!("SWING_COOLDOWN_ACTIVE:{}ms_remaining", cooldown_remaining_ms);
+                rt.perf.entry(chosen.role).or_default().blocked += 1;
+                observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
+                return NpcCycleReport {
+                    cycle_id,
+                    last_action: "NO_ACTION".to_string(),
+                    execution_result: reason.clone(),
+                    status: "blocked".to_string(),
+                    last_agent_decision: "HOLD — swing cooldown active".to_string(),
+                    no_trade_reason: reason.clone(),
+                    pipeline_state: "Scanning".to_string(),
+                    final_decision: "BLOCKED".to_string(),
+                    balance_block_reason: String::new(),
+                    risk_block_reason: String::new(),
+                    execution_block_reason: reason,
+                    cooldown_active: true,
+                    cooldown_remaining_ms,
+                    effective_threshold: effective_cutoff,
+                    threshold_mode: threshold_mode.to_string(),
+                    raw_score: chosen.raw_score,
+                    normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
+                    top_score_penalties: chosen.score_parts.top_penalties_str(),
+                };
+            }
+            if chosen.side.eq_ignore_ascii_case("SELL") || !swing_entry_ready {
+                let reason = format!(
+                    "SWING_ENTRY_WAIT:bias={} m1m={:+.5} m5m={:+.5} m15m={:+.5} pullback={} resume={}",
+                    bias.as_str(),
+                    swing_signals.momentum_1m,
+                    swing_signals.momentum_5m,
+                    swing_signals.trend_bias_15m,
+                    swing_signals.pullback_detected,
+                    swing_signals.momentum_resumed_up
+                );
+                rt.perf.entry(chosen.role).or_default().blocked += 1;
+                observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
+                return NpcCycleReport {
+                    cycle_id,
+                    last_action: "NO_ACTION".to_string(),
+                    execution_result: "SWING_NO_ENTRY".to_string(),
+                    status: "blocked".to_string(),
+                    last_agent_decision: "HOLD — swing entry conditions not met".to_string(),
+                    no_trade_reason: reason.clone(),
+                    pipeline_state: "Scanning".to_string(),
+                    final_decision: "BLOCKED".to_string(),
+                    balance_block_reason: String::new(),
+                    risk_block_reason: String::new(),
+                    execution_block_reason: reason,
+                    cooldown_active: false,
+                    cooldown_remaining_ms: 0,
+                    effective_threshold: effective_cutoff,
+                    threshold_mode: threshold_mode.to_string(),
+                    raw_score: chosen.raw_score,
+                    normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
+                    top_score_penalties: chosen.score_parts.top_penalties_str(),
+                };
+            }
+        } else {
+            let entry_price = rt.swing_entry_price.max(f64::EPSILON);
+            let current_unrealized_pct = (metrics.mid / entry_price) - 1.0;
+            let trail_stop_hit = rt.swing_peak_price > 0.0
+                && metrics.mid <= rt.swing_peak_price * (1.0 - SWING_TRAILING_STOP_PCT);
+            let momentum_reversal = swing_signals.momentum_1m < 0.0;
+            let structure_break = swing_signals.structure_break_long;
+            let target_zone_hit =
+                current_unrealized_pct >= SWING_TARGET_MIN_PCT && current_unrealized_pct <= SWING_TARGET_MAX_PCT;
+            let exit_signal = momentum_reversal || structure_break || trail_stop_hit || current_unrealized_pct >= SWING_TARGET_MAX_PCT;
+            if chosen.side.eq_ignore_ascii_case("BUY") || !exit_signal {
+                let reason = format!(
+                    "SWING_HOLD:exit_signal={} rev={} structure_break={} trail_hit={} pnl_pct={:+.4}% target_zone_hit={}",
+                    exit_signal,
+                    momentum_reversal,
+                    structure_break,
+                    trail_stop_hit,
+                    current_unrealized_pct * 100.0,
+                    target_zone_hit
+                );
+                rt.perf.entry(chosen.role).or_default().blocked += 1;
+                observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
+                return NpcCycleReport {
+                    cycle_id,
+                    last_action: "NO_ACTION".to_string(),
+                    execution_result: "SWING_HOLD".to_string(),
+                    status: "running".to_string(),
+                    last_agent_decision: "HOLD — swing position maintained".to_string(),
+                    no_trade_reason: reason.clone(),
+                    pipeline_state: "Holding".to_string(),
+                    final_decision: "HOLD".to_string(),
+                    balance_block_reason: String::new(),
+                    risk_block_reason: String::new(),
+                    execution_block_reason: String::new(),
+                    cooldown_active: false,
+                    cooldown_remaining_ms: 0,
+                    effective_threshold: effective_cutoff,
+                    threshold_mode: threshold_mode.to_string(),
+                    raw_score: chosen.raw_score,
+                    normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
+                    top_score_penalties: chosen.score_parts.top_penalties_str(),
+                };
+            }
+            let reason = if momentum_reversal {
+                "momentum_reversal_1m"
+            } else if structure_break {
+                "structure_break"
+            } else if trail_stop_hit {
+                "trailing_stop_hit"
+            } else {
+                "target_hit"
+            };
+            rt.swing_last_exit_reason = reason.to_string();
+        }
     }
 
     if let Some(reason) = chosen.regime_block_reason.clone() {
@@ -2360,6 +2630,40 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                 qty = allocation.qty,
                 "[FLIP_HYPER] SELL submitted; awaiting fill confirmation for flip completion"
             );
+        }
+    }
+    if is_swing_profile {
+        if chosen.side.eq_ignore_ascii_case("BUY") {
+            rt.swing_entry_price = metrics.mid;
+            rt.swing_entry_started_at = Some(Instant::now());
+            rt.swing_peak_price = metrics.mid;
+            rt.swing_peak_unrealized_pct = 0.0;
+        } else if chosen.side.eq_ignore_ascii_case("SELL") {
+            let hold_secs = rt
+                .swing_entry_started_at
+                .map(|t| t.elapsed().as_secs_f64())
+                .unwrap_or(0.0);
+            rt.swing_last_hold_duration_secs = hold_secs;
+            let cooldown_secs = ((hold_secs / 4.0) as u64)
+                .clamp(SWING_COOLDOWN_MIN_SECS, SWING_COOLDOWN_MAX_SECS);
+            rt.swing_cooldown_until = Some(Instant::now() + Duration::from_secs(cooldown_secs));
+            log_npc_event(
+                &*state.store,
+                "swing_exit",
+                &format!(
+                    "cycle={} entry_price={:.2} peak_unrealized_pct={:+.4}% exit_reason={} hold_duration_secs={:.2} cooldown_secs={}",
+                    cycle_id,
+                    rt.swing_entry_price,
+                    rt.swing_peak_unrealized_pct * 100.0,
+                    rt.swing_last_exit_reason,
+                    hold_secs,
+                    cooldown_secs
+                ),
+            );
+            rt.swing_entry_price = 0.0;
+            rt.swing_entry_started_at = None;
+            rt.swing_peak_price = 0.0;
+            rt.swing_peak_unrealized_pct = 0.0;
         }
     }
 
@@ -4714,6 +5018,7 @@ mod diagnostic_tests {
             THRESHOLD_FLIP_HYPER_SMALL, report.effective_threshold
         );
     }
+
 }
 
 // ── MICRO_ACTIVE behavior tests ───────────────────────────────────────────────
