@@ -1671,7 +1671,7 @@ fn update_contract_executor(
             };
             let entry_fee = notional * rt.contract_fee_rate.max(0.0);
             if !entry_fee.is_finite() {
-                rt.contract_last_no_open_reason = "ZERO_NOTIONAL".to_string();
+                rt.contract_last_no_open_reason = "INVALID_ENTRY_FEE".to_string();
                 return;
             }
             rt.contract_realized_pnl_session -= entry_fee;
