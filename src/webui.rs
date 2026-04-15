@@ -714,7 +714,7 @@ async fn agent_status_json(state: &AppState) -> String {
     let exec_block = snap.execution_block_reason.replace('"', "\\\"");
     let threshold_mode = snap.threshold_mode.replace('"', "\\\"");
     let body = format!(
-        r#"{{"mode":"{mode_str}","state":"{state_label}","agent_state":"{status_str}","last_action":"{last_action}","last_reason":"{last_reason}","last_agent_decision":"{last_decision}","last_no_trade_reason":"{no_trade_reason}","pipeline_state":"{pipeline}","final_decision":"{final_decision}","balance_block_reason":"{balance_block}","risk_block_reason":"{risk_block}","execution_block_reason":"{exec_block}","current_equity":{current_equity},"peak_equity":{peak_equity},"drawdown_pct":{drawdown_pct},"drawdown_limit":{drawdown_limit},"cycle_count":{cycle_count},"running":{running},"cooldown_active":{cooldown_active},"cooldown_remaining_ms":{cooldown_remaining_ms},"effective_threshold":{effective_threshold},"threshold_mode":"{threshold_mode}","compound_position_size_usd":{compound_pos_usd},"compound_position_size_btc":{compound_pos_btc},"compound_last_trade_pnl":{compound_last_pnl},"compound_session_pnl":{compound_sess_pnl},"compound_peak_balance":{compound_peak_bal},"compound_current_balance":{compound_cur_bal},"compound_consecutive_losses":{compound_consec},"compound_size_scalar":{compound_scalar},"compound_loss_pause_active":{compound_paused}}"#,
+        r#"{{"mode":"{mode_str}","state":"{state_label}","agent_state":"{status_str}","last_action":"{last_action}","last_reason":"{last_reason}","last_agent_decision":"{last_decision}","last_no_trade_reason":"{no_trade_reason}","pipeline_state":"{pipeline}","final_decision":"{final_decision}","balance_block_reason":"{balance_block}","risk_block_reason":"{risk_block}","execution_block_reason":"{exec_block}","current_equity":{current_equity},"peak_equity":{peak_equity},"drawdown_pct":{drawdown_pct},"drawdown_limit":{drawdown_limit},"cycle_count":{cycle_count},"running":{running},"cooldown_active":{cooldown_active},"cooldown_remaining_ms":{cooldown_remaining_ms},"effective_threshold":{effective_threshold},"threshold_mode":"{threshold_mode}","compound_position_size_usd":{compound_pos_usd},"compound_position_size_btc":{compound_pos_btc},"compound_last_trade_pnl":{compound_last_pnl},"compound_session_pnl":{compound_sess_pnl},"compound_peak_balance":{compound_peak_bal},"compound_current_balance":{compound_cur_bal},"compound_consecutive_losses":{compound_consec},"compound_size_scalar":{compound_scalar},"compound_loss_pause_active":{compound_paused},"flip_cycle_phase":"{flip_cycle_phase}","flip_session_pnl":{flip_session_pnl},"flip_rotation_count":{flip_rotation_count},"flip_last_entry_price":{flip_last_entry_price},"flip_last_exit_price":{flip_last_exit_price},"flip_last_pnl_usd":{flip_last_pnl_usd},"flip_last_pnl_pct":{flip_last_pnl_pct},"flip_min_profit_floor":{flip_min_profit_floor},"flip_blocker":"{flip_blocker}"}}"#,
         current_equity  = snap.current_equity,
         peak_equity     = snap.peak_equity,
         drawdown_pct    = snap.drawdown_pct,
@@ -733,6 +733,15 @@ async fn agent_status_json(state: &AppState) -> String {
         compound_consec    = snap.compound_consecutive_losses,
         compound_scalar    = snap.compound_size_scalar,
         compound_paused    = snap.compound_loss_pause_active,
+        flip_cycle_phase      = snap.flip_cycle_phase.replace('"', "\\\""),
+        flip_session_pnl      = snap.flip_session_pnl,
+        flip_rotation_count   = snap.flip_rotation_count,
+        flip_last_entry_price = snap.flip_last_entry_price,
+        flip_last_exit_price  = snap.flip_last_exit_price,
+        flip_last_pnl_usd     = snap.flip_last_pnl_usd,
+        flip_last_pnl_pct     = snap.flip_last_pnl_pct,
+        flip_min_profit_floor = snap.flip_min_profit_floor,
+        flip_blocker          = snap.flip_blocker.replace('"', "\\\""),
     );
     json_resp(&body)
 }
@@ -1109,7 +1118,12 @@ async fn page_events(state: &AppState, query: &str) -> String {
     let inventory_value_usd = sell_inventory * latest_mid;
     // Profile banner — shown prominently on LIVE page.
     let profile_banner = {
-        let (extra_style, text) = if current_profile == RuntimeProfile::MicroActive {
+        let (extra_style, text) = if current_profile == RuntimeProfile::FlipHyper {
+            (
+                "background:rgba(240,185,11,0.10);border-color:#f0b90b;color:#f0b90b;",
+                format!("{}", esc(current_profile.label())),
+            )
+        } else if current_profile == RuntimeProfile::MicroActive {
             (
                 "background:rgba(82,255,168,0.10);border-color:#52ffa8;color:#52ffa8;",
                 format!("{}", esc(current_profile.label())),
@@ -1306,7 +1320,16 @@ async fn page_events(state: &AppState, query: &str) -> String {
         } else {
             "inactive".to_string()
         };
-        let micro_mode_badge = if npc_loop.threshold_mode == "micro_active" {
+        let micro_mode_badge = if npc_loop.threshold_mode == "flip_hyper" {
+            format!(
+                "<div style='grid-column:1/-1;padding:4px 8px;background:rgba(240,185,11,.12);\
+                 border:1px solid rgba(240,185,11,.4);border-radius:8px;color:#f0b90b;font-weight:700'>\
+                 🔄 FLIP_HYPER (live) — threshold {:.2}, capital-rotation mode ON — \
+                 phase: {}</div>",
+                npc_loop.effective_threshold,
+                esc(&npc_loop.flip_cycle_phase)
+            )
+        } else if npc_loop.threshold_mode == "micro_active" {
             format!(
                 "<div style='grid-column:1/-1;padding:4px 8px;background:rgba(34,197,94,.12);\
                  border:1px solid rgba(34,197,94,.4);border-radius:8px;color:#22c55e;font-weight:700'>\
@@ -1421,6 +1444,97 @@ async fn page_events(state: &AppState, query: &str) -> String {
         String::new()
     };
 
+    // ── FLIP_HYPER capital rotation panel ─────────────────────────────────────
+    let flip_hyper_panel = if npc_loop.threshold_mode == "flip_hyper" {
+        let phase_color = match npc_loop.flip_cycle_phase.as_str() {
+            "SEEK_ENTRY"        => "#22c55e",
+            "ENTERING"         => "#f0b90b",
+            "HOLDING_POSITION" => "#e2e8f0",
+            "SEEK_EXIT"        => "#f0b90b",
+            "EXITING"          => "#ef4444",
+            "REBUY_READY"      => "#22c55e",
+            _                  => "#82909f",
+        };
+        let sess_pnl_color = if npc_loop.flip_session_pnl > 0.0 { "#22c55e" }
+                             else if npc_loop.flip_session_pnl < 0.0 { "#ef4444" }
+                             else { "#82909f" };
+        let last_pnl_color = if npc_loop.flip_last_pnl_usd > 0.0 { "#22c55e" }
+                             else if npc_loop.flip_last_pnl_usd < 0.0 { "#ef4444" }
+                             else { "#82909f" };
+        let blocker_section = if !npc_loop.flip_blocker.is_empty() {
+            format!(
+                "<div style='grid-column:1/-1;margin-top:2px;padding:4px 6px;\
+                 background:rgba(239,68,68,.10);border:1px solid rgba(239,68,68,.35);\
+                 border-radius:6px;font-size:10px;color:#ef4444'>\
+                 ⚠ {}</div>",
+                esc(&npc_loop.flip_blocker)
+            )
+        } else {
+            String::new()
+        };
+        let last_flip_section = if npc_loop.flip_last_exit_price > 0.0 {
+            let last_flip_entry_price = if npc_loop.flip_last_entry_price > 0.0 {
+                format!("{:.2}", npc_loop.flip_last_entry_price)
+            } else {
+                "—".to_string()
+            };
+            format!(
+                "<div style='grid-column:1/-1;margin-top:2px;padding:4px 6px;\
+                 background:rgba(0,0,0,.15);border-radius:6px;font-size:10px'>\
+                 <span class='dim'>Last flip: </span>\
+                 <span style='color:#94a3b8'>entry {} → exit {:.2}</span>\
+                 <span class='dim'> | </span>\
+                 <span style='color:{last_pnl_color}'>{:+.4} USD ({:+.2}%)</span></div>",
+                last_flip_entry_price,
+                npc_loop.flip_last_exit_price,
+                npc_loop.flip_last_pnl_usd,
+                npc_loop.flip_last_pnl_pct,
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            "<div style='margin-top:8px;padding:6px 8px;background:rgba(240,185,11,.06);\
+             border:1px solid rgba(240,185,11,.25);border-radius:8px;font-size:11px'>\
+             <div style='font-weight:700;color:#f0b90b;margin-bottom:4px'>🔄 FLIP_HYPER — Capital Rotation</div>\
+             <div style='display:grid;grid-template-columns:repeat(2,1fr);gap:4px'>\
+               <div><span class='dim'>Mode: </span>\
+                 <span style='color:#f0b90b;font-weight:700'>FLIP_HYPER</span></div>\
+               <div><span class='dim'>Phase: </span>\
+                 <span style='color:{phase_color};font-weight:700'>{flip_phase}</span></div>\
+               <div><span class='dim'>Session PnL: </span>\
+                 <span style='color:{sess_pnl_color}'>{sess_pnl:+.4} USD</span></div>\
+               <div><span class='dim'>Flips today: </span>\
+                 <span style='color:#e2e8f0'>{rotation_count}</span></div>\
+               <div><span class='dim'>Free BTC: </span>\
+                 <span style='color:#e2e8f0'>{free_btc:.8}</span></div>\
+               <div><span class='dim'>Free USDT: </span>\
+                 <span style='color:#e2e8f0'>{free_usdt:.2}</span></div>\
+               <div><span class='dim'>Min profit floor: </span>\
+                 <span style='color:#94a3b8'>${min_floor:.2}</span></div>\
+               <div><span class='dim'>Entry price: </span>\
+                 <span style='color:{entry_color}'>{entry_price}</span></div>\
+               {last_flip_section}\
+               {blocker_section}\
+             </div>\
+             </div>",
+            flip_phase     = esc(&npc_loop.flip_cycle_phase),
+            sess_pnl       = npc_loop.flip_session_pnl,
+            rotation_count = npc_loop.flip_rotation_count,
+            free_btc       = sell_inventory,
+            free_usdt      = buy_power,
+            min_floor      = npc_loop.flip_min_profit_floor,
+            entry_color    = if npc_loop.flip_last_entry_price > 0.0 { "#f0b90b" } else { "#82909f" },
+            entry_price    = if npc_loop.flip_last_entry_price > 0.0 {
+                format!("{:.2}", npc_loop.flip_last_entry_price)
+            } else {
+                "—".to_string()
+            },
+        )
+    } else {
+        String::new()
+    };
+
     let agent_control_card = format!(
         "<div class='signal-box' style='margin-bottom:12px;{agent_card_glow}'>\
            <div style='display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px'>\
@@ -1438,6 +1552,7 @@ async fn page_events(state: &AppState, query: &str) -> String {
            {sell_blocked_banner}\
            {buy_blocked_banner}\
            {compound_panel}\
+           {flip_hyper_panel}\
            <details style='margin-top:6px'><summary class='dim' style='cursor:pointer;font-size:11px'>Decision transparency</summary>{decision_transparency}</details>\
            <div style='display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:10px'>\
              <form method='post' action='/agent/mode'><input type='hidden' name='mode' value='off'>\
@@ -1912,7 +2027,9 @@ async fn page_events(state: &AppState, query: &str) -> String {
                {position_row}\
              </div>",
             bmode       = esc(&phase1_status.behavior_mode),
-            bmode_color = if current_profile == RuntimeProfile::MicroActive { "#52ffa8" } else { "#93a2b3" },
+            bmode_color = if current_profile == RuntimeProfile::FlipHyper { "#f0b90b" }
+                         else if current_profile == RuntimeProfile::MicroActive { "#52ffa8" }
+                         else { "#93a2b3" },
             tw          = phase1_status.effective_trigger_window_secs,
             drift       = phase1_status.effective_min_trend_drift * 100.0,
         )
@@ -2138,6 +2255,7 @@ async fn page_assistant(state: &AppState, query: &str) -> String {
         ("ACTIVE",       "Active — balanced defaults"),
         ("MICRO_TEST",   "Micro-Test — faster decisions for small balances"),
         ("MICRO_ACTIVE", "⚡ Micro Active — high-frequency mode for balances under $100"),
+        ("FLIP_HYPER",   "🔄 Flip Hyper — rapid capital-rotation mode for sub-$100 live accounts"),
     ]
     .iter()
     .map(|(val, label)| {
