@@ -2470,15 +2470,20 @@ fn allocate_capital(
     // The compound_size_scalar (updated by loss control and profit locking) is
     // applied on top.  Increase only when the last trade was profitable.
     let mut qty = if is_micro_active && total_balance_usd > 0.0 && mid > 0.0 {
-        let base_notional = (total_balance_usd * COMPOUND_BASE_EQUITY_PCT)
-            .clamp(COMPOUND_MIN_NOTIONAL_USD, total_balance_usd * COMPOUND_MAX_EQUITY_PCT);
-        // Apply loss-based scalar (reduced after consecutive losses).
-        let size_scalar = rt.compound_size_scalar.clamp(COMPOUND_MIN_SIZE_SCALAR, 1.0);
-        // On a win, allow a small upward bump (capped at 10%) to grow into profitable streaks.
-        // On a loss or flat, no additional adjustment — scalar stays at current level.
-        let momentum_adjust = if rt.compound_last_trade_was_profitable { 1.10 } else { 1.0 };
-        let adjusted_notional = base_notional * size_scalar * momentum_adjust * dd_factor;
-        adjusted_notional / mid
+        let max_notional = total_balance_usd * COMPOUND_MAX_EQUITY_PCT;
+        if max_notional < COMPOUND_MIN_NOTIONAL_USD {
+            0.0
+        } else {
+            let base_notional = (total_balance_usd * COMPOUND_BASE_EQUITY_PCT)
+                .clamp(COMPOUND_MIN_NOTIONAL_USD, max_notional);
+            // Apply loss-based scalar (reduced after consecutive losses).
+            let size_scalar = rt.compound_size_scalar.clamp(COMPOUND_MIN_SIZE_SCALAR, 1.0);
+            // On a win, allow a small upward bump (capped at 10%) to grow into profitable streaks.
+            // On a loss or flat, no additional adjustment — scalar stays at current level.
+            let momentum_adjust = if rt.compound_last_trade_was_profitable { 1.10 } else { 1.0 };
+            let adjusted_notional = base_notional * size_scalar * momentum_adjust * dd_factor;
+            adjusted_notional / mid
+        }
     } else {
         let size_multiplier = quality * (1.0 + recent_performance).clamp(0.3, 1.4) * (1.0 - symbol_concentration).clamp(0.1, 1.0) * dd_factor;
         cfg.trade_size * agent_budget * size_multiplier
