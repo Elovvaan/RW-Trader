@@ -1516,8 +1516,8 @@ async fn page_events(state: &AppState, query: &str) -> String {
             flip_phase     = esc(&npc_loop.flip_cycle_phase),
             sess_pnl       = npc_loop.flip_session_pnl,
             rotation_count = npc_loop.flip_rotation_count,
-            free_btc       = npc_loop.compound_position_size_btc,
-            free_usdt      = npc_loop.compound_current_balance,
+            free_btc       = sell_inventory,
+            free_usdt      = buy_power,
             min_floor      = npc_loop.flip_min_profit_floor,
             entry_color    = if npc_loop.flip_last_entry_price > 0.0 { "#f0b90b" } else { "#82909f" },
             entry_price    = if npc_loop.flip_last_entry_price > 0.0 {
