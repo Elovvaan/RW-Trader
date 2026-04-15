@@ -1524,7 +1524,9 @@ async fn page_events(state: &AppState, query: &str) -> String {
         match fill_info {
             Some(fi) => {
                 let is_buy = fi.side.eq_ignore_ascii_case("BUY");
-                // Live PnL: unrealized gain/loss from fill price to current mid.
+                // Live PnL: unrealized mark-to-market from fill price to current mid.
+                // Falls back to 0.0 when mid is unavailable (no market tick yet) or
+                // qty is zero — both are legitimate "no data" states, not errors.
                 let live_pnl = if latest_mid > 0.0 && fi.qty > 0.0 {
                     if is_buy { fi.qty * (latest_mid - fi.price) }
                     else      { fi.qty * (fi.price - latest_mid) }

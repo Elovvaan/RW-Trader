@@ -2155,12 +2155,15 @@ fn allocate_capital(
     // ── Minimum notional floor ($5) ───────────────────────────────────────────
     // Ensure fills are visible: if the computed qty would produce a notional value
     // below $5, bump it up so the fill registers on the exchange. The bump is
-    // capped by max_qty so it never exceeds the available balance or inventory.
+    // capped by max_qty (already guaranteed ≥ 0 from the BUY/SELL cap above) so
+    // it never exceeds the available balance or inventory.
     const MIN_NOTIONAL_USD: f64 = 5.0;
     if mid > 0.0 {
         let min_qty_for_notional = MIN_NOTIONAL_USD / mid;
         if qty < min_qty_for_notional {
-            qty = min_qty_for_notional.min(max_qty.max(0.0));
+            // max_qty is non-negative by construction (sell_inventory.max(0) or
+            // buy_power/mid with mid > 0), so no extra clamp is needed.
+            qty = min_qty_for_notional.min(max_qty);
         }
     }
 
