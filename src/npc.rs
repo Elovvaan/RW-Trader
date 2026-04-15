@@ -871,9 +871,9 @@ const THRESHOLD_BASE: f64           = 0.18;   // signal threshold for normal acc
 
 // ── MICRO_ACTIVE live-mode thresholds (lower than paper/sim micro_aggressive) ──
 /// Signal threshold for live micro_active < $50 (lower than micro_aggressive 0.11).
-const THRESHOLD_MICRO_ACTIVE_SMALL: f64 = 0.08;
+const THRESHOLD_MICRO_ACTIVE_SMALL: f64 = 0.065;
 /// Signal threshold for live micro_active $50–$99.99 (lower than micro_aggressive 0.14).
-const THRESHOLD_MICRO_ACTIVE_MID: f64   = 0.11;
+const THRESHOLD_MICRO_ACTIVE_MID: f64   = 0.09;
 
 /// Penalty dampen factor applied to spread_cost / volatility_penalty / slippage_risk
 /// in MICRO_ACTIVE mode. Halves those components so the tiny edge signal is not
@@ -910,9 +910,9 @@ fn adaptive_signal_threshold(total_balance_usd: f64) -> (f64, &'static str) {
 ///
 /// In `Live` mode, accounts below $100 activate **MICRO_ACTIVE** with even lower
 /// thresholds and dedicated scoring-penalty dampening:
-///   live balance < $50        → 0.08  "micro_active"
-///   live balance $50–$99.99   → 0.11  "micro_active"
-///   live balance ≥ $100       → 0.18  "normal"
+///   live balance < $50        → 0.065  "micro_active"
+///   live balance $50–$99.99   → 0.09   "micro_active"
+///   live balance ≥ $100       → 0.18   "normal"
 ///
 /// In paper/simulation mode the ordinary `adaptive_signal_threshold` tiers apply.
 fn adaptive_signal_threshold_with_trading_mode(
@@ -1868,7 +1868,12 @@ fn score_candidate(
     position_size: f64,
     is_micro_active: bool,
 ) -> ScoreBreakdown {
-    let momentum = metrics.momentum_5s;
+    // In MICRO_ACTIVE mode, boost short-term momentum sensitivity (5s) by 1.5×
+    // to amplify edge signals on small live accounts where momentum is the primary
+    // entry driver. This only scales the momentum input to edge_bias — it does not
+    // affect safety guards or spread/slippage checks.
+    let momentum_boost = if is_micro_active { 1.5 } else { 1.0 };
+    let momentum = metrics.momentum_5s * momentum_boost;
     let edge_bias = match role {
         NpcRole::Scout => momentum.abs() * 1000.0,
         NpcRole::DipBuyer => dip.map(|v| (-v * 1400.0).max(0.0)).unwrap_or(0.0),
@@ -1981,13 +1986,13 @@ fn evaluate_guards(
     }
 
     // ── Per-role cooldown ────────────────────────────────────────────────────
-    // MICRO_ACTIVE (live < $50): ultra-short 150ms cooldown for faster re-entry.
+    // MICRO_ACTIVE (live < $50): ultra-short 100ms cooldown for faster re-entry.
     // Small accounts (0 < balance < $100): reduced cooldown (300ms).
     // Normal accounts: max(cycle_interval, 250ms).
     // Allow immediate execution when no other guards fired — the cooldown only
     // adds friction when something else is already blocking the cycle.
     let effective_cooldown = if is_micro_active && total_balance_usd > 0.0 && total_balance_usd < MICRO_BALANCE_USD {
-        Duration::from_millis(150)
+        Duration::from_millis(100)
     } else if total_balance_usd > 0.0 && total_balance_usd < 100.0 {
         Duration::from_millis(300)
     } else {
@@ -2140,6 +2145,33 @@ fn allocate_capital(
         return AllocationDecision {
             qty: 0.0,
             reason: "ALLOCATION_BELOW_MIN_SIZE".to_string(),
+            quality,
+            recent_performance,
+            symbol_concentration,
+            drawdown,
+        };
+    }
+
+    // ── Minimum notional floor ($5) ───────────────────────────────────────────
+    // Ensure fills are visible: if the computed qty would produce a notional value
+    // below $5, bump it up so the fill registers on the exchange. The bump is
+    // capped by max_qty (already guaranteed ≥ 0 from the BUY/SELL cap above) so
+    // it never exceeds the available balance or inventory.
+    const MIN_NOTIONAL_USD: f64 = 5.0;
+    if mid > 0.0 {
+        let min_qty_for_notional = MIN_NOTIONAL_USD / mid;
+        if qty < min_qty_for_notional {
+            // max_qty is non-negative by construction (sell_inventory.max(0) or
+            // buy_power/mid with mid > 0), so no extra clamp is needed.
+            qty = min_qty_for_notional.min(max_qty);
+        }
+    }
+
+    // Re-check after the notional floor bump in case max_qty was too small.
+    if qty < 0.000_000_01 {
+        return AllocationDecision {
+            qty: 0.0,
+            reason: "ALLOCATION_BELOW_MIN_NOTIONAL".to_string(),
             quality,
             recent_performance,
             symbol_concentration,
@@ -3968,7 +4000,7 @@ mod micro_active_tests {
         rt.last_action_at.insert(NpcRole::Scout, std::time::Instant::now() - Duration::from_millis(200));
         let metrics = typical_metrics(0.01, 1.0, 10);
 
-        // MICRO_ACTIVE (< $50, is_micro_active=true): 150ms cooldown → expired after 200ms.
+        // MICRO_ACTIVE (< $50, is_micro_active=true): 100ms cooldown → expired after 200ms.
         let (_, cooldown_micro_active, _) = evaluate_guards(
             &cfg, &rt, NpcRole::Scout, "BUY",
             0.0, &metrics, 0.5,
