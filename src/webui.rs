@@ -1473,14 +1473,19 @@ async fn page_events(state: &AppState, query: &str) -> String {
             String::new()
         };
         let last_flip_section = if npc_loop.flip_last_exit_price > 0.0 {
+            let last_flip_entry_price = if npc_loop.flip_last_entry_price > 0.0 {
+                format!("{:.2}", npc_loop.flip_last_entry_price)
+            } else {
+                "—".to_string()
+            };
             format!(
                 "<div style='grid-column:1/-1;margin-top:2px;padding:4px 6px;\
                  background:rgba(0,0,0,.15);border-radius:6px;font-size:10px'>\
                  <span class='dim'>Last flip: </span>\
-                 <span style='color:#94a3b8'>entry {:.2} → exit {:.2}</span>\
+                 <span style='color:#94a3b8'>entry {} → exit {:.2}</span>\
                  <span class='dim'> | </span>\
                  <span style='color:{last_pnl_color}'>{:+.4} USD ({:+.2}%)</span></div>",
-                npc_loop.flip_last_entry_price,
+                last_flip_entry_price,
                 npc_loop.flip_last_exit_price,
                 npc_loop.flip_last_pnl_usd,
                 npc_loop.flip_last_pnl_pct,
