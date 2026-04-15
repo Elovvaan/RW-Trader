@@ -1366,34 +1366,50 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                 || rt.flip_cycle_phase == FlipCyclePhase::HoldingPosition
                 || rt.flip_cycle_phase == FlipCyclePhase::Entering)
         {
-            // Position has been sold — record completed flip.
+            // Position has been sold — record completed flip once.
             let exit_price = metrics.mid;
             let qty = rt.flip_last_entry_qty.max(0.0);
             if qty > 0.0 {
-                let gross_pnl = qty * (exit_price - rt.flip_last_entry_price);
-                let est_fees = qty * exit_price * 0.001; // ~0.1% fee estimate
-                let realized_pnl_usd = gross_pnl - est_fees;
-                let realized_pnl_pct =
-                    (exit_price / rt.flip_last_entry_price - 1.0) * 100.0;
-                info!(
-                    entry = rt.flip_last_entry_price,
-                    exit = exit_price,
-                    qty,
-                    pnl_usd = realized_pnl_usd,
-                    "[FLIP_HYPER] Flip reconciled via inventory sync: \
-                     entry={:.2} exit={:.2} qty={:.8} pnl={:+.4}",
-                    rt.flip_last_entry_price, exit_price, qty, realized_pnl_usd
-                );
-                rt.flip_last_completed = Some(CompletedFlip {
-                    entry_price: rt.flip_last_entry_price,
-                    exit_price,
-                    qty,
-                    realized_pnl_usd,
-                    realized_pnl_pct,
-                    completed_at: Instant::now(),
+                let already_recorded = rt.flip_last_completed.as_ref().map_or(false, |completed| {
+                    const FLIP_MATCH_EPSILON: f64 = 1e-9;
+                    (completed.entry_price - rt.flip_last_entry_price).abs() <= FLIP_MATCH_EPSILON
+                        && (completed.qty - qty).abs() <= FLIP_MATCH_EPSILON
                 });
-                rt.flip_session_pnl += realized_pnl_usd;
-                rt.flip_rotation_count = rt.flip_rotation_count.saturating_add(1);
+
+                if already_recorded {
+                    info!(
+                        entry = rt.flip_last_entry_price,
+                        exit = exit_price,
+                        qty,
+                        "[FLIP_HYPER] Inventory sync detected already-recorded flip; \
+                         skipping duplicate completion accounting"
+                    );
+                } else {
+                    let gross_pnl = qty * (exit_price - rt.flip_last_entry_price);
+                    let est_fees = qty * exit_price * 0.001; // ~0.1% fee estimate
+                    let realized_pnl_usd = gross_pnl - est_fees;
+                    let realized_pnl_pct =
+                        (exit_price / rt.flip_last_entry_price - 1.0) * 100.0;
+                    info!(
+                        entry = rt.flip_last_entry_price,
+                        exit = exit_price,
+                        qty,
+                        pnl_usd = realized_pnl_usd,
+                        "[FLIP_HYPER] Flip reconciled via inventory sync: \
+                         entry={:.2} exit={:.2} qty={:.8} pnl={:+.4}",
+                        rt.flip_last_entry_price, exit_price, qty, realized_pnl_usd
+                    );
+                    rt.flip_last_completed = Some(CompletedFlip {
+                        entry_price: rt.flip_last_entry_price,
+                        exit_price,
+                        qty,
+                        realized_pnl_usd,
+                        realized_pnl_pct,
+                        completed_at: Instant::now(),
+                    });
+                    rt.flip_session_pnl += realized_pnl_usd;
+                    rt.flip_rotation_count = rt.flip_rotation_count.saturating_add(1);
+                }
             }
             rt.flip_last_entry_price = 0.0;
             rt.flip_last_entry_qty   = 0.0;
