@@ -417,7 +417,7 @@ pub enum FlipCyclePhase {
     /// Sell order submitted; waiting for fill confirmation.
     Exiting,
     /// Sell confirmed; brief pause before next buy cycle.
-    RebutyReady,
+    RebuyReady,
 }
 
 impl FlipCyclePhase {
@@ -428,7 +428,7 @@ impl FlipCyclePhase {
             Self::HoldingPosition => "HOLDING_POSITION",
             Self::SeekExit        => "SEEK_EXIT",
             Self::Exiting         => "EXITING",
-            Self::RebutyReady     => "REBUY_READY",
+            Self::RebuyReady     => "REBUY_READY",
         }
     }
 }
@@ -1397,16 +1397,16 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             }
             rt.flip_last_entry_price = 0.0;
             rt.flip_last_entry_qty   = 0.0;
-            rt.flip_cycle_phase      = FlipCyclePhase::RebutyReady;
+            rt.flip_cycle_phase      = FlipCyclePhase::RebuyReady;
             rt.flip_last_active      = Some(Instant::now());
         }
         // REBUY_READY immediately transitions to SEEK_ENTRY
-        if rt.flip_cycle_phase == FlipCyclePhase::RebutyReady {
+        if rt.flip_cycle_phase == FlipCyclePhase::RebuyReady {
             rt.flip_cycle_phase = FlipCyclePhase::SeekEntry;
         }
         // If BTC is held but phase is SeekEntry, sync to HOLD state
         if btc_held && (rt.flip_cycle_phase == FlipCyclePhase::SeekEntry
-            || rt.flip_cycle_phase == FlipCyclePhase::RebutyReady)
+            || rt.flip_cycle_phase == FlipCyclePhase::RebuyReady)
         {
             rt.flip_cycle_phase = FlipCyclePhase::HoldingPosition;
             if rt.flip_last_entry_price == 0.0 {
@@ -5029,7 +5029,7 @@ mod flip_hyper_tests {
         assert_eq!(FlipCyclePhase::HoldingPosition.as_str(), "HOLDING_POSITION");
         assert_eq!(FlipCyclePhase::SeekExit.as_str(),        "SEEK_EXIT");
         assert_eq!(FlipCyclePhase::Exiting.as_str(),         "EXITING");
-        assert_eq!(FlipCyclePhase::RebutyReady.as_str(),     "REBUY_READY");
+        assert_eq!(FlipCyclePhase::RebuyReady.as_str(),     "REBUY_READY");
     }
 
     // ── Test 3: realized PnL fields after completed exit ─────────────────────
@@ -5176,18 +5176,18 @@ mod flip_hyper_tests {
         rt.flip_cycle_phase = FlipCyclePhase::Exiting;
 
         // After SELL confirmed and inventory is zero, flip state should
-        // eventually reach RebutyReady then SeekEntry (tested via flip_cycle_phase field).
-        // The state machine transition to SeekEntry from RebutyReady is immediate.
+        // eventually reach RebuyReady then SeekEntry (tested via flip_cycle_phase field).
+        // The state machine transition to SeekEntry from RebuyReady is immediate.
         assert_eq!(rt.flip_cycle_phase, FlipCyclePhase::Exiting,
             "After SELL submission, phase must be EXITING");
 
         // Simulate inventory cleared (as run_cycle detects on next cycle)
-        rt.flip_cycle_phase      = FlipCyclePhase::RebutyReady;
+        rt.flip_cycle_phase      = FlipCyclePhase::RebuyReady;
         rt.flip_last_entry_price = 0.0;
         rt.flip_last_entry_qty   = 0.0;
 
         // REBUY_READY immediately transitions to SEEK_ENTRY (logic in run_cycle)
-        if rt.flip_cycle_phase == FlipCyclePhase::RebutyReady {
+        if rt.flip_cycle_phase == FlipCyclePhase::RebuyReady {
             rt.flip_cycle_phase = FlipCyclePhase::SeekEntry;
         }
         assert_eq!(rt.flip_cycle_phase, FlipCyclePhase::SeekEntry,
