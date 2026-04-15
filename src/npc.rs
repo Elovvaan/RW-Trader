@@ -1636,11 +1636,11 @@ fn update_contract_executor(
             SwingBias::NoTrade => None,
         };
         if let Some(side) = side {
-            if balance_usd <= 0.0 {
+            if !balance_usd.is_finite() || balance_usd <= 0.0 {
                 rt.contract_last_no_open_reason = "ZERO_CAPITAL".to_string();
                 return;
             }
-            if notional <= 0.0 {
+            if !notional.is_finite() || notional <= 0.0 {
                 rt.contract_last_no_open_reason = "ZERO_NOTIONAL".to_string();
                 return;
             }
@@ -1650,7 +1650,7 @@ fn update_contract_executor(
             }
             let entry = entry_price;
             let qty_base = if entry > 0.0 { notional / entry } else { 0.0 };
-            if qty_base <= 0.0 {
+            if !qty_base.is_finite() || qty_base <= 0.0 {
                 rt.contract_last_no_open_reason = "ZERO_QTY".to_string();
                 return;
             }
@@ -1670,6 +1670,10 @@ fn update_contract_executor(
                 ContractSide::Short => entry * (1.0 + (vol * CONTRACT_TRAIL_VOL_MULT).max(0.002)),
             };
             let entry_fee = notional * rt.contract_fee_rate.max(0.0);
+            if !entry_fee.is_finite() {
+                rt.contract_last_no_open_reason = "ZERO_NOTIONAL".to_string();
+                return;
+            }
             rt.contract_realized_pnl_session -= entry_fee;
             rt.contract_position = Some(OpenContractPosition {
                 side,
@@ -6016,6 +6020,24 @@ mod flip_hyper_tests {
         assert!(rt.contract_position.is_none(), "must not create synthetic qty==0 position");
         assert_eq!(rt.contract_last_no_open_reason, "ZERO_QTY");
         assert!(rt.contract_last_trade.is_none(), "no trade telemetry on non-trade");
+    }
+
+    #[test]
+    fn non_finite_notional_does_not_open_contract_position() {
+        let mut rt = NpcRuntimeState::default();
+        rt.contract_leverage = f64::NAN;
+        update_contract_executor(&mut rt, SwingBias::LongBias, 100.0, 100.0, 0.01, 100.0);
+        assert!(rt.contract_position.is_none(), "must not open when notional is non-finite");
+        assert_eq!(rt.contract_last_no_open_reason, "ZERO_NOTIONAL");
+    }
+
+    #[test]
+    fn non_finite_qty_does_not_create_position_state() {
+        let mut rt = NpcRuntimeState::default();
+        let tiny_price = f64::from_bits(1);
+        update_contract_executor(&mut rt, SwingBias::LongBias, tiny_price, tiny_price, 0.01, 100.0);
+        assert!(rt.contract_position.is_none(), "must not create position with non-finite qty");
+        assert_eq!(rt.contract_last_no_open_reason, "ZERO_QTY");
     }
 
     #[test]
