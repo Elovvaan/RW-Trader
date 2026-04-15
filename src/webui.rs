@@ -714,7 +714,7 @@ async fn agent_status_json(state: &AppState) -> String {
     let exec_block = snap.execution_block_reason.replace('"', "\\\"");
     let threshold_mode = snap.threshold_mode.replace('"', "\\\"");
     let body = format!(
-        r#"{{"mode":"{mode_str}","state":"{state_label}","agent_state":"{status_str}","last_action":"{last_action}","last_reason":"{last_reason}","last_agent_decision":"{last_decision}","last_no_trade_reason":"{no_trade_reason}","pipeline_state":"{pipeline}","final_decision":"{final_decision}","balance_block_reason":"{balance_block}","risk_block_reason":"{risk_block}","execution_block_reason":"{exec_block}","current_equity":{current_equity},"peak_equity":{peak_equity},"drawdown_pct":{drawdown_pct},"drawdown_limit":{drawdown_limit},"cycle_count":{cycle_count},"running":{running},"cooldown_active":{cooldown_active},"cooldown_remaining_ms":{cooldown_remaining_ms},"effective_threshold":{effective_threshold},"threshold_mode":"{threshold_mode}","compound_position_size_usd":{compound_pos_usd},"compound_position_size_btc":{compound_pos_btc},"compound_last_trade_pnl":{compound_last_pnl},"compound_session_pnl":{compound_sess_pnl},"compound_peak_balance":{compound_peak_bal},"compound_current_balance":{compound_cur_bal},"compound_consecutive_losses":{compound_consec},"compound_size_scalar":{compound_scalar},"compound_loss_pause_active":{compound_paused},"flip_cycle_phase":"{flip_cycle_phase}","flip_session_pnl":{flip_session_pnl},"flip_rotation_count":{flip_rotation_count},"flip_last_entry_price":{flip_last_entry_price},"flip_last_exit_price":{flip_last_exit_price},"flip_last_pnl_usd":{flip_last_pnl_usd},"flip_last_pnl_pct":{flip_last_pnl_pct},"flip_min_profit_floor":{flip_min_profit_floor},"flip_blocker":"{flip_blocker}"}}"#,
+        r#"{{"mode":"{mode_str}","state":"{state_label}","agent_state":"{status_str}","last_action":"{last_action}","last_reason":"{last_reason}","last_agent_decision":"{last_decision}","last_no_trade_reason":"{no_trade_reason}","pipeline_state":"{pipeline}","final_decision":"{final_decision}","balance_block_reason":"{balance_block}","risk_block_reason":"{risk_block}","execution_block_reason":"{exec_block}","current_equity":{current_equity},"peak_equity":{peak_equity},"drawdown_pct":{drawdown_pct},"drawdown_limit":{drawdown_limit},"cycle_count":{cycle_count},"running":{running},"cooldown_active":{cooldown_active},"cooldown_remaining_ms":{cooldown_remaining_ms},"effective_threshold":{effective_threshold},"threshold_mode":"{threshold_mode}","compound_position_size_usd":{compound_pos_usd},"compound_position_size_btc":{compound_pos_btc},"compound_last_trade_pnl":{compound_last_pnl},"compound_session_pnl":{compound_sess_pnl},"compound_peak_balance":{compound_peak_bal},"compound_current_balance":{compound_cur_bal},"compound_consecutive_losses":{compound_consec},"compound_size_scalar":{compound_scalar},"compound_loss_pause_active":{compound_paused},"flip_cycle_phase":"{flip_cycle_phase}","flip_session_pnl":{flip_session_pnl},"flip_rotation_count":{flip_rotation_count},"flip_last_entry_price":{flip_last_entry_price},"flip_last_exit_price":{flip_last_exit_price},"flip_last_pnl_usd":{flip_last_pnl_usd},"flip_last_pnl_pct":{flip_last_pnl_pct},"flip_min_profit_floor":{flip_min_profit_floor},"flip_blocker":"{flip_blocker}","contract_side":"{contract_side}","contract_leverage":{contract_leverage},"contract_entry_price":{contract_entry_price},"contract_mark_price":{contract_mark_price},"contract_notional_usd":{contract_notional_usd},"contract_unrealized_pnl":{contract_unrealized_pnl},"contract_realized_pnl_session":{contract_realized_pnl_session},"contract_liquidation_price":{contract_liquidation_price},"contract_stop_loss":{contract_stop_loss},"contract_take_profit":{contract_take_profit},"contract_liquidation_buffer_pct":{contract_liquidation_buffer_pct},"contract_duration_secs":{contract_duration_secs},"contract_exit_reason":"{contract_exit_reason}","contract_last_trade_result":{contract_last_trade_result},"contract_paper_mode":{contract_paper_mode}}}"#,
         current_equity  = snap.current_equity,
         peak_equity     = snap.peak_equity,
         drawdown_pct    = snap.drawdown_pct,
@@ -742,6 +742,21 @@ async fn agent_status_json(state: &AppState) -> String {
         flip_last_pnl_pct     = snap.flip_last_pnl_pct,
         flip_min_profit_floor = snap.flip_min_profit_floor,
         flip_blocker          = snap.flip_blocker.replace('"', "\\\""),
+        contract_side                 = snap.contract_side.replace('"', "\\\""),
+        contract_leverage             = snap.contract_leverage,
+        contract_entry_price          = snap.contract_entry_price,
+        contract_mark_price           = snap.contract_mark_price,
+        contract_notional_usd         = snap.contract_notional_usd,
+        contract_unrealized_pnl       = snap.contract_unrealized_pnl,
+        contract_realized_pnl_session = snap.contract_realized_pnl_session,
+        contract_liquidation_price    = snap.contract_liquidation_price,
+        contract_stop_loss            = snap.contract_stop_loss,
+        contract_take_profit          = snap.contract_take_profit,
+        contract_liquidation_buffer_pct = snap.contract_liquidation_buffer_pct,
+        contract_duration_secs        = snap.contract_duration_secs,
+        contract_exit_reason          = snap.contract_exit_reason.replace('"', "\\\""),
+        contract_last_trade_result    = snap.contract_last_trade_result,
+        contract_paper_mode           = snap.contract_paper_mode,
     );
     json_resp(&body)
 }
@@ -1534,6 +1549,54 @@ async fn page_events(state: &AppState, query: &str) -> String {
     } else {
         String::new()
     };
+    let contract_panel = if npc_loop.threshold_mode == "swing"
+        || npc_loop.contract_side != "FLAT"
+        || npc_loop.contract_realized_pnl_session.abs() > 0.0
+    {
+        let side_color = match npc_loop.contract_side.as_str() {
+            "LONG" => "#22c55e",
+            "SHORT" => "#ef4444",
+            _ => "#82909f",
+        };
+        let unreal_color = if npc_loop.contract_unrealized_pnl > 0.0 { "#22c55e" }
+            else if npc_loop.contract_unrealized_pnl < 0.0 { "#ef4444" } else { "#82909f" };
+        let realized_color = if npc_loop.contract_realized_pnl_session > 0.0 { "#22c55e" }
+            else if npc_loop.contract_realized_pnl_session < 0.0 { "#ef4444" } else { "#82909f" };
+        let last_result_color = if npc_loop.contract_last_trade_result > 0.0 { "#22c55e" }
+            else if npc_loop.contract_last_trade_result < 0.0 { "#ef4444" } else { "#82909f" };
+        format!(
+            "<div style='margin-top:8px;padding:6px 8px;background:rgba(59,130,246,.08);\
+             border:1px solid rgba(59,130,246,.25);border-radius:8px;font-size:11px'>\
+             <div style='font-weight:700;color:#60a5fa;margin-bottom:4px'>📄 CONTRACT_EXECUTOR {paper_badge}</div>\
+             <div style='display:grid;grid-template-columns:repeat(2,1fr);gap:4px'>\
+               <div><span class='dim'>Side: </span><span style='color:{side_color};font-weight:700'>{side}</span></div>\
+               <div><span class='dim'>Leverage: </span><span style='color:#e2e8f0'>{leverage:.1}x</span></div>\
+               <div><span class='dim'>Entry / Mark: </span><span style='color:#e2e8f0'>{entry:.2} / {mark:.2}</span></div>\
+               <div><span class='dim'>Notional: </span><span style='color:#e2e8f0'>${notional:.2}</span></div>\
+               <div><span class='dim'>PnL (U/R): </span><span style='color:{unreal_color}'>{unreal:+.4}</span> / <span style='color:{realized_color}'>{realized:+.4}</span></div>\
+               <div><span class='dim'>Liq buffer: </span><span style='color:#e2e8f0'>{liq_buffer:.2}%</span></div>\
+               <div><span class='dim'>Stop / TP: </span><span style='color:#94a3b8'>{stop:.2} / {tp:.2}</span></div>\
+               <div><span class='dim'>Duration: </span><span style='color:#e2e8f0'>{duration:.0}s</span></div>\
+               <div style='grid-column:1/-1'><span class='dim'>Last trade result: </span><span style='color:{last_result_color}'>{last_result:+.4}</span> <span class='dim'>({exit_reason})</span></div>\
+             </div></div>",
+            paper_badge = if npc_loop.contract_paper_mode { "<span style='color:#22c55e;font-size:10px'>(paper-only)</span>" } else { "" },
+            side = esc(&npc_loop.contract_side),
+            leverage = npc_loop.contract_leverage,
+            entry = npc_loop.contract_entry_price,
+            mark = npc_loop.contract_mark_price,
+            notional = npc_loop.contract_notional_usd,
+            unreal = npc_loop.contract_unrealized_pnl,
+            realized = npc_loop.contract_realized_pnl_session,
+            liq_buffer = npc_loop.contract_liquidation_buffer_pct * 100.0,
+            stop = npc_loop.contract_stop_loss,
+            tp = npc_loop.contract_take_profit,
+            duration = npc_loop.contract_duration_secs,
+            last_result = npc_loop.contract_last_trade_result,
+            exit_reason = esc(&npc_loop.contract_exit_reason),
+        )
+    } else {
+        String::new()
+    };
 
     let agent_control_card = format!(
         "<div class='signal-box' style='margin-bottom:12px;{agent_card_glow}'>\
@@ -1553,6 +1616,7 @@ async fn page_events(state: &AppState, query: &str) -> String {
            {buy_blocked_banner}\
            {compound_panel}\
            {flip_hyper_panel}\
+           {contract_panel}\
            <details style='margin-top:6px'><summary class='dim' style='cursor:pointer;font-size:11px'>Decision transparency</summary>{decision_transparency}</details>\
            <div style='display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:10px'>\
              <form method='post' action='/agent/mode'><input type='hidden' name='mode' value='off'>\
