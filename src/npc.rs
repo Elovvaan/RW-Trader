@@ -1184,10 +1184,12 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                     "compound_loss_pause",
                     &format!("cycle={} remaining_ms={} consecutive_losses={}", cycle_id, remaining_ms, rt.compound_consecutive_losses),
                 );
-                observe_and_learn(cfg, &mut rt, &*state.store, metrics.mid);
-                return no_action(cycle_id,
-                    format!("COMPOUND_LOSS_PAUSE:{}ms_remaining", remaining_ms),
-                    "blocked".to_string());
+                if position_size <= 0.0 {
+                    observe_and_learn(cfg, &mut rt, &*state.store, metrics.mid);
+                    return no_action(cycle_id,
+                        format!("COMPOUND_LOSS_PAUSE:{}ms_remaining", remaining_ms),
+                        "blocked".to_string());
+                }
             } else {
                 rt.compound_loss_pause_until = None;
             }
