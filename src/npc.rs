@@ -406,7 +406,6 @@ struct OpenAction {
     cycle_id: u64,
 }
 
-#[derive(Default)]
 struct NpcRuntimeState {
     action_state: HashMap<String, ActionState>,
     last_action_at: HashMap<NpcRole, Instant>,
@@ -420,6 +419,55 @@ struct NpcRuntimeState {
     peak_equity: f64,
     regime_perf: HashMap<(NpcRole, MarketRegime), AgentPerformance>,
     learner_ranges: Option<LearnerConfigRanges>,
+    // ── COMPOUND_EXECUTION tracking ───────────────────────────────────────────
+    /// Number of consecutive losing trades in COMPOUND_EXECUTION mode.
+    compound_consecutive_losses: u32,
+    /// PnL of the most recently closed trade (positive = win, negative = loss).
+    compound_last_trade_pnl: f64,
+    /// Whether the most recently closed trade was profitable.
+    compound_last_trade_was_profitable: bool,
+    /// Cumulative session PnL since agent start in COMPOUND_EXECUTION mode.
+    compound_session_pnl: f64,
+    /// Highest total_balance_usd seen so far (set once per cycle when in micro_active).
+    compound_peak_balance: f64,
+    /// Size scalar applied on top of the equity-based calculation (range 0.1–1.0).
+    /// Reduced after losses, recovered after wins, slightly reduced on profit lock.
+    compound_size_scalar: f64,
+    /// When set, no new BUY entries are allowed until this instant (compound loss pause).
+    compound_loss_pause_until: Option<Instant>,
+    /// Last observed position size in BTC (updated each run_cycle call).
+    compound_last_position_btc: f64,
+    /// Last observed total account balance in USD (updated each run_cycle call).
+    compound_last_balance_usd: f64,
+}
+
+impl Default for NpcRuntimeState {
+    fn default() -> Self {
+        Self {
+            action_state: HashMap::new(),
+            last_action_at: HashMap::new(),
+            mid_history: VecDeque::new(),
+            spread_history: VecDeque::new(),
+            open_actions: BTreeMap::new(),
+            paper_executions: 0,
+            perf: HashMap::new(),
+            cycle_seq: 0,
+            cycle_open_notional: 0.0,
+            peak_equity: 0.0,
+            regime_perf: HashMap::new(),
+            learner_ranges: None,
+            compound_consecutive_losses: 0,
+            compound_last_trade_pnl: 0.0,
+            compound_last_trade_was_profitable: false,
+            compound_session_pnl: 0.0,
+            compound_peak_balance: 0.0,
+            // Start at full size — reduced only after losses.
+            compound_size_scalar: 1.0,
+            compound_loss_pause_until: None,
+            compound_last_position_btc: 0.0,
+            compound_last_balance_usd: 0.0,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -477,6 +525,25 @@ pub struct NpcLoopSnapshot {
     pub normalized_score: f64,
     /// Formatted top-3 penalty components that suppressed the score (descending).
     pub top_score_penalties: String,
+    // ── COMPOUND_EXECUTION telemetry ──────────────────────────────────────────
+    /// Current position size in USD terms (position_size_btc * mid price).
+    pub compound_position_size_usd: f64,
+    /// Current position size in base asset (BTC).
+    pub compound_position_size_btc: f64,
+    /// PnL of the most recently closed trade in USD.
+    pub compound_last_trade_pnl: f64,
+    /// Cumulative session PnL in USD since agent start.
+    pub compound_session_pnl: f64,
+    /// Peak account balance seen during this session in USD.
+    pub compound_peak_balance: f64,
+    /// Current account balance in USD (last observed total_balance_usd).
+    pub compound_current_balance: f64,
+    /// Consecutive-loss count driving size/cooldown decisions.
+    pub compound_consecutive_losses: u32,
+    /// Size scalar currently applied (1.0 = full, <1.0 = reduced after losses).
+    pub compound_size_scalar: f64,
+    /// True when a compound-loss cooldown is currently active (no new BUYs).
+    pub compound_loss_pause_active: bool,
 }
 
 #[derive(Default)]
@@ -507,6 +574,16 @@ struct NpcLoopTelemetry {
     raw_score: f64,
     normalized_score: f64,
     top_score_penalties: String,
+    // ── COMPOUND_EXECUTION telemetry ──────────────────────────────────────────
+    compound_position_size_usd: f64,
+    compound_position_size_btc: f64,
+    compound_last_trade_pnl: f64,
+    compound_session_pnl: f64,
+    compound_peak_balance: f64,
+    compound_current_balance: f64,
+    compound_consecutive_losses: u32,
+    compound_size_scalar: f64,
+    compound_loss_pause_active: bool,
 }
 
 struct NpcLoopControl {
@@ -644,7 +721,7 @@ impl NpcAutonomousController {
         let telemetry = self.telemetry.lock().await;
         let control = self.control.lock().await;
         let agent_mode = control.mode;
-        let (current_equity, peak_equity, drawdown_pct) = {
+        let (current_equity, peak_equity, drawdown_pct, compound) = {
             // Compute current equity and drawdown from runtime state (same formula as evaluate_portfolio_controls).
             let rt = self.runtime.lock().await;
             let aggregate_pnl: f64 = rt.perf.values().map(|p| p.gross_pnl).sum();
@@ -656,8 +733,29 @@ impl NpcAutonomousController {
             } else {
                 0.0
             };
-            (equity, peak, dd)
+            // Compute position size in USD using the most recent mid price from history.
+            let last_mid = rt.mid_history.back().copied().unwrap_or(0.0);
+            let pos_usd = rt.compound_last_position_btc * last_mid;
+            let c = (
+                rt.compound_last_position_btc,
+                pos_usd,
+                rt.compound_last_trade_pnl,
+                rt.compound_session_pnl,
+                rt.compound_peak_balance,
+                rt.compound_last_balance_usd,
+                rt.compound_consecutive_losses,
+                rt.compound_size_scalar,
+                rt.compound_loss_pause_until.map(|t| t > std::time::Instant::now()).unwrap_or(false),
+            );
+            (equity, peak, dd, c)
         };
+        let (
+            compound_pos_btc, compound_pos_usd,
+            compound_last_pnl, compound_sess_pnl,
+            compound_peak_bal, compound_cur_bal,
+            compound_consec_losses, compound_sz_scalar,
+            compound_paused,
+        ) = compound;
         NpcLoopSnapshot {
             agent_mode,
             autonomous_mode: agent_mode != AgentMode::Off,
@@ -687,6 +785,15 @@ impl NpcAutonomousController {
             raw_score: telemetry.raw_score,
             normalized_score: telemetry.normalized_score,
             top_score_penalties: telemetry.top_score_penalties.clone(),
+            compound_position_size_btc: compound_pos_btc,
+            compound_position_size_usd: compound_pos_usd,
+            compound_last_trade_pnl: compound_last_pnl,
+            compound_session_pnl: compound_sess_pnl,
+            compound_peak_balance: compound_peak_bal,
+            compound_current_balance: compound_cur_bal,
+            compound_consecutive_losses: compound_consec_losses,
+            compound_size_scalar: compound_sz_scalar,
+            compound_loss_pause_active: compound_paused,
         }
     }
 
@@ -880,6 +987,31 @@ const THRESHOLD_MICRO_ACTIVE_MID: f64   = 0.09;
 /// overwhelmed by proportionally large penalty terms.
 const MICRO_PENALTY_DAMPEN: f64 = 0.50;
 
+// ── COMPOUND_EXECUTION mode constants ────────────────────────────────────────
+/// Minimum normalized score (raw_score / threshold) required in COMPOUND_EXECUTION.
+/// Score must be at least 20% above the threshold — not just barely passing.
+const COMPOUND_NORMALIZED_SCORE_MIN: f64 = 1.2;
+/// Base position size as a fraction of total account balance (15%).
+const COMPOUND_BASE_EQUITY_PCT: f64 = 0.15;
+/// Maximum position size as a fraction of total account balance (30%).
+const COMPOUND_MAX_EQUITY_PCT: f64 = 0.30;
+/// Minimum trade notional in USD (floor, never go below $5).
+const COMPOUND_MIN_NOTIONAL_USD: f64 = 5.0;
+/// After this many consecutive losses, reduce position size by COMPOUND_LOSS_SIZE_FACTOR.
+const COMPOUND_LOSS_SIZE_REDUCE_THRESHOLD: u32 = 2;
+/// After this many consecutive losses, pause new BUY entries for a cooldown window.
+const COMPOUND_LOSS_PAUSE_THRESHOLD: u32 = 3;
+/// Factor applied to size scalar after the loss-reduce threshold is reached (50% cut).
+const COMPOUND_LOSS_SIZE_FACTOR: f64 = 0.50;
+/// Cooldown duration (seconds) after COMPOUND_LOSS_PAUSE_THRESHOLD consecutive losses.
+const COMPOUND_LOSS_COOLDOWN_SECS: u64 = 60;
+/// When account balance grows by this fraction above the previous peak, lock profits.
+const COMPOUND_PROFIT_LOCK_TRIGGER_PCT: f64 = 0.10;
+/// Risk reduction applied to size scalar when profit-lock triggers (keep 85% of size).
+const COMPOUND_PROFIT_LOCK_RISK_FACTOR: f64 = 0.85;
+/// Hard floor for the compound size scalar — never reduce below this fraction.
+const COMPOUND_MIN_SIZE_SCALAR: f64 = 0.25;
+
 /// Compute balance-adaptive signal threshold and mode label.
 ///
 /// Returns `(effective_threshold, threshold_mode)`:
@@ -1016,6 +1148,51 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         rt.spread_history.push_back(metrics.spread_bps);
         while rt.spread_history.len() > 128 {
             rt.spread_history.pop_front();
+        }
+    }
+
+    // ── COMPOUND_EXECUTION: update live state snapshots ───────────────────────
+    if is_micro_active {
+        rt.compound_last_position_btc = position_size;
+        rt.compound_last_balance_usd  = total_balance_usd;
+
+        // Track peak balance and apply profit-lock when balance grows ≥10%.
+        if total_balance_usd > 0.0 {
+            if rt.compound_peak_balance <= 0.0 {
+                rt.compound_peak_balance = total_balance_usd;
+            } else if total_balance_usd >= rt.compound_peak_balance * (1.0 + COMPOUND_PROFIT_LOCK_TRIGGER_PCT) {
+                // Balance grew ≥10% above previous peak — lock profits by trimming size scalar.
+                rt.compound_size_scalar = (rt.compound_size_scalar * COMPOUND_PROFIT_LOCK_RISK_FACTOR).max(COMPOUND_MIN_SIZE_SCALAR);
+                info!(
+                    balance = total_balance_usd,
+                    peak = rt.compound_peak_balance,
+                    new_scalar = rt.compound_size_scalar,
+                    "[COMPOUND] Profit lock triggered: balance {:.2} ≥ peak {:.2} × {:.0}%. Size scalar → {:.2}",
+                    total_balance_usd, rt.compound_peak_balance,
+                    COMPOUND_PROFIT_LOCK_TRIGGER_PCT * 100.0, rt.compound_size_scalar
+                );
+                rt.compound_peak_balance = total_balance_usd;
+            }
+        }
+
+        // ── Compound loss pause: block BUY entries while cooldown is active ──────
+        if let Some(pause_until) = rt.compound_loss_pause_until {
+            if pause_until > Instant::now() {
+                let remaining_ms = (pause_until - Instant::now()).as_millis() as u64;
+                log_npc_event(
+                    &*state.store,
+                    "compound_loss_pause",
+                    &format!("cycle={} remaining_ms={} consecutive_losses={}", cycle_id, remaining_ms, rt.compound_consecutive_losses),
+                );
+                if position_size <= 0.0 {
+                    observe_and_learn(cfg, &mut rt, &*state.store, metrics.mid);
+                    return no_action(cycle_id,
+                        format!("COMPOUND_LOSS_PAUSE:{}ms_remaining", remaining_ms),
+                        "blocked".to_string());
+                }
+            } else {
+                rt.compound_loss_pause_until = None;
+            }
         }
     }
 
@@ -1191,6 +1368,105 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         };
     }
 
+    // ── COMPOUND_EXECUTION quality gate ──────────────────────────────────────
+    // In MICRO_ACTIVE mode, require BOTH the score gate AND a strong normalized
+    // score (≥ COMPOUND_NORMALIZED_SCORE_MIN = 1.2).  Borderline passes that
+    // barely clear the threshold are rejected — only trades with meaningful edge
+    // are allowed through.
+    if is_micro_active {
+        let norm = chosen.raw_score / effective_cutoff.max(f64::EPSILON);
+        if norm < COMPOUND_NORMALIZED_SCORE_MIN {
+            lifecycle(
+                &*state.store,
+                chosen.role,
+                &chosen.action_id,
+                NpcLifecycleState::Blocked,
+                &format!(
+                    "COMPOUND_WEAK_SIGNAL:norm={:.3}<{:.2}(raw={:.4},cutoff={:.4})",
+                    norm, COMPOUND_NORMALIZED_SCORE_MIN, chosen.raw_score, effective_cutoff
+                ),
+            );
+            rt.perf.entry(chosen.role).or_default().blocked += 1;
+            observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
+            let reason = format!(
+                "COMPOUND quality gate: normalized score {:.3} < {:.2} (raw={:.4} threshold={:.4}). \
+                 Trade rejected — score must be ≥{:.0}% above threshold for capital-growth mode.",
+                norm, COMPOUND_NORMALIZED_SCORE_MIN, chosen.raw_score, effective_cutoff,
+                COMPOUND_NORMALIZED_SCORE_MIN * 100.0
+            );
+            return NpcCycleReport {
+                cycle_id,
+                last_action: "NO_ACTION".to_string(),
+                execution_result: "COMPOUND_WEAK_SIGNAL".to_string(),
+                status: "blocked".to_string(),
+                last_agent_decision: format!(
+                    "HOLD — {} {} compound quality gate: norm={:.3} < {:.2}",
+                    chosen.side.to_uppercase(), chosen.role.as_str(), norm, COMPOUND_NORMALIZED_SCORE_MIN
+                ),
+                no_trade_reason: reason.clone(),
+                pipeline_state: "Scanning".to_string(),
+                final_decision: "BLOCKED".to_string(),
+                balance_block_reason: String::new(),
+                risk_block_reason: String::new(),
+                execution_block_reason: reason,
+                cooldown_active: false,
+                cooldown_remaining_ms: 0,
+                effective_threshold: effective_cutoff,
+                threshold_mode: threshold_mode.to_string(),
+                raw_score: chosen.raw_score,
+                normalized_score: norm,
+                top_score_penalties: chosen.score_parts.top_penalties_str(),
+            };
+        }
+
+        // ── Spread dominance guard: block if spread cost exceeds the edge estimate ──
+        // If spread_cost > edge_estimate, the market friction is larger than the
+        // expected edge — executing would produce a negative-expectancy trade.
+        if chosen.score_parts.spread_cost > chosen.score_parts.edge_estimate {
+            lifecycle(
+                &*state.store,
+                chosen.role,
+                &chosen.action_id,
+                NpcLifecycleState::Blocked,
+                &format!(
+                    "COMPOUND_SPREAD_DOMINANCE:spread={:.4}>edge={:.4}",
+                    chosen.score_parts.spread_cost, chosen.score_parts.edge_estimate
+                ),
+            );
+            rt.perf.entry(chosen.role).or_default().blocked += 1;
+            observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
+            let reason = format!(
+                "Spread dominance: spread_cost {:.4} > edge_estimate {:.4}. \
+                 Market friction exceeds expected edge — trade skipped.",
+                chosen.score_parts.spread_cost, chosen.score_parts.edge_estimate
+            );
+            return NpcCycleReport {
+                cycle_id,
+                last_action: "NO_ACTION".to_string(),
+                execution_result: "COMPOUND_SPREAD_DOMINANCE".to_string(),
+                status: "blocked".to_string(),
+                last_agent_decision: format!(
+                    "HOLD — {} {} spread dominance: cost {:.4} > edge {:.4}",
+                    chosen.side.to_uppercase(), chosen.role.as_str(),
+                    chosen.score_parts.spread_cost, chosen.score_parts.edge_estimate
+                ),
+                no_trade_reason: reason.clone(),
+                pipeline_state: "Scanning".to_string(),
+                final_decision: "BLOCKED".to_string(),
+                balance_block_reason: String::new(),
+                risk_block_reason: String::new(),
+                execution_block_reason: reason,
+                cooldown_active: false,
+                cooldown_remaining_ms: 0,
+                effective_threshold: effective_cutoff,
+                threshold_mode: threshold_mode.to_string(),
+                raw_score: chosen.raw_score,
+                normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
+                top_score_penalties: chosen.score_parts.top_penalties_str(),
+            };
+        }
+    }
+
     if !portfolio_controls.is_empty() {
         lifecycle(
             &*state.store,
@@ -1227,7 +1503,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         };
     }
 
-    let allocation = allocate_capital(&effective_cfg, &rt, &chosen, position_size, exposure_notional, buy_power, sell_inventory, metrics.mid);
+    let allocation = allocate_capital(&effective_cfg, &rt, &chosen, position_size, exposure_notional, buy_power, sell_inventory, metrics.mid, total_balance_usd, is_micro_active);
     if allocation.qty <= 0.0 {
         lifecycle(
             &*state.store,
@@ -1277,6 +1553,78 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
     }
 
     let order_notional = allocation.qty * metrics.mid.max(0.0);
+
+    // ── COMPOUND_EXECUTION: minimum expected PnL check ────────────────────────
+    // Require that the expected net price move (estimated from momentum) produces
+    // at least a positive net edge after spread and slippage costs.  This prevents
+    // entering trades where the edge cannot beat transaction costs.
+    if is_micro_active && chosen.side.eq_ignore_ascii_case("BUY") {
+        let net_edge_score = chosen.score_parts.edge_estimate
+            - chosen.score_parts.spread_cost
+            - chosen.score_parts.slippage_risk;
+        if net_edge_score <= 0.0 {
+            lifecycle(
+                &*state.store,
+                chosen.role,
+                &chosen.action_id,
+                NpcLifecycleState::Blocked,
+                &format!(
+                    "COMPOUND_EDGE_BELOW_COST:net={:.4}(edge={:.4}-spread={:.4}-slip={:.4})",
+                    net_edge_score, chosen.score_parts.edge_estimate,
+                    chosen.score_parts.spread_cost, chosen.score_parts.slippage_risk
+                ),
+            );
+            rt.perf.entry(chosen.role).or_default().blocked += 1;
+            observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
+            let reason = format!(
+                "COMPOUND edge check: net edge {:.4} ≤ 0 (edge={:.4} − spread={:.4} − slip={:.4}). \
+                 Trade cannot beat spread + slippage — skipped.",
+                net_edge_score, chosen.score_parts.edge_estimate,
+                chosen.score_parts.spread_cost, chosen.score_parts.slippage_risk
+            );
+            return NpcCycleReport {
+                cycle_id,
+                last_action: "NO_ACTION".to_string(),
+                execution_result: "COMPOUND_EDGE_BELOW_COST".to_string(),
+                status: "blocked".to_string(),
+                last_agent_decision: format!(
+                    "HOLD — {} {} net edge {:.4} ≤ 0 after costs",
+                    chosen.side.to_uppercase(), chosen.role.as_str(), net_edge_score
+                ),
+                no_trade_reason: reason.clone(),
+                pipeline_state: "Scanning".to_string(),
+                final_decision: "BLOCKED".to_string(),
+                balance_block_reason: String::new(),
+                risk_block_reason: String::new(),
+                execution_block_reason: reason,
+                cooldown_active: false,
+                cooldown_remaining_ms: 0,
+                effective_threshold: effective_cutoff,
+                threshold_mode: threshold_mode.to_string(),
+                raw_score: chosen.raw_score,
+                normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
+                top_score_penalties: chosen.score_parts.top_penalties_str(),
+            };
+        }
+        // Log expected trade metrics for observability.
+        info!(
+            cycle_id,
+            role = chosen.role.as_str(),
+            side = chosen.side.as_str(),
+            qty = allocation.qty,
+            order_notional,
+            net_edge = net_edge_score,
+            edge = chosen.score_parts.edge_estimate,
+            spread_cost = chosen.score_parts.spread_cost,
+            "[COMPOUND] Trade entry: size_usd={:.2} qty={:.8} net_edge={:.4} reason=score={:.4} penalties=[{}]",
+            order_notional,
+            allocation.qty,
+            net_edge_score,
+            chosen.score,
+            chosen.score_parts.top_penalties_str(),
+        );
+    }
+
     let (guard_reasons, cooldown_active, cooldown_remaining_ms) = evaluate_guards(
         &effective_cfg,
         &rt,
@@ -2098,6 +2446,8 @@ fn allocate_capital(
     buy_power: f64,
     sell_inventory: f64,
     mid: f64,
+    total_balance_usd: f64,
+    is_micro_active: bool,
 ) -> AllocationDecision {
     let perf = rt.perf.get(&chosen.role).cloned().unwrap_or_default();
     let quality = perf.quality_score();
@@ -2115,8 +2465,31 @@ fn allocate_capital(
     let agent_budget = cfg.alpha.per_agent_budget_pct.get(&chosen.role).copied().unwrap_or(0.05).clamp(0.01, 0.80);
     let dd_factor = if drawdown >= cfg.alpha.drawdown_derisk_trigger_pct { 0.35 } else { 1.0 };
 
-    let size_multiplier = quality * (1.0 + recent_performance).clamp(0.3, 1.4) * (1.0 - symbol_concentration).clamp(0.1, 1.0) * dd_factor;
-    let mut qty = cfg.trade_size * agent_budget * size_multiplier;
+    // ── COMPOUND_EXECUTION: dynamic equity-based sizing ───────────────────────
+    // In MICRO_ACTIVE mode, replace flat trade_size with a % of account equity.
+    // base_size = COMPOUND_BASE_EQUITY_PCT (15%) × total_balance, clamped to
+    // [$COMPOUND_MIN_NOTIONAL_USD … COMPOUND_MAX_EQUITY_PCT × total_balance].
+    // The compound_size_scalar (updated by loss control and profit locking) is
+    // applied on top.  Increase only when the last trade was profitable.
+    let mut qty = if is_micro_active && total_balance_usd > 0.0 && mid > 0.0 {
+        let max_notional = total_balance_usd * COMPOUND_MAX_EQUITY_PCT;
+        if max_notional < COMPOUND_MIN_NOTIONAL_USD {
+            0.0
+        } else {
+            let base_notional = (total_balance_usd * COMPOUND_BASE_EQUITY_PCT)
+                .clamp(COMPOUND_MIN_NOTIONAL_USD, max_notional);
+            // Apply loss-based scalar (reduced after consecutive losses).
+            let size_scalar = rt.compound_size_scalar.clamp(COMPOUND_MIN_SIZE_SCALAR, 1.0);
+            // On a win, allow a small upward bump (capped at 10%) to grow into profitable streaks.
+            // On a loss or flat, no additional adjustment — scalar stays at current level.
+            let momentum_adjust = if rt.compound_last_trade_was_profitable { 1.10 } else { 1.0 };
+            let adjusted_notional = base_notional * size_scalar * momentum_adjust * dd_factor;
+            adjusted_notional / mid
+        }
+    } else {
+        let size_multiplier = quality * (1.0 + recent_performance).clamp(0.3, 1.4) * (1.0 - symbol_concentration).clamp(0.1, 1.0) * dd_factor;
+        cfg.trade_size * agent_budget * size_multiplier
+    };
 
     // Cap quantity by the available balance for this side:
     // SELL orders are limited by base-asset inventory; BUY orders by quote buying power.
@@ -2152,14 +2525,15 @@ fn allocate_capital(
         };
     }
 
-    // ── Minimum notional floor ($5) ───────────────────────────────────────────
+    // ── Minimum notional floor ────────────────────────────────────────────────
     // Ensure fills are visible: if the computed qty would produce a notional value
-    // below $5, bump it up so the fill registers on the exchange. The bump is
-    // capped by max_qty (already guaranteed ≥ 0 from the BUY/SELL cap above) so
-    // it never exceeds the available balance or inventory.
-    const MIN_NOTIONAL_USD: f64 = 5.0;
+    // below the floor, bump it up so the fill registers on the exchange. The bump
+    // is capped by max_qty (already guaranteed ≥ 0) so it never exceeds the
+    // available balance or inventory.
+    // COMPOUND_EXECUTION uses COMPOUND_MIN_NOTIONAL_USD; standard path uses $5.
+    let min_notional = if is_micro_active { COMPOUND_MIN_NOTIONAL_USD } else { 5.0 };
     if mid > 0.0 {
-        let min_qty_for_notional = MIN_NOTIONAL_USD / mid;
+        let min_qty_for_notional = min_notional / mid;
         if qty < min_qty_for_notional {
             // max_qty is non-negative by construction (sell_inventory.max(0) or
             // buy_power/mid with mid > 0), so no extra clamp is needed.
@@ -2207,6 +2581,7 @@ fn observe_and_learn(cfg: &NpcConfig, rt: &mut NpcRuntimeState, store: &dyn Even
                 (open.entry_mid - current_mid) * open.allocated_qty
             };
             let hold_ms = open.opened_at.elapsed().as_secs_f64() * 1000.0;
+            let notional_used = open.allocated_qty * open.entry_mid;
             let perf = rt.perf.entry(open.role).or_default();
             perf.gross_pnl += pnl;
             perf.peak_pnl = perf.peak_pnl.max(perf.gross_pnl);
@@ -2250,11 +2625,13 @@ fn observe_and_learn(cfg: &NpcConfig, rt: &mut NpcRuntimeState, store: &dyn Even
                 ),
             );
 
+            // Enhanced per-trade log for COMPOUND_EXECUTION observability.
             log_npc_event(
                 store,
                 "trade_metrics",
                 &format!(
-                    "action_id={} role={} regime={} expected_edge={:+.6} realized_edge={:+.6} pnl={:+.6} hold_ms={:.0} qty={:.8}",
+                    "action_id={} role={} regime={} expected_edge={:+.6} realized_edge={:+.6} \
+                     pnl={:+.6} hold_ms={:.0} qty={:.8} size_usd={:.2} realized_pnl_usd={:+.4}",
                     id,
                     open.role.as_str(),
                     open.regime.as_str(),
@@ -2263,8 +2640,60 @@ fn observe_and_learn(cfg: &NpcConfig, rt: &mut NpcRuntimeState, store: &dyn Even
                     pnl,
                     hold_ms,
                     open.allocated_qty,
+                    notional_used,
+                    pnl,
                 ),
             );
+
+            // ── COMPOUND_EXECUTION: update consecutive loss / profit state ────────
+            let is_compound_execution_trade = open.regime.as_str() == "micro_active";
+            if is_compound_execution_trade {
+                rt.compound_session_pnl += pnl;
+                rt.compound_last_trade_pnl = pnl;
+                rt.compound_last_trade_was_profitable = pnl > 0.0;
+            }
+
+            // Shadow `pnl` so the existing compound loss/profit logic becomes a no-op
+            // for trades that were not opened in the COMPOUND_EXECUTION regime.
+            let pnl = if is_compound_execution_trade { pnl } else { 0.0 };
+            if pnl < 0.0 {
+                rt.compound_consecutive_losses = rt.compound_consecutive_losses.saturating_add(1);
+                // After 2+ consecutive losses: reduce size scalar by COMPOUND_LOSS_SIZE_FACTOR.
+                if rt.compound_consecutive_losses >= COMPOUND_LOSS_SIZE_REDUCE_THRESHOLD {
+                    rt.compound_size_scalar =
+                        (rt.compound_size_scalar * COMPOUND_LOSS_SIZE_FACTOR).max(COMPOUND_MIN_SIZE_SCALAR);
+                    info!(
+                        consecutive_losses = rt.compound_consecutive_losses,
+                        new_scalar = rt.compound_size_scalar,
+                        pnl,
+                        "[COMPOUND] Loss #{}: size scalar reduced to {:.2}",
+                        rt.compound_consecutive_losses, rt.compound_size_scalar
+                    );
+                }
+                // After 3+ losses: activate compound loss pause (no new BUYs for cooldown).
+                if rt.compound_consecutive_losses >= COMPOUND_LOSS_PAUSE_THRESHOLD {
+                    let pause_until = Instant::now() + Duration::from_secs(COMPOUND_LOSS_COOLDOWN_SECS);
+                    rt.compound_loss_pause_until = Some(pause_until);
+                    info!(
+                        consecutive_losses = rt.compound_consecutive_losses,
+                        cooldown_secs = COMPOUND_LOSS_COOLDOWN_SECS,
+                        "[COMPOUND] Loss streak {}: activating {}s cooldown pause",
+                        rt.compound_consecutive_losses, COMPOUND_LOSS_COOLDOWN_SECS
+                    );
+                }
+            } else if pnl > 0.0 {
+                // Win: reset loss streak and proportionally recover size scalar toward 1.0.
+                // Multiply by 1.2 per win — faster recovery from deep reductions while
+                // still requiring multiple consecutive wins to fully restore from 0.25.
+                rt.compound_consecutive_losses = 0;
+                rt.compound_size_scalar = (rt.compound_size_scalar * 1.2).min(1.0);
+                rt.compound_loss_pause_until = None; // cancel any pause on a win
+                info!(
+                    new_scalar = rt.compound_size_scalar,
+                    pnl,
+                    "[COMPOUND] Win: size scalar recovered to {:.2}", rt.compound_size_scalar
+                );
+            }
 
             if cfg.mode.learner_writable() {
                 learner_updates.push((open.role, open.regime, realized_edge));
