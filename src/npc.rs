@@ -467,6 +467,7 @@ struct OpenContractPosition {
     mark_price: f64,
     notional_usd: f64,
     qty_base: f64,
+    entry_fee_usd: f64,
     unrealized_pnl: f64,
     liquidation_price: f64,
     stop_loss: f64,
@@ -483,6 +484,11 @@ struct CompletedContractTrade {
     leverage: f64,
     entry_price: f64,
     exit_price: f64,
+    gross_realized_pnl_usd: f64,
+    entry_fee_usd: f64,
+    exit_fee_usd: f64,
+    net_realized_pnl_usd: f64,
+    /// Back-compat alias used by existing telemetry/UI bindings.
     pnl_usd: f64,
     duration_secs: f64,
     exit_reason: String,
@@ -594,6 +600,7 @@ struct NpcRuntimeState {
     contract_realized_pnl_session: f64,
     contract_last_trade: Option<CompletedContractTrade>,
     contract_last_exit_reason: String,
+    contract_last_no_open_reason: String,
 }
 
 impl Default for NpcRuntimeState {
@@ -644,6 +651,7 @@ impl Default for NpcRuntimeState {
             contract_realized_pnl_session: 0.0,
             contract_last_trade: None,
             contract_last_exit_reason: String::new(),
+            contract_last_no_open_reason: String::new(),
         }
     }
 }
@@ -998,15 +1006,25 @@ impl NpcAutonomousController {
                 .contract_last_trade
                 .as_ref()
                 .map(|t| format!(
-                    "{} {}x {}s {} @{:.2}->{:.2}",
+                    "{} {}x {}s {} gross={:.4} entry_fee={:.4} exit_fee={:.4} net={:.4} @{:.2}->{:.2}",
                     t.side.as_str(),
                     t.leverage,
                     t.duration_secs.round() as i64,
                     t.exit_reason,
+                    t.gross_realized_pnl_usd,
+                    t.entry_fee_usd,
+                    t.exit_fee_usd,
+                    t.net_realized_pnl_usd,
                     t.entry_price,
                     t.exit_price
                 ))
-                .unwrap_or_else(|| rt.contract_last_exit_reason.clone());
+                .unwrap_or_else(|| {
+                    if rt.contract_last_no_open_reason.is_empty() {
+                        rt.contract_last_exit_reason.clone()
+                    } else {
+                        rt.contract_last_no_open_reason.clone()
+                    }
+                });
             let k = (
                 side,
                 leverage,
@@ -1588,14 +1606,21 @@ fn update_contract_executor(
         };
         if let Some(reason) = exit_reason {
             let exit_fee = pos.notional_usd * rt.contract_fee_rate.max(0.0);
-            let net_realized = pos.unrealized_pnl - exit_fee;
-            rt.contract_realized_pnl_session += net_realized;
+            let gross_realized = pos.unrealized_pnl;
+            let net_realized = gross_realized - pos.entry_fee_usd - exit_fee;
+            let session_close_realized = gross_realized - exit_fee;
+            rt.contract_realized_pnl_session += session_close_realized;
             rt.contract_last_exit_reason = reason.to_string();
+            rt.contract_last_no_open_reason.clear();
             rt.contract_last_trade = Some(CompletedContractTrade {
                 side: pos.side,
                 leverage: pos.leverage,
                 entry_price: pos.entry_price,
                 exit_price: mark_price,
+                gross_realized_pnl_usd: gross_realized,
+                entry_fee_usd: pos.entry_fee_usd,
+                exit_fee_usd: exit_fee,
+                net_realized_pnl_usd: net_realized,
                 pnl_usd: net_realized,
                 duration_secs: pos.opened_at.elapsed().as_secs_f64(),
                 exit_reason: reason.to_string(),
@@ -1611,8 +1636,24 @@ fn update_contract_executor(
             SwingBias::NoTrade => None,
         };
         if let Some(side) = side {
-            let entry = entry_price.max(f64::EPSILON);
+            if balance_usd <= 0.0 {
+                rt.contract_last_no_open_reason = "ZERO_CAPITAL".to_string();
+                return;
+            }
+            if notional <= 0.0 {
+                rt.contract_last_no_open_reason = "ZERO_NOTIONAL".to_string();
+                return;
+            }
+            if !entry_price.is_finite() || entry_price <= 0.0 {
+                rt.contract_last_no_open_reason = "ZERO_QTY".to_string();
+                return;
+            }
+            let entry = entry_price;
             let qty_base = if entry > 0.0 { notional / entry } else { 0.0 };
+            if qty_base <= 0.0 {
+                rt.contract_last_no_open_reason = "ZERO_QTY".to_string();
+                return;
+            }
             let stop_distance = (vol * CONTRACT_STOP_VOL_MULT).max(0.0025);
             let tp_distance = (vol * CONTRACT_TAKE_PROFIT_VOL_MULT).max(0.004);
             let stop_loss = match side {
@@ -1637,6 +1678,7 @@ fn update_contract_executor(
                 mark_price,
                 notional_usd: notional,
                 qty_base,
+                entry_fee_usd: entry_fee,
                 unrealized_pnl: contract_unrealized_pnl(side, entry, mark_price, qty_base),
                 liquidation_price,
                 stop_loss,
@@ -1646,6 +1688,7 @@ fn update_contract_executor(
                 high_water_mark: mark_price,
                 low_water_mark: mark_price,
             });
+            rt.contract_last_no_open_reason.clear();
         }
     }
 }
@@ -5939,7 +5982,7 @@ mod flip_hyper_tests {
     }
 
     #[test]
-    fn contract_executor_applies_entry_and_exit_fees() {
+    fn last_trade_result_includes_both_entry_and_exit_fees() {
         let mut rt = NpcRuntimeState::default();
         rt.contract_fee_rate = 0.001;
         update_contract_executor(&mut rt, SwingBias::LongBias, 100.0, 100.0, 0.01, 100.0);
@@ -5948,8 +5991,44 @@ mod flip_hyper_tests {
 
         // Force close via NO_TRADE bias flip and ensure exit fee is subtracted.
         update_contract_executor(&mut rt, SwingBias::NoTrade, 101.0, 101.0, 0.01, 100.0);
-        let realized = rt.contract_realized_pnl_session;
         // Gross pnl: 3.0 ; fees total 0.6 => net 2.4
-        assert!((realized - 2.4).abs() < 1e-6, "expected net 2.4, got {realized}");
+        let trade = rt.contract_last_trade.as_ref().expect("trade should be closed");
+        assert!((trade.gross_realized_pnl_usd - 3.0).abs() < 1e-6);
+        assert!((trade.entry_fee_usd - 0.3).abs() < 1e-6);
+        assert!((trade.exit_fee_usd - 0.3).abs() < 1e-6);
+        assert!((trade.net_realized_pnl_usd - 2.4).abs() < 1e-6);
+        assert!((trade.pnl_usd - 2.4).abs() < 1e-6, "last-trade pnl alias should be net");
+    }
+
+    #[test]
+    fn zero_balance_does_not_open_contract_position() {
+        let mut rt = NpcRuntimeState::default();
+        update_contract_executor(&mut rt, SwingBias::LongBias, 100.0, 100.0, 0.01, 0.0);
+        assert!(rt.contract_position.is_none(), "must not open when balance is zero");
+        assert_eq!(rt.contract_last_no_open_reason, "ZERO_CAPITAL");
+        assert!(rt.contract_last_trade.is_none(), "no trade telemetry on non-trade");
+    }
+
+    #[test]
+    fn zero_qty_does_not_create_position_state() {
+        let mut rt = NpcRuntimeState::default();
+        update_contract_executor(&mut rt, SwingBias::LongBias, 0.0, 100.0, 0.01, 100.0);
+        assert!(rt.contract_position.is_none(), "must not create synthetic qty==0 position");
+        assert_eq!(rt.contract_last_no_open_reason, "ZERO_QTY");
+        assert!(rt.contract_last_trade.is_none(), "no trade telemetry on non-trade");
+    }
+
+    #[test]
+    fn session_realized_pnl_remains_consistent_with_last_trade_net() {
+        let mut rt = NpcRuntimeState::default();
+        rt.contract_fee_rate = 0.001;
+        update_contract_executor(&mut rt, SwingBias::LongBias, 100.0, 100.0, 0.01, 100.0);
+        update_contract_executor(&mut rt, SwingBias::NoTrade, 101.0, 101.0, 0.01, 100.0);
+
+        let trade = rt.contract_last_trade.as_ref().expect("closed trade expected");
+        assert!(
+            (rt.contract_realized_pnl_session - trade.net_realized_pnl_usd).abs() < 1e-6,
+            "session pnl and trade net should match"
+        );
     }
 }
