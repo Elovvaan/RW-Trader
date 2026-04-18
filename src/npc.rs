@@ -547,6 +547,21 @@ struct OpenAction {
     regime: MarketRegime,
     allocated_qty: f64,
     cycle_id: u64,
+    execution_mode: NpcTradingMode,
+}
+
+const SLOT_QTY_EPSILON: f64 = 0.000_000_01;
+const SLOT_RESERVATION_TTL_SECS: u64 = 30;
+const SLOT_PENDING_ACK_TTL_SECS: u64 = 30;
+
+#[derive(Clone, Debug, Default)]
+struct SlotUsageDiagnostics {
+    max_concurrent_positions: usize,
+    counted_open_positions: usize,
+    counted_pending_orders: usize,
+    counted_reserved_slots: usize,
+    slot_block_reason: String,
+    slot_source_ids: Vec<String>,
 }
 
 struct NpcRuntimeState {
@@ -727,6 +742,12 @@ pub struct NpcLoopSnapshot {
     pub active_profile: String,
     pub active_profile_label: String,
     pub profile_lock: String,
+    pub max_concurrent_positions: usize,
+    pub counted_open_positions: usize,
+    pub counted_pending_orders: usize,
+    pub counted_reserved_slots: usize,
+    pub slot_block_reason: String,
+    pub slot_source_ids: String,
     // ── Drawdown diagnostics ──────────────────────────────────────────────────
     /// Current equity estimate used in drawdown calculation (position value + aggregate PnL).
     pub current_equity: f64,
@@ -922,6 +943,9 @@ impl NpcAutonomousController {
         }
         {
             let mut rt = self.runtime.lock().await;
+            rt.open_actions.clear();
+            rt.cycle_open_notional = 0.0;
+            rt.last_action_at.clear();
             rt.flip_cycle_phase = FlipCyclePhase::SeekEntry;
             rt.flip_last_completed = None;
             rt.flip_session_pnl = 0.0;
@@ -930,6 +954,11 @@ impl NpcAutonomousController {
             rt.flip_last_entry_qty = 0.0;
             rt.flip_last_active = None;
             rt.flip_blocker.clear();
+            rt.contract_position = None;
+            rt.contract_last_trade = None;
+            rt.contract_realized_pnl_session = 0.0;
+            rt.contract_last_exit_reason.clear();
+            rt.contract_last_no_open_reason.clear();
             rt.swing_entry_price = 0.0;
             rt.swing_entry_started_at = None;
             rt.swing_peak_price = 0.0;
@@ -952,6 +981,11 @@ impl NpcAutonomousController {
         {
             let mut t = self.telemetry.lock().await;
             t.threshold_mode = profile.as_str().to_ascii_lowercase();
+            t.last_action = "NO_ACTION".to_string();
+            t.execution_result = NPC_STATUS_SCANNING.to_string();
+            t.last_agent_decision = format!("Profile switched to {}", profile.as_str());
+            t.pipeline_state = "Scanning".to_string();
+            t.final_decision = "HOLD".to_string();
             t.cooldown_active = false;
             t.cooldown_remaining_ms = 0;
             t.last_no_trade_reason.clear();
@@ -1043,7 +1077,17 @@ impl NpcAutonomousController {
         let control = self.control.lock().await;
         let cfg = self.cfg.lock().await.clone();
         let agent_mode = control.mode;
-        let (current_equity, peak_equity, drawdown_pct, compound, flip, contract, rebalance, contract_last_no_open_reason) = {
+        let (truth_position_size, truth_sell_inventory, truth_pending_order_slots, truth_pending_order_ids) = {
+            let truth = self.state.truth.lock().await;
+            let (pending_order_slots, pending_order_ids) = collect_truth_pending_order_slots(&truth);
+            (
+                truth.position.size,
+                truth.sell_inventory,
+                pending_order_slots,
+                pending_order_ids,
+            )
+        };
+        let (current_equity, peak_equity, drawdown_pct, compound, flip, contract, rebalance, contract_last_no_open_reason, slot_usage) = {
             // Compute current equity and drawdown from runtime state (same formula as evaluate_portfolio_controls).
             let rt = self.runtime.lock().await;
             let aggregate_pnl: f64 = rt.perf.values().map(|p| p.gross_pnl).sum();
@@ -1155,7 +1199,15 @@ impl NpcAutonomousController {
                 rt.btc_before,
                 rt.btc_after,
             );
-            (equity, peak, dd, c, f, k, reb, rt.contract_last_no_open_reason.clone())
+            let slot_usage = slot_usage_snapshot(
+                &cfg,
+                &rt,
+                truth_position_size,
+                truth_sell_inventory,
+                truth_pending_order_slots,
+                &truth_pending_order_ids,
+            );
+            (equity, peak, dd, c, f, k, reb, rt.contract_last_no_open_reason.clone(), slot_usage)
         };
         let (
             compound_pos_btc, compound_pos_usd,
@@ -1226,6 +1278,12 @@ impl NpcAutonomousController {
             active_profile: active_profile.as_str().to_string(),
             active_profile_label: active_profile.label().to_string(),
             profile_lock: active_profile.as_str().to_string(),
+            max_concurrent_positions: slot_usage.max_concurrent_positions,
+            counted_open_positions: slot_usage.counted_open_positions,
+            counted_pending_orders: slot_usage.counted_pending_orders,
+            counted_reserved_slots: slot_usage.counted_reserved_slots,
+            slot_block_reason: slot_usage.slot_block_reason,
+            slot_source_ids: slot_usage.slot_source_ids.join("|"),
             current_equity,
             peak_equity,
             drawdown_pct,
@@ -1980,11 +2038,12 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         compute_swing_signals(&feed, metrics.mid)
     };
 
-    let (position_size, buy_power, sell_inventory, exposure_notional, total_balance_usd) = {
+    let (position_size, buy_power, sell_inventory, exposure_notional, total_balance_usd, pending_order_slots, pending_order_ids) = {
         let t = state.truth.lock().await;
         let pos = t.position.size.max(0.0);
         let mid = metrics.mid.max(0.0);
-        (pos, t.buy_power.max(0.0), t.sell_inventory.max(0.0), pos * mid, t.total_balance_usd.max(0.0))
+        let (pending_order_slots, pending_order_ids) = collect_truth_pending_order_slots(&t);
+        (pos, t.buy_power.max(0.0), t.sell_inventory.max(0.0), pos * mid, t.total_balance_usd.max(0.0), pending_order_slots, pending_order_ids)
     };
 
     let (effective_threshold, threshold_mode) = adaptive_signal_threshold_with_trading_mode(total_balance_usd, cfg.mode);
@@ -2288,7 +2347,24 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
     apply_learner_overrides(&mut effective_cfg, &mut rt);
 
     let regime = detect_regime(&effective_cfg, &rt.mid_history, &rt.spread_history, &metrics);
-    let portfolio_controls = evaluate_portfolio_controls(&effective_cfg, &rt, position_size, exposure_notional, metrics.mid, regime);
+    let slot_usage = reconcile_slot_usage(
+        &effective_cfg,
+        &mut rt,
+        position_size,
+        sell_inventory,
+        pending_order_slots,
+        &pending_order_ids,
+        effective_cfg.mode,
+    );
+    let portfolio_controls = evaluate_portfolio_controls(
+        &effective_cfg,
+        &rt,
+        &slot_usage,
+        position_size,
+        exposure_notional,
+        metrics.mid,
+        regime,
+    );
 
     let mut candidates = build_worker_candidates(
         &effective_cfg,
@@ -3329,6 +3405,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             regime,
             allocated_qty: allocation.qty,
             cycle_id,
+            execution_mode: effective_cfg.mode,
         },
     );
 
@@ -3882,21 +3959,182 @@ fn evaluate_guards(
     (reasons, cooldown_active, cooldown_remaining_ms)
 }
 
+fn collect_truth_pending_order_slots(truth: &crate::reconciler::TruthState) -> (usize, Vec<String>) {
+    let mut ids = Vec::new();
+    let mut fresh_pending_ack = 0usize;
+    for o in truth.orders.values() {
+        if o.status.is_active() {
+            ids.push(format!("order:{}", o.client_order_id));
+            continue;
+        }
+        if o.is_pending_ack() && o.last_seen.elapsed() <= Duration::from_secs(SLOT_PENDING_ACK_TTL_SECS) {
+            fresh_pending_ack = fresh_pending_ack.saturating_add(1);
+            ids.push(format!("pending_ack:{}", o.client_order_id));
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    let counted = truth.open_order_count.max(fresh_pending_ack);
+    if truth.open_order_count > ids.len() {
+        ids.push(format!("exchange_open_orders:{}", truth.open_order_count));
+    }
+    (counted, ids)
+}
+
+fn count_live_open_positions(position_size: f64, sell_inventory: f64) -> usize {
+    usize::from(position_size.abs() > SLOT_QTY_EPSILON || sell_inventory.abs() > SLOT_QTY_EPSILON)
+}
+
+fn release_open_action_slot(rt: &mut NpcRuntimeState, id: &str) {
+    if let Some(open) = rt.open_actions.remove(id) {
+        rt.cycle_open_notional = (rt.cycle_open_notional - (open.allocated_qty * open.entry_mid).max(0.0)).max(0.0);
+    }
+}
+
+fn build_slot_usage_diagnostics(
+    cfg: &NpcConfig,
+    counted_open_positions: usize,
+    counted_pending_orders: usize,
+    counted_reserved_slots: usize,
+    mut source_ids: Vec<String>,
+) -> SlotUsageDiagnostics {
+    let counted_total_slots = counted_open_positions
+        .saturating_add(counted_pending_orders)
+        .saturating_add(counted_reserved_slots);
+    if source_ids.is_empty() {
+        source_ids.push("none".to_string());
+    }
+    let slot_block_reason = if counted_total_slots >= cfg.alpha.max_concurrent_positions {
+        format!(
+            "MAX_CONCURRENT_POSITIONS:{}>={}",
+            counted_total_slots, cfg.alpha.max_concurrent_positions
+        )
+    } else {
+        String::new()
+    };
+    SlotUsageDiagnostics {
+        max_concurrent_positions: cfg.alpha.max_concurrent_positions,
+        counted_open_positions,
+        counted_pending_orders,
+        counted_reserved_slots,
+        slot_block_reason,
+        slot_source_ids: source_ids,
+    }
+}
+
+fn slot_usage_snapshot(
+    cfg: &NpcConfig,
+    rt: &NpcRuntimeState,
+    position_size: f64,
+    sell_inventory: f64,
+    pending_order_slots: usize,
+    pending_order_ids: &[String],
+) -> SlotUsageDiagnostics {
+    let counted_open_positions = count_live_open_positions(position_size, sell_inventory);
+    let counted_reserved_slots = if counted_open_positions > 0 || pending_order_slots > 0 {
+        0
+    } else {
+        rt.open_actions
+            .values()
+            .filter(|open| open.allocated_qty > SLOT_QTY_EPSILON && open.entry_mid.is_finite() && open.entry_mid > 0.0)
+            .count()
+    };
+    let mut source_ids = Vec::new();
+    if counted_open_positions > 0 {
+        source_ids.push("position:spot_inventory".to_string());
+    }
+    source_ids.extend(pending_order_ids.iter().cloned());
+    if counted_reserved_slots > 0 {
+        source_ids.extend(
+            rt.open_actions
+                .keys()
+                .take(counted_reserved_slots)
+                .map(|id| format!("reservation:{id}")),
+        );
+    }
+    build_slot_usage_diagnostics(
+        cfg,
+        counted_open_positions,
+        pending_order_slots,
+        counted_reserved_slots,
+        source_ids,
+    )
+}
+
+fn reconcile_slot_usage(
+    cfg: &NpcConfig,
+    rt: &mut NpcRuntimeState,
+    position_size: f64,
+    sell_inventory: f64,
+    pending_order_slots: usize,
+    pending_order_ids: &[String],
+    active_mode: NpcTradingMode,
+) -> SlotUsageDiagnostics {
+    let counted_open_positions = count_live_open_positions(position_size, sell_inventory);
+    let mut stale_ids = Vec::new();
+    for (id, open) in rt.open_actions.iter() {
+        let stale_qty = open.allocated_qty <= SLOT_QTY_EPSILON;
+        let stale_entry = !open.entry_mid.is_finite() || open.entry_mid <= 0.0;
+        let expired = open.opened_at.elapsed() > Duration::from_secs(SLOT_RESERVATION_TTL_SECS);
+        let stale_mode = active_mode == NpcTradingMode::Live && open.execution_mode != NpcTradingMode::Live;
+        if stale_qty || stale_entry || expired || stale_mode {
+            stale_ids.push(id.clone());
+        }
+    }
+    for id in stale_ids {
+        release_open_action_slot(rt, &id);
+    }
+
+    let live_slots = counted_open_positions.saturating_add(pending_order_slots);
+    if live_slots == 0 && !rt.open_actions.is_empty() {
+        let ids: Vec<String> = rt.open_actions.keys().cloned().collect();
+        for id in ids {
+            release_open_action_slot(rt, &id);
+        }
+    }
+
+    let mut counted_reserved_slots = if live_slots > 0 { 0 } else { rt.open_actions.len() };
+    if counted_reserved_slots > 0
+        && live_slots < cfg.alpha.max_concurrent_positions
+        && live_slots.saturating_add(counted_reserved_slots) >= cfg.alpha.max_concurrent_positions
+    {
+        let ids: Vec<String> = rt.open_actions.keys().cloned().collect();
+        for id in ids {
+            release_open_action_slot(rt, &id);
+        }
+        counted_reserved_slots = 0;
+    }
+
+    let mut source_ids = Vec::new();
+    if counted_open_positions > 0 {
+        source_ids.push("position:spot_inventory".to_string());
+    }
+    source_ids.extend(pending_order_ids.iter().cloned());
+    if counted_reserved_slots > 0 {
+        source_ids.extend(rt.open_actions.keys().map(|id| format!("reservation:{id}")));
+    }
+
+    build_slot_usage_diagnostics(
+        cfg,
+        counted_open_positions,
+        pending_order_slots,
+        counted_reserved_slots,
+        source_ids,
+    )
+}
+
 fn evaluate_portfolio_controls(
     cfg: &NpcConfig,
     rt: &NpcRuntimeState,
+    slot_usage: &SlotUsageDiagnostics,
     position_size: f64,
     exposure_notional: f64,
     mid: f64,
     regime: MarketRegime,
 ) -> Vec<String> {
     let mut reasons = Vec::new();
-    if rt.open_actions.len() >= cfg.alpha.max_concurrent_positions {
-        reasons.push(format!(
-            "MAX_CONCURRENT_POSITIONS:{}>={}",
-            rt.open_actions.len(),
-            cfg.alpha.max_concurrent_positions
-        ));
+    if !slot_usage.slot_block_reason.is_empty() {
+        reasons.push(slot_usage.slot_block_reason.clone());
     }
     if exposure_notional >= cfg.alpha.max_symbol_exposure_notional {
         reasons.push(format!(
@@ -4424,6 +4662,21 @@ mod tests {
         }
     }
 
+    fn open_action_for_test(entry_mid: f64, allocated_qty: f64, opened_at: Instant, mode: NpcTradingMode) -> OpenAction {
+        OpenAction {
+            role: NpcRole::Scout,
+            side: "BUY".to_string(),
+            entry_mid,
+            opened_at,
+            entry_spread_bps: 1.0,
+            expected_edge: 0.1,
+            regime: MarketRegime::TrendingUp,
+            allocated_qty,
+            cycle_id: 1,
+            execution_mode: mode,
+        }
+    }
+
     // ── evaluate_guards: small account SELL bypass ─────────────────────────────
 
     #[test]
@@ -4860,6 +5113,7 @@ mod tests {
         let reasons = evaluate_portfolio_controls(
             &cfg,
             &rt,
+            &SlotUsageDiagnostics::default(),
             /* position_size */ 0.0,
             /* exposure_notional */ 0.0,
             /* mid */ 50_000.0,
@@ -4879,6 +5133,7 @@ mod tests {
         let reasons = evaluate_portfolio_controls(
             &cfg,
             &rt,
+            &SlotUsageDiagnostics::default(),
             0.0,
             0.0,
             50_000.0,
@@ -4903,6 +5158,7 @@ mod tests {
         let reasons = evaluate_portfolio_controls(
             &cfg,
             &rt,
+            &SlotUsageDiagnostics::default(),
             0.0,
             0.0,
             50_000.0,
@@ -4924,6 +5180,7 @@ mod tests {
         let reasons = evaluate_portfolio_controls(
             &cfg,
             &rt,
+            &SlotUsageDiagnostics::default(),
             0.0,
             0.0,
             50_000.0,
@@ -4934,6 +5191,92 @@ mod tests {
         assert!(breach.contains("current_equity"), "Breach message must include current_equity; got: {breach}");
         assert!(breach.contains("peak_equity"), "Breach message must include peak_equity; got: {breach}");
         assert!(breach.contains("limit"), "Breach message must include limit; got: {breach}");
+    }
+
+    #[test]
+    fn stale_pending_order_does_not_consume_slot_forever() {
+        let mut truth = crate::reconciler::TruthState::new("BTCUSDT", 0.0);
+        truth.orders.insert(
+            "stale-pending".to_string(),
+            crate::reconciler::OrderRecord {
+                client_order_id: "stale-pending".to_string(),
+                exchange_order_id: 0,
+                symbol: "BTCUSDT".to_string(),
+                side: "BUY".to_string(),
+                order_type: "LIMIT".to_string(),
+                orig_qty: 0.001,
+                filled_qty: 0.0,
+                remaining_qty: 0.001,
+                avg_fill_price: 0.0,
+                status: crate::reconciler::OrderStatus::Unknown,
+                last_seen: Instant::now() - Duration::from_secs(SLOT_PENDING_ACK_TTL_SECS + 1),
+            },
+        );
+        let (counted, ids) = collect_truth_pending_order_slots(&truth);
+        assert_eq!(counted, 0, "stale pending ack must not reserve slot");
+        assert!(ids.is_empty(), "stale pending ack id must be excluded");
+    }
+
+    #[test]
+    fn closed_position_does_not_consume_slot() {
+        let cfg = test_cfg();
+        let rt = NpcRuntimeState::default();
+        let diag = slot_usage_snapshot(&cfg, &rt, 0.0, 0.0, 0, &[]);
+        assert_eq!(diag.counted_open_positions, 0);
+        assert_eq!(diag.counted_pending_orders, 0);
+        assert_eq!(diag.counted_reserved_slots, 0);
+    }
+
+    #[test]
+    fn failed_execution_clears_reserved_slot() {
+        let mut cfg = test_cfg();
+        cfg.alpha.max_concurrent_positions = 1;
+        let mut rt = NpcRuntimeState::default();
+        rt.open_actions.insert(
+            "orphan-reservation".to_string(),
+            open_action_for_test(50_000.0, 0.001, Instant::now(), NpcTradingMode::Paper),
+        );
+        let diag = reconcile_slot_usage(&cfg, &mut rt, 0.0, 0.0, 0, &[], NpcTradingMode::Live);
+        assert_eq!(diag.counted_reserved_slots, 0, "orphaned reservation must be self-healed");
+        assert!(rt.open_actions.is_empty(), "reserved slot must be removed");
+    }
+
+    #[test]
+    fn zero_qty_or_synthetic_position_does_not_count_reserved_slot() {
+        let cfg = test_cfg();
+        let mut rt = NpcRuntimeState::default();
+        rt.open_actions.insert(
+            "zero-qty".to_string(),
+            open_action_for_test(50_000.0, 0.0, Instant::now(), NpcTradingMode::Live),
+        );
+        rt.open_actions.insert(
+            "synthetic-entry".to_string(),
+            open_action_for_test(0.0, 0.001, Instant::now(), NpcTradingMode::Live),
+        );
+        let diag = reconcile_slot_usage(&cfg, &mut rt, 0.0, 0.0, 0, &[], NpcTradingMode::Live);
+        assert_eq!(diag.counted_reserved_slots, 0);
+        assert!(rt.open_actions.is_empty(), "invalid reservations must be purged");
+    }
+
+    #[test]
+    fn counted_slots_match_live_reconciled_state() {
+        let cfg = test_cfg();
+        let mut rt = NpcRuntimeState::default();
+        rt.open_actions.insert(
+            "stale-paper".to_string(),
+            open_action_for_test(50_000.0, 0.001, Instant::now(), NpcTradingMode::Paper),
+        );
+        let pending_ids = vec!["order:live-1".to_string()];
+        let diag = reconcile_slot_usage(&cfg, &mut rt, 0.002, 0.002, 1, &pending_ids, NpcTradingMode::Live);
+        assert_eq!(diag.counted_open_positions, 1);
+        assert_eq!(diag.counted_pending_orders, 1);
+        assert_eq!(diag.counted_reserved_slots, 0);
+        assert!(
+            diag.slot_source_ids.iter().any(|s| s == "position:spot_inventory")
+                && diag.slot_source_ids.iter().any(|s| s == "order:live-1"),
+            "diagnostics must reflect reconciled live sources: {:?}",
+            diag.slot_source_ids
+        );
     }
 
     // ── Micro-account adaptive signal thresholds ───────────────────────────────
@@ -5159,6 +5502,42 @@ mod diagnostic_tests {
                 is_aggressor_buy: true,
             });
         }
+    }
+
+    #[tokio::test]
+    async fn profile_switch_does_not_preserve_stale_slot_runtime_state() {
+        let store: Arc<dyn crate::store::EventStore> = InMemoryEventStore::new();
+        let authority = Arc::new(AuthorityLayer::new());
+        let state = make_agent_state(Arc::clone(&store), authority, None);
+        let npc = NpcAutonomousController::new(active_npc_cfg(), state);
+
+        {
+            let mut rt = npc.runtime.lock().await;
+            rt.open_actions.insert(
+                "stale-slot".to_string(),
+                OpenAction {
+                    role: NpcRole::Scout,
+                    side: "BUY".to_string(),
+                    entry_mid: 50_000.0,
+                    opened_at: Instant::now(),
+                    entry_spread_bps: 1.0,
+                    expected_edge: 0.1,
+                    regime: MarketRegime::TrendingUp,
+                    allocated_qty: 0.001,
+                    cycle_id: 1,
+                    execution_mode: NpcTradingMode::Paper,
+                },
+            );
+            rt.cycle_open_notional = 50.0;
+            rt.rebalance_reason = "stale".to_string();
+        }
+
+        npc.set_active_profile(RuntimeProfile::Swing).await;
+
+        let rt = npc.runtime.lock().await;
+        assert!(rt.open_actions.is_empty(), "profile switch must clear stale slot reservations");
+        assert_eq!(rt.cycle_open_notional, 0.0, "profile switch must reset reserved notional");
+        assert!(rt.rebalance_reason.is_empty(), "profile switch must clear stale runtime labels");
     }
 
     // ── Gate 1: authority-layer ───────────────────────────────────────────────
