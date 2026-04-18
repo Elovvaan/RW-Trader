@@ -727,7 +727,7 @@ async fn agent_status_json(state: &AppState) -> String {
     let override_used = snap.last_agent_decision.contains("override_used=true")
         || snap.last_no_trade_reason.contains("override_used=true");
     let body = format!(
-        r#"{{"mode":"{mode_str}","state":"{state_label}","agent_state":"{status_str}","last_action":"{last_action}","last_reason":"{last_reason}","last_agent_decision":"{last_decision}","last_no_trade_reason":"{no_trade_reason}","pipeline_state":"{pipeline}","final_decision":"{final_decision}","balance_block_reason":"{balance_block}","risk_block_reason":"{risk_block}","execution_block_reason":"{exec_block}","max_concurrent_positions":{max_concurrent_positions},"counted_open_positions":{counted_open_positions},"counted_pending_orders":{counted_pending_orders},"counted_reserved_slots":{counted_reserved_slots},"slot_block_reason":"{slot_block_reason}","slot_source_ids":"{slot_source_ids}","risk_override":{risk_override},"active_profile":"{active_profile}","active_profile_label":"{active_profile_label}","PROFILE_LOCK":"{profile_lock}","current_equity":{current_equity},"peak_equity":{peak_equity},"drawdown_pct":{drawdown_pct},"drawdown_limit":{drawdown_limit},"cycle_count":{cycle_count},"running":{running},"cooldown_active":{cooldown_active},"cooldown_remaining_ms":{cooldown_remaining_ms},"effective_threshold":{effective_threshold},"threshold_mode":"{threshold_mode}","raw_score":{raw_score},"adjusted_score":{adjusted_score},"threshold_used":{threshold_used},"penalty_clamped":{penalty_clamped},"override_used":{override_used},"compound_position_size_usd":{compound_pos_usd},"compound_position_size_btc":{compound_pos_btc},"compound_last_trade_pnl":{compound_last_pnl},"compound_session_pnl":{compound_sess_pnl},"compound_peak_balance":{compound_peak_bal},"compound_current_balance":{compound_cur_bal},"compound_consecutive_losses":{compound_consec},"compound_size_scalar":{compound_scalar},"compound_loss_pause_active":{compound_paused},"raw_position_size_usd":{raw_position_size_usd},"adjusted_position_size_usd":{adjusted_position_size_usd},"min_notional":{min_notional},"sizing_adjustment_reason":"{sizing_adjustment_reason}","flip_cycle_phase":"{flip_cycle_phase}","flip_session_pnl":{flip_session_pnl},"flip_rotation_count":{flip_rotation_count},"flip_last_entry_price":{flip_last_entry_price},"flip_last_exit_price":{flip_last_exit_price},"flip_last_pnl_usd":{flip_last_pnl_usd},"flip_last_pnl_pct":{flip_last_pnl_pct},"flip_min_profit_floor":{flip_min_profit_floor},"flip_blocker":"{flip_blocker}","contract_side":"{contract_side}","contract_leverage":{contract_leverage},"contract_entry_price":{contract_entry_price},"contract_mark_price":{contract_mark_price},"contract_notional_usd":{contract_notional_usd},"contract_unrealized_pnl":{contract_unrealized_pnl},"contract_realized_pnl_session":{contract_realized_pnl_session},"contract_liquidation_price":{contract_liquidation_price},"contract_stop_loss":{contract_stop_loss},"contract_take_profit":{contract_take_profit},"contract_liquidation_buffer_pct":{contract_liquidation_buffer_pct},"contract_duration_secs":{contract_duration_secs},"contract_exit_reason":"{contract_exit_reason}","contract_last_trade_result":{contract_last_trade_result},"contract_paper_mode":{contract_paper_mode},"contract_last_no_open_reason":"{contract_last_no_open_reason}","rebalance_status":"{rebalance_status}","rebalance_triggered":{rebalance_triggered},"rebalance_reason":"{rebalance_reason}","rebalance_side":"{rebalance_side}","rebalance_qty":{rebalance_qty},"rebalance_value_usd":{rebalance_value_usd},"free_usdt_before":{free_usdt_before},"free_usdt_after":{free_usdt_after},"btc_before":{btc_before},"btc_after":{btc_after}}}"#,
+        r#"{{"mode":"{mode_str}","state":"{state_label}","agent_state":"{status_str}","last_action":"{last_action}","last_reason":"{last_reason}","last_agent_decision":"{last_decision}","last_no_trade_reason":"{no_trade_reason}","pipeline_state":"{pipeline}","final_decision":"{final_decision}","balance_block_reason":"{balance_block}","risk_block_reason":"{risk_block}","execution_block_reason":"{exec_block}","max_concurrent_positions":{max_concurrent_positions},"counted_open_positions":{counted_open_positions},"counted_pending_orders":{counted_pending_orders},"counted_reserved_slots":{counted_reserved_slots},"slot_block_reason":"{slot_block_reason}","slot_source_ids":"{slot_source_ids}","risk_override":{risk_override},"regime_override":{regime_override},"active_profile":"{active_profile}","active_profile_label":"{active_profile_label}","PROFILE_LOCK":"{profile_lock}","current_equity":{current_equity},"peak_equity":{peak_equity},"drawdown_pct":{drawdown_pct},"drawdown_limit":{drawdown_limit},"cycle_count":{cycle_count},"running":{running},"cooldown_active":{cooldown_active},"cooldown_remaining_ms":{cooldown_remaining_ms},"effective_threshold":{effective_threshold},"threshold_mode":"{threshold_mode}","raw_score":{raw_score},"adjusted_score":{adjusted_score},"threshold_used":{threshold_used},"penalty_clamped":{penalty_clamped},"override_used":{override_used},"compound_position_size_usd":{compound_pos_usd},"compound_position_size_btc":{compound_pos_btc},"compound_last_trade_pnl":{compound_last_pnl},"compound_session_pnl":{compound_sess_pnl},"compound_peak_balance":{compound_peak_bal},"compound_current_balance":{compound_cur_bal},"compound_consecutive_losses":{compound_consec},"compound_size_scalar":{compound_scalar},"compound_loss_pause_active":{compound_paused},"raw_position_size_usd":{raw_position_size_usd},"adjusted_position_size_usd":{adjusted_position_size_usd},"min_notional":{min_notional},"sizing_adjustment_reason":"{sizing_adjustment_reason}","sizing_bumped":{sizing_bumped},"flip_cycle_phase":"{flip_cycle_phase}","flip_session_pnl":{flip_session_pnl},"flip_rotation_count":{flip_rotation_count},"flip_last_entry_price":{flip_last_entry_price},"flip_last_exit_price":{flip_last_exit_price},"flip_last_pnl_usd":{flip_last_pnl_usd},"flip_last_pnl_pct":{flip_last_pnl_pct},"flip_min_profit_floor":{flip_min_profit_floor},"flip_blocker":"{flip_blocker}","contract_side":"{contract_side}","contract_leverage":{contract_leverage},"contract_entry_price":{contract_entry_price},"contract_mark_price":{contract_mark_price},"contract_notional_usd":{contract_notional_usd},"contract_unrealized_pnl":{contract_unrealized_pnl},"contract_realized_pnl_session":{contract_realized_pnl_session},"contract_liquidation_price":{contract_liquidation_price},"contract_stop_loss":{contract_stop_loss},"contract_take_profit":{contract_take_profit},"contract_liquidation_buffer_pct":{contract_liquidation_buffer_pct},"contract_duration_secs":{contract_duration_secs},"contract_exit_reason":"{contract_exit_reason}","contract_last_trade_result":{contract_last_trade_result},"contract_paper_mode":{contract_paper_mode},"contract_last_no_open_reason":"{contract_last_no_open_reason}","rebalance_status":"{rebalance_status}","rebalance_triggered":{rebalance_triggered},"rebalance_reason":"{rebalance_reason}","rebalance_side":"{rebalance_side}","rebalance_qty":{rebalance_qty},"rebalance_value_usd":{rebalance_value_usd},"free_usdt_before":{free_usdt_before},"free_usdt_after":{free_usdt_after},"btc_before":{btc_before},"btc_after":{btc_after},"final_blocker_reason":"{final_blocker_reason}"}}"#,
         current_equity  = snap.current_equity,
         peak_equity     = snap.peak_equity,
         drawdown_pct    = snap.drawdown_pct,
@@ -749,6 +749,7 @@ async fn agent_status_json(state: &AppState) -> String {
         penalty_clamped       = penalty_clamped,
         override_used         = override_used,
         risk_override         = snap.risk_override,
+        regime_override       = snap.regime_override,
         active_profile        = snap.active_profile.replace('"', "\\\""),
         active_profile_label  = snap.active_profile_label.replace('"', "\\\""),
         profile_lock          = snap.profile_lock.replace('"', "\\\""),
@@ -765,6 +766,7 @@ async fn agent_status_json(state: &AppState) -> String {
         adjusted_position_size_usd = snap.adjusted_position_size_usd,
         min_notional = snap.min_notional,
         sizing_adjustment_reason = snap.sizing_adjustment_reason.replace('"', "\\\""),
+        sizing_bumped = snap.sizing_bumped,
         flip_cycle_phase      = snap.flip_cycle_phase.replace('"', "\\\""),
         flip_session_pnl      = snap.flip_session_pnl,
         flip_rotation_count   = snap.flip_rotation_count,
@@ -800,6 +802,7 @@ async fn agent_status_json(state: &AppState) -> String {
         free_usdt_after               = snap.free_usdt_after,
         btc_before                    = snap.btc_before,
         btc_after                     = snap.btc_after,
+        final_blocker_reason          = snap.final_blocker_reason.replace('"', "\\\""),
     );
     json_resp(&body)
 }
@@ -1186,6 +1189,11 @@ async fn page_events(state: &AppState, query: &str) -> String {
                 "background:rgba(82,255,168,0.10);border-color:#52ffa8;color:#52ffa8;",
                 format!("{}", esc(current_profile.label())),
             )
+        } else if current_profile == RuntimeProfile::MicroSafeExecution {
+            (
+                "background:rgba(34,197,94,0.10);border-color:#22c55e;color:#22c55e;",
+                format!("{}", esc(current_profile.label())),
+            )
         } else if current_profile == RuntimeProfile::MicroTest {
             (
                 "background:rgba(240,185,11,0.12);border-color:#f0b90b;color:#f0b90b;",
@@ -1392,6 +1400,13 @@ async fn page_events(state: &AppState, query: &str) -> String {
                 "<div style='grid-column:1/-1;padding:4px 8px;background:rgba(34,197,94,.12);\
                  border:1px solid rgba(34,197,94,.4);border-radius:8px;color:#22c55e;font-weight:700'>\
                  ⚡ MICRO_ACTIVE (live) — threshold {:.2}, penalty dampening ON</div>",
+                npc_loop.effective_threshold
+            )
+        } else if npc_loop.threshold_mode == "micro_safe_execution" {
+            format!(
+                "<div style='grid-column:1/-1;padding:4px 8px;background:rgba(34,197,94,.12);\
+                 border:1px solid rgba(34,197,94,.4);border-radius:8px;color:#22c55e;font-weight:700'>\
+                 🛡 MICRO_SAFE_EXECUTION — threshold {:.2}, regime override and penalty clamps ON</div>",
                 npc_loop.effective_threshold
             )
         } else if npc_loop.threshold_mode == "micro_aggressive" {
@@ -2146,6 +2161,7 @@ async fn page_events(state: &AppState, query: &str) -> String {
             bmode       = esc(&phase1_status.behavior_mode),
             bmode_color = if current_profile == RuntimeProfile::FlipHyper { "#f0b90b" }
                          else if current_profile == RuntimeProfile::MicroActive { "#52ffa8" }
+                         else if current_profile == RuntimeProfile::MicroSafeExecution { "#22c55e" }
                          else { "#93a2b3" },
             tw          = phase1_status.effective_trigger_window_secs,
             drift       = phase1_status.effective_min_trend_drift * 100.0,
@@ -2372,6 +2388,7 @@ async fn page_assistant(state: &AppState, query: &str) -> String {
         ("ACTIVE",       "Active — balanced defaults"),
         ("MICRO_TEST",   "Micro-Test — faster decisions for small balances"),
         ("MICRO_ACTIVE", "⚡ Micro Active — high-frequency mode for balances under $100"),
+        ("MICRO_SAFE_EXECUTION", "🛡 Micro Safe Execution — aggressive micro-safe mode for balances under $250"),
         ("FLIP_HYPER",   "🔄 Flip Hyper — rapid capital-rotation mode for sub-$100 live accounts"),
         ("SWING",        "📈 Swing — directional trend mode (minutes to hours)"),
     ]
@@ -3220,6 +3237,7 @@ mod tests {
         let state = make_state();
         let r = page_assistant(&state, "").await;
         assert!(r.contains("value='MICRO_ACTIVE'"), "SETTINGS page must include MICRO_ACTIVE option");
+        assert!(r.contains("value='MICRO_SAFE_EXECUTION'"), "SETTINGS page must include MICRO_SAFE_EXECUTION option");
         assert!(
             r.contains("high-frequency") || r.contains("Micro Active") || r.contains("$100"),
             "MICRO_ACTIVE option must have a descriptive label"
@@ -3248,6 +3266,7 @@ mod tests {
         assert!(r.contains("value='ACTIVE'"),       "ACTIVE option must be present");
         assert!(r.contains("value='MICRO_TEST'"),   "MICRO_TEST option must be present");
         assert!(r.contains("value='MICRO_ACTIVE'"), "MICRO_ACTIVE option must be present");
+        assert!(r.contains("value='MICRO_SAFE_EXECUTION'"), "MICRO_SAFE_EXECUTION option must be present");
         assert!(r.contains("Apply"),                "Apply button must be present");
     }
 
@@ -3456,6 +3475,9 @@ mod tests {
         assert!(r.contains("\"threshold_used\""), "JSON must contain threshold_used");
         assert!(r.contains("\"penalty_clamped\""), "JSON must contain penalty_clamped");
         assert!(r.contains("\"override_used\""), "JSON must contain override_used");
+        assert!(r.contains("\"regime_override\""), "JSON must contain regime_override");
+        assert!(r.contains("\"sizing_bumped\""), "JSON must contain sizing_bumped");
+        assert!(r.contains("\"final_blocker_reason\""), "JSON must contain final_blocker_reason");
     }
 
     #[tokio::test]
