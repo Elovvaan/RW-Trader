@@ -27,7 +27,7 @@ use tracing::{debug, error, info};
 use crate::assistant;
 use crate::authority::{AuthorityLayer, AuthorityMode};
 use crate::executor::Executor;
-use crate::profile::RuntimeProfile;
+use crate::profile::{ProfileConfig, RuntimeProfile};
 use crate::reader::{get_trade_timeline, summarise_event, LifecycleStage, TradeOutcome};
 use crate::reconciler::TruthState;
 use crate::risk::{self, RiskEngine, RiskVerdict};
@@ -226,6 +226,8 @@ async fn handle_post(path: &str, _query: &str, body: &str, state: &AppState) -> 
         let profile_str = form.get("profile").map(|s| s.as_str()).unwrap_or("ACTIVE");
         let new_profile = RuntimeProfile::from_str(profile_str);
         *state.profile.lock().await = new_profile;
+        state.npc.set_active_profile(new_profile).await;
+        *state.strategy.lock().await = StrategyEngine::with_profile(&ProfileConfig::for_profile(new_profile));
         log_ui_action(
             &*state.store,
             "ui_profile_changed",
@@ -714,7 +716,7 @@ async fn agent_status_json(state: &AppState) -> String {
     let exec_block = snap.execution_block_reason.replace('"', "\\\"");
     let threshold_mode = snap.threshold_mode.replace('"', "\\\"");
     let body = format!(
-        r#"{{"mode":"{mode_str}","state":"{state_label}","agent_state":"{status_str}","last_action":"{last_action}","last_reason":"{last_reason}","last_agent_decision":"{last_decision}","last_no_trade_reason":"{no_trade_reason}","pipeline_state":"{pipeline}","final_decision":"{final_decision}","balance_block_reason":"{balance_block}","risk_block_reason":"{risk_block}","execution_block_reason":"{exec_block}","risk_override":{risk_override},"current_equity":{current_equity},"peak_equity":{peak_equity},"drawdown_pct":{drawdown_pct},"drawdown_limit":{drawdown_limit},"cycle_count":{cycle_count},"running":{running},"cooldown_active":{cooldown_active},"cooldown_remaining_ms":{cooldown_remaining_ms},"effective_threshold":{effective_threshold},"threshold_mode":"{threshold_mode}","compound_position_size_usd":{compound_pos_usd},"compound_position_size_btc":{compound_pos_btc},"compound_last_trade_pnl":{compound_last_pnl},"compound_session_pnl":{compound_sess_pnl},"compound_peak_balance":{compound_peak_bal},"compound_current_balance":{compound_cur_bal},"compound_consecutive_losses":{compound_consec},"compound_size_scalar":{compound_scalar},"compound_loss_pause_active":{compound_paused},"flip_cycle_phase":"{flip_cycle_phase}","flip_session_pnl":{flip_session_pnl},"flip_rotation_count":{flip_rotation_count},"flip_last_entry_price":{flip_last_entry_price},"flip_last_exit_price":{flip_last_exit_price},"flip_last_pnl_usd":{flip_last_pnl_usd},"flip_last_pnl_pct":{flip_last_pnl_pct},"flip_min_profit_floor":{flip_min_profit_floor},"flip_blocker":"{flip_blocker}","contract_side":"{contract_side}","contract_leverage":{contract_leverage},"contract_entry_price":{contract_entry_price},"contract_mark_price":{contract_mark_price},"contract_notional_usd":{contract_notional_usd},"contract_unrealized_pnl":{contract_unrealized_pnl},"contract_realized_pnl_session":{contract_realized_pnl_session},"contract_liquidation_price":{contract_liquidation_price},"contract_stop_loss":{contract_stop_loss},"contract_take_profit":{contract_take_profit},"contract_liquidation_buffer_pct":{contract_liquidation_buffer_pct},"contract_duration_secs":{contract_duration_secs},"contract_exit_reason":"{contract_exit_reason}","contract_last_trade_result":{contract_last_trade_result},"contract_paper_mode":{contract_paper_mode}}}"#,
+        r#"{{"mode":"{mode_str}","state":"{state_label}","agent_state":"{status_str}","last_action":"{last_action}","last_reason":"{last_reason}","last_agent_decision":"{last_decision}","last_no_trade_reason":"{no_trade_reason}","pipeline_state":"{pipeline}","final_decision":"{final_decision}","balance_block_reason":"{balance_block}","risk_block_reason":"{risk_block}","execution_block_reason":"{exec_block}","risk_override":{risk_override},"active_profile":"{active_profile}","active_profile_label":"{active_profile_label}","PROFILE_LOCK":"{profile_lock}","current_equity":{current_equity},"peak_equity":{peak_equity},"drawdown_pct":{drawdown_pct},"drawdown_limit":{drawdown_limit},"cycle_count":{cycle_count},"running":{running},"cooldown_active":{cooldown_active},"cooldown_remaining_ms":{cooldown_remaining_ms},"effective_threshold":{effective_threshold},"threshold_mode":"{threshold_mode}","compound_position_size_usd":{compound_pos_usd},"compound_position_size_btc":{compound_pos_btc},"compound_last_trade_pnl":{compound_last_pnl},"compound_session_pnl":{compound_sess_pnl},"compound_peak_balance":{compound_peak_bal},"compound_current_balance":{compound_cur_bal},"compound_consecutive_losses":{compound_consec},"compound_size_scalar":{compound_scalar},"compound_loss_pause_active":{compound_paused},"flip_cycle_phase":"{flip_cycle_phase}","flip_session_pnl":{flip_session_pnl},"flip_rotation_count":{flip_rotation_count},"flip_last_entry_price":{flip_last_entry_price},"flip_last_exit_price":{flip_last_exit_price},"flip_last_pnl_usd":{flip_last_pnl_usd},"flip_last_pnl_pct":{flip_last_pnl_pct},"flip_min_profit_floor":{flip_min_profit_floor},"flip_blocker":"{flip_blocker}","contract_side":"{contract_side}","contract_leverage":{contract_leverage},"contract_entry_price":{contract_entry_price},"contract_mark_price":{contract_mark_price},"contract_notional_usd":{contract_notional_usd},"contract_unrealized_pnl":{contract_unrealized_pnl},"contract_realized_pnl_session":{contract_realized_pnl_session},"contract_liquidation_price":{contract_liquidation_price},"contract_stop_loss":{contract_stop_loss},"contract_take_profit":{contract_take_profit},"contract_liquidation_buffer_pct":{contract_liquidation_buffer_pct},"contract_duration_secs":{contract_duration_secs},"contract_exit_reason":"{contract_exit_reason}","contract_last_trade_result":{contract_last_trade_result},"contract_paper_mode":{contract_paper_mode},"contract_last_no_open_reason":"{contract_last_no_open_reason}","rebalance_status":"{rebalance_status}","rebalance_triggered":{rebalance_triggered},"rebalance_reason":"{rebalance_reason}","rebalance_side":"{rebalance_side}","rebalance_qty":{rebalance_qty},"rebalance_value_usd":{rebalance_value_usd},"free_usdt_before":{free_usdt_before},"free_usdt_after":{free_usdt_after},"btc_before":{btc_before},"btc_after":{btc_after}}}"#,
         current_equity  = snap.current_equity,
         peak_equity     = snap.peak_equity,
         drawdown_pct    = snap.drawdown_pct,
@@ -725,6 +727,9 @@ async fn agent_status_json(state: &AppState) -> String {
         cooldown_remaining_ms = snap.cooldown_remaining_ms,
         effective_threshold   = snap.effective_threshold,
         risk_override         = snap.risk_override,
+        active_profile        = snap.active_profile.replace('"', "\\\""),
+        active_profile_label  = snap.active_profile_label.replace('"', "\\\""),
+        profile_lock          = snap.profile_lock.replace('"', "\\\""),
         compound_pos_usd   = snap.compound_position_size_usd,
         compound_pos_btc   = snap.compound_position_size_btc,
         compound_last_pnl  = snap.compound_last_trade_pnl,
@@ -758,6 +763,17 @@ async fn agent_status_json(state: &AppState) -> String {
         contract_exit_reason          = snap.contract_exit_reason.replace('"', "\\\""),
         contract_last_trade_result    = snap.contract_last_trade_result,
         contract_paper_mode           = snap.contract_paper_mode,
+        contract_last_no_open_reason  = snap.contract_last_no_open_reason.replace('"', "\\\""),
+        rebalance_status              = snap.rebalance_status.replace('"', "\\\""),
+        rebalance_triggered           = snap.rebalance_triggered,
+        rebalance_reason              = snap.rebalance_reason.replace('"', "\\\""),
+        rebalance_side                = snap.rebalance_side.replace('"', "\\\""),
+        rebalance_qty                 = snap.rebalance_qty,
+        rebalance_value_usd           = snap.rebalance_value_usd,
+        free_usdt_before              = snap.free_usdt_before,
+        free_usdt_after               = snap.free_usdt_after,
+        btc_before                    = snap.btc_before,
+        btc_after                     = snap.btc_after,
     );
     json_resp(&body)
 }
@@ -1387,12 +1403,22 @@ async fn page_events(state: &AppState, query: &str) -> String {
                <div><span class='dim'>Final decision: </span>{final_dec}</div>\
                <div><span class='dim'>Drawdown: </span>{dd_info}</div>\
                <div><span class='dim'>Cooldown: </span>{cooldown_info}</div>\
+               <div><span class='dim'>Working capital (USDT): </span>{:.2}</div>\
+               <div><span class='dim'>Idle BTC inventory: </span>{:.8}</div>\
+               <div style='grid-column:1/-1'><span class='dim'>Rebalance status: </span>{}{}{}{}{} </div>\
                {micro_mode_badge}\
                {score_telemetry}\
                <div style='grid-column:1/-1'><span class='dim'>Balance block: </span>{}</div>\
                <div style='grid-column:1/-1'><span class='dim'>Risk block: </span>{}</div>\
                <div style='grid-column:1/-1'><span class='dim'>Execution block: </span>{}</div>\
-             </div>",
+              </div>",
+            buy_power,
+            sell_inventory,
+            esc(&npc_loop.rebalance_status),
+            if npc_loop.rebalance_triggered { " · triggered" } else { "" },
+            if npc_loop.rebalance_reason.is_empty() { "".to_string() } else { format!(" · {}", esc(&npc_loop.rebalance_reason)) },
+            if npc_loop.rebalance_side.is_empty() { "".to_string() } else { format!(" · side={} qty={:.8}", esc(&npc_loop.rebalance_side), npc_loop.rebalance_qty) },
+            if npc_loop.rebalance_value_usd > 0.0 { format!(" · value=${:.2}", npc_loop.rebalance_value_usd) } else { "".to_string() },
             if bal_block.is_empty() { "—".to_string() } else { bal_block },
             if risk_block.is_empty() { "—".to_string() } else { risk_block },
             if exec_block.is_empty() { "—".to_string() } else { exec_block },
@@ -2314,7 +2340,7 @@ async fn page_assistant(state: &AppState, query: &str) -> String {
     let (health_class, health_text) = system_health_summary(sys_mode, exec_state.clone(), kill_active);
     let recent_events = state.store.fetch_recent(10).unwrap_or_default();
 
-    // Profile selector options
+    // Profile selector options (single-active radio semantics).
     let profile_options = [
         ("CONSERVATIVE", "Conservative — cautious, long cooldowns"),
         ("ACTIVE",       "Active — balanced defaults"),
@@ -2325,8 +2351,10 @@ async fn page_assistant(state: &AppState, query: &str) -> String {
     ]
     .iter()
     .map(|(val, label)| {
-        let selected = if *val == current_profile.as_str() { " selected" } else { "" };
-        format!("<option value='{val}'{selected}>{label}</option>")
+        let checked = if *val == current_profile.as_str() { " checked" } else { "" };
+        format!(
+            "<label style='display:block;margin:4px 0'><input type='radio' name='profile' value='{val}'{checked}> {label}</label>"
+        )
     })
     .collect::<Vec<_>>()
     .join("");
@@ -2339,7 +2367,7 @@ async fn page_assistant(state: &AppState, query: &str) -> String {
           <div class='metric-card'><div class='metric-label'>Kill Switch</div><div class='metric-value {}'>{}</div></div>\
           <div class='metric-card'><div class='metric-label'>Agent Mode</div><div class='metric-value'>{}</div></div>\
           <div class='metric-card'><div class='metric-label'>Loop Cycles</div><div class='metric-value'>{}</div></div>\
-          <div class='metric-card'><div class='metric-label'>Runtime Profile</div><div class='metric-value'>{}</div></div>\
+          <div class='metric-card'><div class='metric-label'>CURRENT ACTIVE PROFILE</div><div class='metric-value'>{}</div></div>\
         </div>",
         health_class,
         esc(&health_text),
@@ -2354,11 +2382,11 @@ async fn page_assistant(state: &AppState, query: &str) -> String {
 
     let primary_body = format!("<div style='display:grid;gap:10px'>\
       <div class='signal-box'><div class='label'>Trading Controls</div><div class='sum'>Operator-level controls for runtime behavior and authority-safe interventions.</div><div style='margin-top:8px'>Authority workflows available in <a href='/authority'>FUNDS → approvals</a>. Agent control panel available on <a href='/events'>LIVE</a>.</div></div>\
-      <div class='signal-box'><div class='label'>Runtime Profile</div>\
+      <div class='signal-box'><div class='label'>CURRENT ACTIVE PROFILE</div>\
         <div class='sum'>Current: <strong>{}</strong></div>\
         <div class='sum' style='margin-top:4px'>{}</div>\
-        <form method='post' action='/assistant/profile' style='margin-top:8px;display:flex;gap:8px;align-items:center'>\
-          <select name='profile' style='flex:1'>{}</select>\
+        <form method='post' action='/assistant/profile' style='margin-top:8px'>\
+          {}\
           <button class='btn' type='submit'>Apply</button>\
         </form>\
         <div class='sum' style='margin-top:6px;font-size:11px'>Note: profile change takes effect on the next trading cycle. Spread guard, kill switch, and risk engine remain active on all profiles.</div>\
@@ -3178,8 +3206,8 @@ mod tests {
         *state.profile.lock().await = crate::profile::RuntimeProfile::MicroActive;
         let r = page_assistant(&state, "").await;
         assert!(
-            r.contains("value='MICRO_ACTIVE' selected") || r.contains("value='MICRO_ACTIVE'  selected"),
-            "MICRO_ACTIVE option must be marked as selected when profile is MICRO_ACTIVE"
+            r.contains("value='MICRO_ACTIVE' checked"),
+            "MICRO_ACTIVE radio must be checked when profile is MICRO_ACTIVE"
         );
     }
 
@@ -3188,7 +3216,8 @@ mod tests {
         let state = make_state();
         let r = page_assistant(&state, "").await;
         // The interactive selector element must be present.
-        assert!(r.contains("name='profile'"), "SETTINGS page must render profile <select> element");
+        assert!(r.contains("name='profile'"), "SETTINGS page must render profile selector controls");
+        assert!(r.contains("type='radio'"), "SETTINGS page must render profile radio controls");
         assert!(r.contains("value='CONSERVATIVE'"), "CONSERVATIVE option must be present");
         assert!(r.contains("value='ACTIVE'"),       "ACTIVE option must be present");
         assert!(r.contains("value='MICRO_TEST'"),   "MICRO_TEST option must be present");
@@ -3201,15 +3230,22 @@ mod tests {
         let state = make_state();
         *state.profile.lock().await = crate::profile::RuntimeProfile::MicroTest;
         let r = page_assistant(&state, "").await;
-        // MICRO_TEST option must carry the `selected` attribute.
+        // MICRO_TEST option must carry the `checked` attribute.
         assert!(
-            r.contains("value='MICRO_TEST' selected") || r.contains("value='MICRO_TEST'  selected"),
-            "MICRO_TEST option must be marked as selected"
+            r.contains("value='MICRO_TEST' checked"),
+            "MICRO_TEST option must be marked as checked"
         );
         assert!(
             r.contains("faster decisions") || r.contains("small balances"),
             "Micro-test label must appear in the profile description"
         );
+    }
+
+    #[tokio::test]
+    async fn test_assistant_shows_current_active_profile_label() {
+        let state = make_state();
+        let r = page_assistant(&state, "").await;
+        assert!(r.contains("CURRENT ACTIVE PROFILE"));
     }
 
     // ── Agent Control Panel ───────────────────────────────────────────────────
@@ -3425,6 +3461,11 @@ mod tests {
         let r = agent_status_json(&state).await;
         assert!(r.contains("\"effective_threshold\""), "JSON must contain effective_threshold");
         assert!(r.contains("\"threshold_mode\""), "JSON must contain threshold_mode");
+        assert!(r.contains("\"active_profile\""), "JSON must contain active_profile");
+        assert!(r.contains("\"active_profile_label\""), "JSON must contain active_profile_label");
+        assert!(r.contains("\"PROFILE_LOCK\""), "JSON must contain PROFILE_LOCK");
+        assert!(r.contains("\"rebalance_status\""), "JSON must contain rebalance_status");
+        assert!(r.contains("\"contract_last_no_open_reason\""), "JSON must contain contract_last_no_open_reason");
     }
 
     #[tokio::test]
