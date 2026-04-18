@@ -2578,6 +2578,64 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
     let metrics_line = format_cycle_metrics(cycle_id, regime, &candidates, effective_cutoff, &portfolio_controls);
     log_npc_event(&*state.store, "alpha_cycle", &metrics_line);
 
+    if candidates.is_empty() {
+        log_npc_event(&*state.store, "no_action", &format!("cycle={} reason=NO_CANDIDATES", cycle_id));
+        observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
+        return no_action(cycle_id, "NO_CANDIDATES".to_string(), "running".to_string());
+    }
+
+    // Walk candidates in score order. Regime-blocked roles that outrank the eventual
+    // winner are logged as Blocked. Everything below the winner is Superseded.
+    // This ensures a high-scoring but regime-ineligible SELL role (e.g. risk_manager
+    // in TRENDING_UP) does not prevent eligible BUY roles from being evaluated.
+    let mut chosen_opt: Option<WorkerProposal> = None;
+    let mut top_blocked_reason: Option<String> = None;
+    for c in &candidates {
+        if chosen_opt.is_some() {
+            // A winner was already found; everything below it is lower-ranked.
+            lifecycle(
+                &*state.store,
+                c.role,
+                &c.action_id,
+                NpcLifecycleState::Superseded,
+                "lower-ranked candidate superseded by orchestrator ranking",
+            );
+        } else if let Some(reason) = &c.regime_block_reason {
+            // Regime-blocked role ranked above all eligible candidates seen so far.
+            lifecycle(&*state.store, c.role, &c.action_id, NpcLifecycleState::Blocked, reason);
+            rt.perf.entry(c.role).or_default().blocked += 1;
+            top_blocked_reason.get_or_insert_with(|| reason.clone());
+        } else {
+            // First regime-eligible candidate — this is the chosen winner.
+            chosen_opt = Some(c.clone());
+        }
+    }
+
+    let chosen = match chosen_opt {
+        Some(c) => c,
+        None => {
+            // Every candidate was regime-blocked; report the top blocker's reason.
+            let reason = top_blocked_reason
+                .unwrap_or_else(|| format!("ALL_REGIME_BLOCKED regime={}", regime.as_str()));
+            observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
+            return NpcCycleReport {
+                cycle_id,
+                last_action: "NO_ACTION".to_string(),
+                execution_result: reason.clone(),
+                status: "blocked".to_string(),
+                last_agent_decision: format!(
+                    "HOLD — all roles blocked in {} regime: {}",
+                    regime.as_str(), reason
+                ),
+                no_trade_reason: format!(
+                    "No eligible candidate for {} regime — {}. Waiting for a suitable market condition.",
+                    regime.as_str(), reason
+                ),
+                pipeline_state: "Scanning".to_string(),
+                final_decision: "BLOCKED".to_string(),
+                balance_block_reason: String::new(),
+                risk_block_reason: reason.clone(),
+                execution_block_reason: reason,
     let Some(mut chosen) = candidates.first().cloned() else {
         log_npc_event(&*state.store, "no_action", &format!("cycle={} reason=NO_CANDIDATES", cycle_id));
         observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
@@ -2891,6 +2949,11 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                 cooldown_remaining_ms: 0,
                 effective_threshold: effective_cutoff,
                 threshold_mode: threshold_mode.to_string(),
+            };
+        }
+    };
+
+    if chosen.score < effective_cutoff {
                 raw_score: chosen.raw_score,
                 normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
                 top_score_penalties: chosen.score_parts.top_penalties_str(),
@@ -6784,6 +6847,21 @@ mod diagnostic_tests {
         }
     }
 
+    // ── Regime-skip gate: regime-blocked top-scorer must not silence eligible BUY ──
+
+    /// DIAGNOSTIC PROOF (LIVE issue fix): When the highest-scoring candidate is
+    /// regime-blocked (e.g. risk_manager/SELL in TRENDING_UP), the orchestrator
+    /// must skip it and promote the next eligible candidate, not return HOLD.
+    ///
+    /// Root cause of the LIVE no-trade issue: risk_manager scored 0.8366 in
+    /// TRENDING_UP but is REGIME_MISMATCH blocked. The old code picked it as
+    /// `chosen`, marked all others Superseded, then returned HOLD — Scout,
+    /// DipBuyer, and MomentumExecutor (all TRENDING_UP eligible) were never tried.
+    ///
+    /// After the fix the orchestrator walks the scored list, marks blocked roles
+    /// as Blocked (not Superseded), and promotes the first eligible role.
+    #[tokio::test]
+    async fn regime_blocked_top_scorer_does_not_silence_eligible_buy_roles() {
     // ── Post-threshold execution-chain proofs ─────────────────────────────────
     //
     // These tests prove the complete path AFTER a score passes effective_cutoff:
@@ -6917,6 +6995,30 @@ mod diagnostic_tests {
         let runtime = Arc::new(Mutex::new(NpcRuntimeState::default()));
         {
             let mut feed = state.feed.lock().await;
+            // Upward-trending feed so regime detects TRENDING_UP, enabling
+            // Scout / DipBuyer / MomentumExecutor but blocking risk_manager.
+            let now = std::time::Instant::now();
+            let mid_base = 50_000.0_f64;
+            feed.bid = mid_base * 0.9999;
+            feed.ask = mid_base * 1.0001;
+            feed.last_seen = Some(now);
+            for i in 0..30_usize {
+                let ts = now - Duration::from_millis((30 - i) as u64 * 50);
+                // Monotonically rising prices to ensure an up-trend signal.
+                let price = mid_base * (1.0 + i as f64 * 0.0001);
+                feed.mid_history.push_back(crate::feed::MidSample { timestamp: ts, mid: price });
+                feed.trade_history.push_back(crate::feed::TradeSample {
+                    timestamp: ts,
+                    qty: 0.1,
+                    is_aggressor_buy: true,
+                });
+            }
+        }
+        {
+            let mut truth = state.truth.lock().await;
+            truth.sell_inventory = 0.0;      // no inventory → no SELL candidates
+            truth.buy_power     = 5_000.0;   // enough for a BUY order
+            truth.total_balance_usd = 5_000.0;
             populate_feed(&mut feed, 50_000.0, 30);
         }
         {
@@ -6928,6 +7030,15 @@ mod diagnostic_tests {
 
         let report = run_cycle(&cfg, &state, runtime).await;
 
+        // The critical invariant: REGIME_MISMATCH on risk_manager must NOT be
+        // the sole reason for blocking when eligible BUY roles are available.
+        assert!(
+            !(report.final_decision == "BLOCKED"
+                && report.execution_result.contains("REGIME_MISMATCH")
+                && report.execution_result.contains("risk_manager")),
+            "regime-blocked risk_manager must not suppress eligible BUY roles; \
+             final_decision={} execution_result={} no_trade_reason={}",
+            report.final_decision, report.execution_result, report.no_trade_reason
         // PROOF: All NPC-internal gates pass; dispatch is the only blocker.
         assert_eq!(
             report.execution_result, "WEB_UI_ADDR_MISSING",
