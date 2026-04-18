@@ -30,6 +30,10 @@ pub enum RuntimeProfile {
     /// (kill switch, exchange filters, valid sizing, balance checks, authority
     /// mode, dispatcher / executor protections) remain fully active.
     MicroActive,
+    /// Aggressive micro-account execution mode for balances under $250.
+    ///
+    /// Prioritizes safe executability over perfection gating.
+    MicroSafeExecution,
     /// Rapid capital-rotation flip mode for sub-$100 live accounts.
     ///
     /// Adds the FLIP_HYPER state machine (SEEK_ENTRY → ENTERING →
@@ -54,6 +58,7 @@ impl RuntimeProfile {
             "ACTIVE"       => Self::Active,
             "MICRO_TEST" | "MICROTEST"     => Self::MicroTest,
             "MICRO_ACTIVE" | "MICROACTIVE" => Self::MicroActive,
+            "MICRO_SAFE_EXECUTION" | "MICROSAFEEXECUTION" => Self::MicroSafeExecution,
             "FLIP_HYPER" | "FLIPHYPER"     => Self::FlipHyper,
             "SWING" | "SWING_TRADER"       => Self::Swing,
             _              => Self::default(),
@@ -66,6 +71,7 @@ impl RuntimeProfile {
             Self::Active       => "ACTIVE",
             Self::MicroTest    => "MICRO_TEST",
             Self::MicroActive  => "MICRO_ACTIVE",
+            Self::MicroSafeExecution => "MICRO_SAFE_EXECUTION",
             Self::FlipHyper    => "FLIP_HYPER",
             Self::Swing        => "SWING",
         }
@@ -78,6 +84,7 @@ impl RuntimeProfile {
             Self::Active       => "Active — balanced defaults",
             Self::MicroTest    => "Micro-Test — faster decisions for small balances",
             Self::MicroActive  => "⚡ Micro Active — high-frequency mode for balances under $100",
+            Self::MicroSafeExecution => "🛡 Micro Safe Execution — aggressive micro-safe mode for balances under $250",
             Self::FlipHyper    => "🔄 Flip Hyper — rapid capital-rotation mode for sub-$100 live accounts",
             Self::Swing        => "📈 Swing — directional trend mode (minutes to hours)",
         }
@@ -88,7 +95,10 @@ impl RuntimeProfile {
     /// Used by the UI to render mode-specific badges and by the strategy
     /// engine to apply the micro-account Phase1 configuration.
     pub fn is_micro(self) -> bool {
-        matches!(self, Self::MicroTest | Self::MicroActive | Self::FlipHyper)
+        matches!(
+            self,
+            Self::MicroTest | Self::MicroActive | Self::MicroSafeExecution | Self::FlipHyper
+        )
     }
 }
 
@@ -247,6 +257,23 @@ impl ProfileConfig {
                 strategy_no_trade_lowering_after_secs:   Some(30),
                 strategy_min_abs_imbalance_1s:           Some(0.03),
             },
+            RuntimeProfile::MicroSafeExecution => Self {
+                signal_min_confidence:       0.08,
+                entry_cooldown_after_exit:   Duration::from_millis(100),
+                failed_breakout_cooldown:    Duration::from_millis(100),
+                cycle_interval:              Duration::from_millis(250),
+                phase1_trigger_window_secs:      Some(4.0),
+                phase1_min_trend_drift:          Some(0.0002),
+                phase1_min_samples:              Some(3),
+                phase1_breakout_min_momentum_1s: Some(0.00002),
+                phase1_breakout_min_imbalance:   Some(0.05),
+                signal_momentum_threshold:       Some(0.00001),
+                signal_imbalance_threshold:      Some(0.03),
+                signal_max_hold_secs:            Some(30),
+                strategy_base_confidence_threshold:      Some(0.08),
+                strategy_no_trade_lowering_after_secs:   Some(5),
+                strategy_min_abs_imbalance_1s:           Some(0.01),
+            },
             // ── FLIP_HYPER: rapid capital-rotation mode ────────────────────────
             //
             // Inherits all MICRO_ACTIVE aggressive settings and further tightens
@@ -332,6 +359,8 @@ mod tests {
             ("MICROTEST",     RuntimeProfile::MicroTest),
             ("MICRO_ACTIVE",  RuntimeProfile::MicroActive),
             ("MICROACTIVE",   RuntimeProfile::MicroActive),
+            ("MICRO_SAFE_EXECUTION", RuntimeProfile::MicroSafeExecution),
+            ("MICROSAFEEXECUTION", RuntimeProfile::MicroSafeExecution),
             ("SWING",         RuntimeProfile::Swing),
             ("SWING_TRADER",  RuntimeProfile::Swing),
             ("unknown",       RuntimeProfile::Conservative), // falls back to default
@@ -378,6 +407,10 @@ mod tests {
         assert_eq!(RuntimeProfile::MicroTest.to_string(), "MICRO_TEST");
         assert_eq!(RuntimeProfile::Conservative.to_string(), "CONSERVATIVE");
         assert_eq!(RuntimeProfile::MicroActive.to_string(), "MICRO_ACTIVE");
+        assert_eq!(
+            RuntimeProfile::MicroSafeExecution.to_string(),
+            "MICRO_SAFE_EXECUTION"
+        );
         assert_eq!(RuntimeProfile::Swing.to_string(), "SWING");
     }
 
@@ -484,6 +517,7 @@ mod tests {
         assert!(!RuntimeProfile::Active.is_micro());
         assert!(RuntimeProfile::MicroTest.is_micro());
         assert!(RuntimeProfile::MicroActive.is_micro());
+        assert!(RuntimeProfile::MicroSafeExecution.is_micro());
         assert!(RuntimeProfile::FlipHyper.is_micro(),
             "FlipHyper must be classified as a micro-account mode");
     }

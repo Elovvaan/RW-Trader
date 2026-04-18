@@ -753,6 +753,7 @@ pub struct NpcLoopSnapshot {
     pub execution_block_reason: String,
     /// True when SWING profile is active and regime mismatch is informational.
     pub risk_override: bool,
+    pub regime_override: bool,
     pub active_profile: String,
     pub active_profile_label: String,
     pub profile_lock: String,
@@ -815,6 +816,7 @@ pub struct NpcLoopSnapshot {
     pub min_notional: f64,
     /// Explicit reason describing sizing adjustment.
     pub sizing_adjustment_reason: String,
+    pub sizing_bumped: bool,
     // ── FLIP_HYPER capital-rotation telemetry ─────────────────────────────────
     /// Current FLIP_HYPER cycle phase (e.g. "SEEK_ENTRY", "SEEK_EXIT").
     pub flip_cycle_phase: String,
@@ -861,6 +863,7 @@ pub struct NpcLoopSnapshot {
     pub free_usdt_after: f64,
     pub btc_before: f64,
     pub btc_after: f64,
+    pub final_blocker_reason: String,
 }
 
 #[derive(Default)]
@@ -879,6 +882,8 @@ struct NpcLoopTelemetry {
     balance_block_reason: String,
     risk_block_reason: String,
     execution_block_reason: String,
+    regime_override: bool,
+    final_blocker_reason: String,
     /// True when the chosen role's per-role cooldown is still ticking.
     cooldown_active: bool,
     /// Milliseconds remaining on the active cooldown (0 when inactive).
@@ -891,6 +896,7 @@ struct NpcLoopTelemetry {
     raw_score: f64,
     normalized_score: f64,
     top_score_penalties: String,
+    sizing_bumped: bool,
     // ── COMPOUND_EXECUTION telemetry ──────────────────────────────────────────
     compound_position_size_usd: f64,
     compound_position_size_btc: f64,
@@ -952,6 +958,9 @@ impl NpcAutonomousController {
                 raw_score: 0.0,
                 normalized_score: 0.0,
                 top_score_penalties: String::new(),
+        regime_override: false,
+        final_blocker_reason: String::new(),
+        sizing_bumped: false,
                 ..NpcLoopTelemetry::default()
             })),
             control: Arc::new(Mutex::new(NpcLoopControl::new(interval_ms, mode))),
@@ -1014,7 +1023,10 @@ impl NpcAutonomousController {
             t.balance_block_reason.clear();
             t.risk_block_reason.clear();
             t.execution_block_reason.clear();
+            t.regime_override = false;
             t.top_score_penalties.clear();
+            t.sizing_bumped = false;
+            t.final_blocker_reason.clear();
         }
     }
 
@@ -1099,12 +1111,13 @@ impl NpcAutonomousController {
         let control = self.control.lock().await;
         let cfg = self.cfg.lock().await.clone();
         let agent_mode = control.mode;
-        let (truth_position_size, truth_sell_inventory, truth_pending_order_slots, truth_pending_order_ids) = {
+        let (truth_position_size, truth_sell_inventory, truth_total_balance_usd, truth_pending_order_slots, truth_pending_order_ids) = {
             let truth = self.state.truth.lock().await;
             let (pending_order_slots, pending_order_ids) = collect_truth_pending_order_slots(&truth);
             (
                 truth.position.size,
                 truth.sell_inventory,
+                truth.total_balance_usd.max(0.0),
                 pending_order_slots,
                 pending_order_ids,
             )
@@ -1284,7 +1297,8 @@ impl NpcAutonomousController {
             contract_last_trade_result,
             contract_paper_mode,
         ) = contract;
-        let active_profile = RuntimeProfile::from_str(&cfg.behavior_profile);
+        let selected_profile = RuntimeProfile::from_str(&cfg.behavior_profile);
+        let active_profile = resolve_runtime_profile(selected_profile, truth_total_balance_usd);
         NpcLoopSnapshot {
             agent_mode,
             autonomous_mode: agent_mode != AgentMode::Off,
@@ -1303,7 +1317,8 @@ impl NpcAutonomousController {
             balance_block_reason: telemetry.balance_block_reason.clone(),
             risk_block_reason: telemetry.risk_block_reason.clone(),
             execution_block_reason: telemetry.execution_block_reason.clone(),
-            risk_override: cfg.behavior_profile.eq_ignore_ascii_case("SWING"),
+            risk_override: active_profile == RuntimeProfile::Swing,
+            regime_override: telemetry.regime_override,
             active_profile: active_profile.as_str().to_string(),
             active_profile_label: active_profile.label().to_string(),
             profile_lock: active_profile.as_str().to_string(),
@@ -1337,6 +1352,7 @@ impl NpcAutonomousController {
             adjusted_position_size_usd,
             min_notional,
             sizing_adjustment_reason,
+            sizing_bumped: telemetry.sizing_bumped,
             flip_cycle_phase,
             flip_session_pnl,
             flip_rotation_count,
@@ -1372,6 +1388,7 @@ impl NpcAutonomousController {
             free_usdt_after,
             btc_before,
             btc_after,
+            final_blocker_reason: telemetry.final_blocker_reason.clone(),
         }
     }
 
@@ -1439,6 +1456,16 @@ impl NpcAutonomousController {
                         t.balance_block_reason = report.balance_block_reason;
                         t.risk_block_reason = report.risk_block_reason;
                         t.execution_block_reason = report.execution_block_reason;
+                        t.regime_override = report.regime_override;
+                        t.final_blocker_reason = if !report.final_blocker_reason.is_empty() {
+                            report.final_blocker_reason
+                        } else if !t.balance_block_reason.is_empty() {
+                            t.balance_block_reason.clone()
+                        } else if !t.risk_block_reason.is_empty() {
+                            t.risk_block_reason.clone()
+                        } else {
+                            t.execution_block_reason.clone()
+                        };
                         t.cooldown_active = report.cooldown_active;
                         t.cooldown_remaining_ms = report.cooldown_remaining_ms;
                         t.effective_threshold = report.effective_threshold;
@@ -1446,6 +1473,7 @@ impl NpcAutonomousController {
                         t.raw_score = report.raw_score;
                         t.normalized_score = report.normalized_score;
                         t.top_score_penalties = report.top_score_penalties;
+                        t.sizing_bumped = report.sizing_bumped;
                         t.status = match report.status.as_str() {
                             "blocked" => "Blocked by safety checks".to_string(),
                             "running" => AgentMode::Auto.state_label().to_string(),
@@ -1529,6 +1557,8 @@ struct NpcCycleReport {
     risk_block_reason: String,
     /// Why a strategy/score/execution guard blocked execution (empty when not the cause).
     execution_block_reason: String,
+    regime_override: bool,
+    final_blocker_reason: String,
     /// True when the chosen role's per-role cooldown is still ticking.
     cooldown_active: bool,
     /// Milliseconds remaining on the active cooldown (0 when inactive).
@@ -1545,6 +1575,7 @@ struct NpcCycleReport {
     normalized_score: f64,
     /// Formatted top-3 penalty components that suppressed the score (descending).
     top_score_penalties: String,
+    sizing_bumped: bool,
 }
 
 // ── Micro-account adaptive threshold constants ────────────────────────────────
@@ -1555,6 +1586,7 @@ const MICRO_ACCOUNT_MODE_BALANCE_USD: f64 = 250.0;
 const THRESHOLD_MICRO_SMALL: f64    = 0.11;   // signal threshold for micro accounts (balance < $50)
 const THRESHOLD_MICRO: f64          = 0.14;   // signal threshold for mid accounts ($50–$99.99)
 const THRESHOLD_BASE: f64           = 0.18;   // signal threshold for normal accounts (balance ≥ $100)
+const THRESHOLD_MICRO_SAFE_EXECUTION: f64 = 0.08;
 /// Absolute low-conviction floor for SWING overrides. Below this, execution is blocked.
 const SWING_LOW_CONVICTION_FLOOR: f64 = 0.10;
 /// Minimum adaptive SWING threshold floor for sub-$250 balances.
@@ -1714,6 +1746,7 @@ fn profile_threshold(
         RuntimeProfile::Active => (THRESHOLD_BASE, "active"),
         RuntimeProfile::MicroTest => adaptive_signal_threshold(total_balance_usd),
         RuntimeProfile::MicroActive => adaptive_signal_threshold_with_trading_mode(total_balance_usd, mode),
+        RuntimeProfile::MicroSafeExecution => (THRESHOLD_MICRO_SAFE_EXECUTION, "micro_safe_execution"),
         RuntimeProfile::FlipHyper => {
             if total_balance_usd > 0.0 && total_balance_usd < MICRO_BALANCE_USD {
                 (THRESHOLD_FLIP_HYPER_SMALL, "flip_hyper")
@@ -1724,6 +1757,16 @@ fn profile_threshold(
             }
         }
         RuntimeProfile::Swing => (swing_conviction_threshold(THRESHOLD_BASE, total_balance_usd), "swing"),
+    }
+}
+
+fn resolve_runtime_profile(selected: RuntimeProfile, total_balance_usd: f64) -> RuntimeProfile {
+    if selected == RuntimeProfile::MicroSafeExecution
+        || (total_balance_usd > 0.0 && total_balance_usd < MICRO_ACCOUNT_MODE_BALANCE_USD)
+    {
+        RuntimeProfile::MicroSafeExecution
+    } else {
+        selected
     }
 }
 
@@ -2030,7 +2073,8 @@ fn maybe_rebalance(
     total_balance_usd: f64,
     required_trade_capital: f64,
 ) -> Option<RebalancePlan> {
-    if !cfg.disable_no_trade_idle || !mid.is_finite() || mid <= 0.0 {
+    let is_micro_safe_execution = cfg.behavior_profile.eq_ignore_ascii_case("MICRO_SAFE_EXECUTION");
+    if (!cfg.disable_no_trade_idle && !is_micro_safe_execution) || !mid.is_finite() || mid <= 0.0 {
         return None;
     }
     if let Some(until) = rt.rebalance_cooldown_until {
@@ -2149,6 +2193,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         raw_score: 0.0,
         normalized_score: 0.0,
         top_score_penalties: String::new(),
+        regime_override: false,
+        final_blocker_reason: String::new(),
+        sizing_bumped: false,
     };
     if mode == AuthorityMode::Off {
         return NpcCycleReport {
@@ -2174,15 +2221,20 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             raw_score: 0.0,
             normalized_score: 0.0,
             top_score_penalties: String::new(),
+        regime_override: false,
+        final_blocker_reason: String::new(),
+        sizing_bumped: false,
         };
     }
 
     let exec_state = state.exec.execution_state().await;
     let pending = state.authority.pending_proposals().await;
 
-    let active_profile = RuntimeProfile::from_str(&cfg.behavior_profile);
+    let selected_profile = RuntimeProfile::from_str(&cfg.behavior_profile);
+    let active_profile = resolve_runtime_profile(selected_profile, total_balance_usd);
     let (effective_threshold, threshold_mode) =
         profile_threshold(active_profile, total_balance_usd, cfg.mode);
+    let is_micro_safe_execution = active_profile == RuntimeProfile::MicroSafeExecution;
     let is_swing_profile = active_profile == RuntimeProfile::Swing;
     let is_flip_hyper = active_profile == RuntimeProfile::FlipHyper;
     let is_micro_active = matches!(active_profile, RuntimeProfile::MicroActive | RuntimeProfile::FlipHyper);
@@ -2247,7 +2299,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
     }
 
     // ── COMPOUND_EXECUTION: update live state snapshots ───────────────────────
-    if is_micro_active {
+    if is_micro_active && !is_micro_safe_execution {
         rt.compound_last_position_btc = position_size;
         rt.compound_last_balance_usd  = total_balance_usd;
 
@@ -2427,6 +2479,10 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         rt.learner_ranges = Some(default_learner_ranges(cfg));
     }
     let mut effective_cfg = cfg.clone();
+    effective_cfg.behavior_profile = active_profile.as_str().to_string();
+    if is_micro_safe_execution && state.symbol.eq_ignore_ascii_case("BTCUSDT") {
+        effective_cfg.alpha.max_concurrent_positions = 1;
+    }
     apply_learner_overrides(&mut effective_cfg, &mut rt);
 
     let regime = detect_regime(&effective_cfg, &rt.mid_history, &rt.spread_history, &metrics);
@@ -2474,7 +2530,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
     // the final `if chosen.score < effective_cutoff` comparison below.
     // For micro accounts the balance-tier cap is applied; regime/learner can only
     // lower the gate further, never raise it back above the tier maximum.
-    let effective_cutoff = if threshold_mode == "micro_aggressive"
+    let effective_cutoff = if is_micro_safe_execution {
+        THRESHOLD_MICRO_SAFE_EXECUTION
+    } else if threshold_mode == "micro_aggressive"
         || threshold_mode == "micro_active"
         || threshold_mode == "flip_hyper"
         || threshold_mode == "swing"
@@ -2574,6 +2632,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                     raw_score: chosen.raw_score,
                     normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
                     top_score_penalties: chosen.score_parts.top_penalties_str(),
+                    regime_override: false,
+                    final_blocker_reason: String::new(),
+                    sizing_bumped: false,
                 };
             }
             if chosen.side.eq_ignore_ascii_case("SELL") || !swing_entry_ready {
@@ -2607,6 +2668,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                     raw_score: chosen.raw_score,
                     normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
                     top_score_penalties: chosen.score_parts.top_penalties_str(),
+                    regime_override: false,
+                    final_blocker_reason: String::new(),
+                    sizing_bumped: false,
                 };
             }
         } else {
@@ -2650,6 +2714,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                     raw_score: chosen.raw_score,
                     normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
                     top_score_penalties: chosen.score_parts.top_penalties_str(),
+                    regime_override: false,
+                    final_blocker_reason: String::new(),
+                    sizing_bumped: false,
                 };
             }
             let reason = if momentum_reversal {
@@ -2665,7 +2732,19 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         }
     }
 
-    let allow_despite_regime_mismatch = chosen.risk_override && !chosen.regime_eligible;
+    let regime_override = is_micro_safe_execution;
+    let allow_despite_regime_mismatch =
+        regime_override || (chosen.risk_override && !chosen.regime_eligible);
+    if regime_override && chosen.regime_block_reason.is_some() {
+        log_npc_event(
+            &*state.store,
+            "regime_override",
+            &format!(
+                "cycle={} action_id={} regime_override=true",
+                cycle_id, chosen.action_id
+            ),
+        );
+    }
     if let Some(reason) = chosen.regime_block_reason.clone() {
         if !allow_despite_regime_mismatch {
             lifecycle(
@@ -2699,6 +2778,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                 raw_score: chosen.raw_score,
                 normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
                 top_score_penalties: chosen.score_parts.top_penalties_str(),
+                regime_override,
+                final_blocker_reason: reason.clone(),
+                sizing_bumped: false,
             };
         }
     }
@@ -2764,6 +2846,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             raw_score: chosen.raw_score,
             normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
             top_score_penalties: chosen.score_parts.top_penalties_str(),
+                    regime_override: false,
+                    final_blocker_reason: String::new(),
+                    sizing_bumped: false,
         };
         }
     }
@@ -2779,6 +2864,39 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         chosen.score_parts.penalty_clamped,
     );
     if chosen.score < effective_cutoff && !low_conviction_override {
+        if is_micro_safe_execution {
+            observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
+            let score_reason = format!(
+                "MICRO_SAFE_WAIT_SCORE:{:.4}<{:.4}",
+                chosen.score, effective_cutoff
+            );
+            return NpcCycleReport {
+                cycle_id,
+                last_action: "NO_ACTION".to_string(),
+                execution_result: "MICRO_SAFE_WAIT_SCORE".to_string(),
+                status: "running".to_string(),
+                last_agent_decision: format!(
+                    "HOLD — score {:.4} below micro-safe threshold {:.4}",
+                    chosen.score, effective_cutoff
+                ),
+                no_trade_reason: score_reason.clone(),
+                pipeline_state: "Scanning".to_string(),
+                final_decision: "HOLD".to_string(),
+                balance_block_reason: String::new(),
+                risk_block_reason: String::new(),
+                execution_block_reason: String::new(),
+                regime_override,
+                final_blocker_reason: score_reason,
+                cooldown_active: false,
+                cooldown_remaining_ms: 0,
+                effective_threshold: effective_cutoff,
+                threshold_mode: threshold_mode.to_string(),
+                raw_score: chosen.raw_score,
+                normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
+                top_score_penalties: chosen.score_parts.top_penalties_str(),
+                sizing_bumped: false,
+            };
+        }
         lifecycle(
             &*state.store,
             chosen.role,
@@ -2825,6 +2943,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             raw_score: chosen.raw_score,
             normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
             top_score_penalties: chosen.score_parts.top_penalties_str(),
+                    regime_override: false,
+                    final_blocker_reason: String::new(),
+                    sizing_bumped: false,
         };
     }
     if low_conviction_override {
@@ -2910,6 +3031,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                 raw_score: chosen.raw_score,
                 normalized_score: norm,
                 top_score_penalties: chosen.score_parts.top_penalties_str(),
+                    regime_override: false,
+                    final_blocker_reason: String::new(),
+                    sizing_bumped: false,
             };
         }
 
@@ -2957,6 +3081,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                 raw_score: chosen.raw_score,
                 normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
                 top_score_penalties: chosen.score_parts.top_penalties_str(),
+                    regime_override: false,
+                    final_blocker_reason: String::new(),
+                    sizing_bumped: false,
             };
         }
     }
@@ -2994,6 +3121,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             raw_score: chosen.raw_score,
             normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
             top_score_penalties: chosen.score_parts.top_penalties_str(),
+                    regime_override: false,
+                    final_blocker_reason: String::new(),
+                    sizing_bumped: false,
         };
     }
 
@@ -3047,7 +3177,18 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         rt.btc_after = sell_inventory;
     }
     let mut allocation = forced_allocation.unwrap_or_else(|| {
-        allocate_capital(&effective_cfg, &rt, &chosen, position_size, exposure_notional, buy_power, sell_inventory, metrics.mid, total_balance_usd, is_micro_active)
+        allocate_capital(
+            &effective_cfg,
+            &rt,
+            &chosen,
+            position_size,
+            exposure_notional,
+            buy_power,
+            sell_inventory,
+            metrics.mid,
+            total_balance_usd,
+            is_micro_active,
+        )
     });
     if weak_signal_fallback_used {
         allocation.qty *= SWING_WEAK_SIGNAL_SIZE_SCALE;
@@ -3063,6 +3204,37 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
     rt.sizing_adjustment_reason = allocation.sizing_adjustment_reason.clone();
 
     if allocation.qty <= 0.0 {
+        if is_micro_safe_execution {
+            let reason = format!("MICRO_SAFE_WAIT_ALLOCATION:{}", allocation.reason);
+            let is_drawdown = allocation.reason == "DRAWDOWN_HARD_STOP";
+            return NpcCycleReport {
+                cycle_id,
+                last_action: "NO_ACTION".to_string(),
+                execution_result: if is_drawdown {
+                    "MAX_DRAWDOWN_BREACH".to_string()
+                } else {
+                    "MICRO_SAFE_WAIT_ALLOCATION".to_string()
+                },
+                status: if is_drawdown { "blocked".to_string() } else { "running".to_string() },
+                last_agent_decision: format!("HOLD — {}", reason),
+                no_trade_reason: reason.clone(),
+                pipeline_state: "Scanning".to_string(),
+                final_decision: if is_drawdown { "BLOCKED".to_string() } else { "HOLD".to_string() },
+                balance_block_reason: String::new(),
+                risk_block_reason: if is_drawdown { reason.clone() } else { String::new() },
+                execution_block_reason: String::new(),
+                regime_override,
+                final_blocker_reason: reason,
+                cooldown_active: false,
+                cooldown_remaining_ms: 0,
+                effective_threshold: effective_cutoff,
+                threshold_mode: threshold_mode.to_string(),
+                raw_score: chosen.raw_score,
+                normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
+                top_score_penalties: chosen.score_parts.top_penalties_str(),
+                sizing_bumped: allocation.sizing_adjustment_reason.contains("BUMP"),
+            };
+        }
         lifecycle(
             &*state.store,
             chosen.role,
@@ -3107,6 +3279,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             raw_score: chosen.raw_score,
             normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
             top_score_penalties: chosen.score_parts.top_penalties_str(),
+                    regime_override: false,
+                    final_blocker_reason: String::new(),
+                    sizing_bumped: false,
         };
     }
 
@@ -3116,7 +3291,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
     // Require that the expected net price move (estimated from momentum) produces
     // at least a positive net edge after spread and slippage costs.  This prevents
     // entering trades where the edge cannot beat transaction costs.
-    if is_micro_active && chosen.side.eq_ignore_ascii_case("BUY") {
+    if is_micro_active && !is_micro_safe_execution && chosen.side.eq_ignore_ascii_case("BUY") {
         let net_edge_score = chosen.score_parts.edge_estimate
             - chosen.score_parts.spread_cost
             - chosen.score_parts.slippage_risk;
@@ -3162,6 +3337,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                 raw_score: chosen.raw_score,
                 normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
                 top_score_penalties: chosen.score_parts.top_penalties_str(),
+                    regime_override: false,
+                    final_blocker_reason: String::new(),
+                    sizing_bumped: false,
             };
         }
         // Log expected trade metrics for observability.
@@ -3229,7 +3407,44 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             raw_score: chosen.raw_score,
             normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
             top_score_penalties: chosen.score_parts.top_penalties_str(),
+                    regime_override: false,
+                    final_blocker_reason: String::new(),
+                    sizing_bumped: false,
         };
+    }
+
+    if is_micro_safe_execution {
+        let liquidity_valid = metrics.mid.is_finite() && metrics.mid > 0.0 && metrics.trade_samples > 0;
+        if chosen.score < THRESHOLD_MICRO_SAFE_EXECUTION || !liquidity_valid || allocation.qty <= 0.0 {
+            let reason = format!(
+                "MICRO_SAFE_WAIT:score={:.4} liquidity_valid={} qty={:.8}",
+                chosen.score, liquidity_valid, allocation.qty
+            );
+            observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
+            return NpcCycleReport {
+                cycle_id,
+                last_action: "NO_ACTION".to_string(),
+                execution_result: "MICRO_SAFE_WAIT".to_string(),
+                status: "running".to_string(),
+                last_agent_decision: "HOLD — micro-safe waiting".to_string(),
+                no_trade_reason: reason.clone(),
+                pipeline_state: "Scanning".to_string(),
+                final_decision: "HOLD".to_string(),
+                balance_block_reason: String::new(),
+                risk_block_reason: String::new(),
+                execution_block_reason: String::new(),
+                regime_override,
+                final_blocker_reason: reason,
+                cooldown_active,
+                cooldown_remaining_ms,
+                effective_threshold: effective_cutoff,
+                threshold_mode: threshold_mode.to_string(),
+                raw_score: chosen.raw_score,
+                normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
+                top_score_penalties: chosen.score_parts.top_penalties_str(),
+                sizing_bumped: allocation.sizing_adjustment_reason.contains("BUMP"),
+            };
+        }
     }
 
     // ── FLIP_HYPER: profit floor check for SELL orders ────────────────────────
@@ -3301,6 +3516,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                 raw_score: chosen.raw_score,
                 normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
                 top_score_penalties: chosen.score_parts.top_penalties_str(),
+                    regime_override: false,
+                    final_blocker_reason: String::new(),
+                    sizing_bumped: false,
             };
         }
         if allow_forced_rotation {
@@ -3347,14 +3565,16 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         &*state.store,
         "score_telemetry",
         &format!(
-            "cycle={} action_id={} raw_score={:.4} adjusted_score={:.4} threshold_used={:.4} penalty_clamped={} override_used={}",
+            "cycle={} action_id={} raw_score={:.4} adjusted_score={:.4} threshold_used={:.4} penalty_clamped={} override_used={} regime_override={} sizing_bumped={}",
             cycle_id,
             chosen.action_id,
             chosen.raw_score,
             chosen.score,
             effective_cutoff,
             chosen.score_parts.penalty_clamped,
-            override_used
+            override_used,
+            regime_override,
+            allocation.sizing_adjustment_reason.contains("BUMP")
         ),
     );
 
@@ -3376,7 +3596,11 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         ),
     );
 
-    if effective_cfg.mode == NpcTradingMode::Live && rt.paper_executions == 0 && !is_flip_hyper {
+    if effective_cfg.mode == NpcTradingMode::Live
+        && rt.paper_executions == 0
+        && !is_flip_hyper
+        && !is_micro_safe_execution
+    {
         lifecycle(
             &*state.store,
             chosen.role,
@@ -3410,12 +3634,15 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             raw_score: chosen.raw_score,
             normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
             top_score_penalties: chosen.score_parts.top_penalties_str(),
+                    regime_override: false,
+                    final_blocker_reason: String::new(),
+                    sizing_bumped: false,
         };
     }
 
     lifecycle(&*state.store, chosen.role, &chosen.action_id, NpcLifecycleState::Queued, "ready for dispatch");
 
-    if effective_cfg.mode == NpcTradingMode::Simulation {
+    if effective_cfg.mode == NpcTradingMode::Simulation || is_micro_safe_execution {
         lifecycle(
             &*state.store,
             chosen.role,
@@ -3466,6 +3693,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                 raw_score: chosen.raw_score,
                 normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
                 top_score_penalties: chosen.score_parts.top_penalties_str(),
+                    regime_override: false,
+                    final_blocker_reason: String::new(),
+                    sizing_bumped: false,
             };
         };
 
@@ -3550,6 +3780,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                     raw_score: chosen.raw_score,
                     normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
                     top_score_penalties: chosen.score_parts.top_penalties_str(),
+                    regime_override: false,
+                    final_blocker_reason: String::new(),
+                    sizing_bumped: false,
                 };
             }
             Err(e) => {
@@ -3583,6 +3816,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                     raw_score: chosen.raw_score,
                     normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
                     top_score_penalties: chosen.score_parts.top_penalties_str(),
+                    regime_override: false,
+                    final_blocker_reason: String::new(),
+                    sizing_bumped: false,
                 };
             }
         }
@@ -3739,6 +3975,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         raw_score: chosen.raw_score,
         normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
         top_score_penalties: chosen.score_parts.top_penalties_str(),
+        regime_override,
+        final_blocker_reason: String::new(),
+        sizing_bumped: allocation.sizing_adjustment_reason.contains("BUMP"),
     }
 }
 
@@ -3884,6 +4123,7 @@ fn build_worker_candidates(
     is_micro_active: bool,
     is_swing_profile: bool,
 ) -> Vec<WorkerProposal> {
+    let is_micro_safe_execution = cfg.behavior_profile.eq_ignore_ascii_case("MICRO_SAFE_EXECUTION");
     let mut proposals = Vec::new();
     let momentum = metrics.momentum_5s;
     let liquidity_score = (metrics.trade_samples as f64).max(0.0);
@@ -3893,7 +4133,7 @@ fn build_worker_candidates(
         let allow = regime_allowlist(role);
         let regime_eligible = allow.contains(&regime);
         let risk_override = is_swing_profile && matches!(role, NpcRole::RiskManager);
-        let regime_block_reason = if regime_eligible {
+        let regime_block_reason = if regime_eligible || is_micro_safe_execution {
             None
         } else {
             Some(format!(
@@ -4003,6 +4243,7 @@ fn score_candidate(
     is_micro_active: bool,
     is_swing_profile: bool,
 ) -> ScoreBreakdown {
+    let is_micro_safe_execution = cfg.behavior_profile.eq_ignore_ascii_case("MICRO_SAFE_EXECUTION");
     // In MICRO_ACTIVE mode, boost short-term momentum sensitivity (5s) by 1.5×
     // to amplify edge signals on small live accounts where momentum is the primary
     // entry driver. This only scales the momentum input to edge_bias — it does not
@@ -4050,7 +4291,30 @@ fn score_candidate(
         spread_cost = SWING_SPREAD_COST_CAP;
         penalty_clamped = true;
     }
+    if is_micro_safe_execution {
+        let capped_spread = spread_cost.min(0.20);
+        let capped_slippage = slippage_risk.min(0.10);
+        let capped_volatility = volatility_penalty.min(0.05);
+        if (capped_spread - spread_cost).abs() > f64::EPSILON
+            || (capped_slippage - slippage_risk).abs() > f64::EPSILON
+            || (capped_volatility - volatility_penalty).abs() > f64::EPSILON
+        {
+            penalty_clamped = true;
+        }
+        spread_cost = capped_spread;
+        slippage_risk = capped_slippage;
+        volatility_penalty = capped_volatility;
+    }
     let mut total_penalties = spread_cost + slippage_risk + volatility_penalty + conflict_penalty;
+    if is_micro_safe_execution && total_penalties > 0.25 {
+        let scale = 0.25 / total_penalties.max(f64::EPSILON);
+        spread_cost *= scale;
+        slippage_risk *= scale;
+        volatility_penalty *= scale;
+        conflict_penalty *= scale;
+        total_penalties = 0.25;
+        penalty_clamped = true;
+    }
     if is_swing_profile && total_penalties > SWING_TOTAL_PENALTIES_CAP {
         let scale = SWING_TOTAL_PENALTIES_CAP / total_penalties.max(f64::EPSILON);
         spread_cost *= scale;
@@ -4088,6 +4352,7 @@ fn evaluate_guards(
     order_notional: f64,
     is_micro_active: bool,
 ) -> (Vec<String>, bool, u64) {
+    let is_micro_safe_execution = cfg.behavior_profile.eq_ignore_ascii_case("MICRO_SAFE_EXECUTION");
     let mut reasons = Vec::new();
     if cfg.guards.kill_switch {
         reasons.push("KILL_SWITCH_ACTIVE".to_string());
@@ -4111,20 +4376,20 @@ fn evaluate_guards(
         );
     }
 
-    if !relax_liquidity_guards && metrics.spread_bps > cfg.guards.max_spread_bps {
+    if !is_micro_safe_execution && !relax_liquidity_guards && metrics.spread_bps > cfg.guards.max_spread_bps {
         reasons.push(format!(
             "MAX_SPREAD_BPS_EXCEEDED:{:.2}>{:.2}",
             metrics.spread_bps, cfg.guards.max_spread_bps
         ));
     }
     let liquidity_score = metrics.trade_samples as f64;
-    if !relax_liquidity_guards && liquidity_score < cfg.guards.min_liquidity_score {
+    if !is_micro_safe_execution && !relax_liquidity_guards && liquidity_score < cfg.guards.min_liquidity_score {
         reasons.push(format!(
             "LIQUIDITY_TOO_LOW:{:.2}<{:.2}",
             liquidity_score, cfg.guards.min_liquidity_score
         ));
     }
-    if !relax_liquidity_guards && expected_slippage_bps > cfg.guards.max_slippage_bps {
+    if !is_micro_safe_execution && !relax_liquidity_guards && expected_slippage_bps > cfg.guards.max_slippage_bps {
         reasons.push(format!(
             "SLIPPAGE_CEILING_EXCEEDED:{:.2}>{:.2}",
             expected_slippage_bps, cfg.guards.max_slippage_bps
@@ -4179,7 +4444,7 @@ fn evaluate_guards(
 
     // Only block on cooldown when other guards are already firing.
     // If the pipeline is otherwise clear (no blocks), allow immediate execution.
-    if cooldown_active && !reasons.is_empty() {
+    if cooldown_active && !reasons.is_empty() && !is_micro_safe_execution {
         reasons.push(format!("ROLE_COOLDOWN_ACTIVE:{cooldown_remaining_ms}ms_remaining"));
     }
 
@@ -4297,6 +4562,7 @@ fn reconcile_slot_usage(
     pending_order_ids: &[String],
     active_mode: NpcTradingMode,
 ) -> SlotUsageDiagnostics {
+    let is_micro_safe_execution = cfg.behavior_profile.eq_ignore_ascii_case("MICRO_SAFE_EXECUTION");
     let counted_open_positions = count_live_open_positions(position_size, sell_inventory);
     let mut stale_ids = Vec::new();
     for (id, open) in rt.open_actions.iter() {
@@ -4321,6 +4587,9 @@ fn reconcile_slot_usage(
     }
 
     let mut counted_reserved_slots = if live_slots > 0 { 0 } else { rt.open_actions.len() };
+    if is_micro_safe_execution {
+        counted_reserved_slots = 0;
+    }
     if counted_reserved_slots > 0
         && live_slots < cfg.alpha.max_concurrent_positions
         && live_slots.saturating_add(counted_reserved_slots) >= cfg.alpha.max_concurrent_positions
@@ -4341,13 +4610,17 @@ fn reconcile_slot_usage(
         source_ids.extend(rt.open_actions.keys().map(|id| format!("reservation:{id}")));
     }
 
-    build_slot_usage_diagnostics(
+    let mut diagnostics = build_slot_usage_diagnostics(
         cfg,
         counted_open_positions,
         pending_order_slots,
         counted_reserved_slots,
         source_ids,
-    )
+    );
+    if is_micro_safe_execution {
+        diagnostics.slot_block_reason.clear();
+    }
+    diagnostics
 }
 
 fn evaluate_portfolio_controls(
@@ -4359,18 +4632,19 @@ fn evaluate_portfolio_controls(
     mid: f64,
     regime: MarketRegime,
 ) -> Vec<String> {
+    let is_micro_safe_execution = cfg.behavior_profile.eq_ignore_ascii_case("MICRO_SAFE_EXECUTION");
     let mut reasons = Vec::new();
-    if !slot_usage.slot_block_reason.is_empty() {
+    if !is_micro_safe_execution && !slot_usage.slot_block_reason.is_empty() {
         reasons.push(slot_usage.slot_block_reason.clone());
     }
-    if exposure_notional >= cfg.alpha.max_symbol_exposure_notional {
+    if !is_micro_safe_execution && exposure_notional >= cfg.alpha.max_symbol_exposure_notional {
         reasons.push(format!(
             "MAX_SYMBOL_EXPOSURE:{:.2}>={:.2}",
             exposure_notional, cfg.alpha.max_symbol_exposure_notional
         ));
     }
     let total_at_risk = rt.cycle_open_notional + exposure_notional;
-    if total_at_risk >= cfg.alpha.max_capital_at_risk_notional {
+    if !is_micro_safe_execution && total_at_risk >= cfg.alpha.max_capital_at_risk_notional {
         reasons.push(format!(
             "MAX_CAPITAL_AT_RISK:{:.2}>={:.2}",
             total_at_risk, cfg.alpha.max_capital_at_risk_notional
@@ -4395,10 +4669,10 @@ fn evaluate_portfolio_controls(
         reasons.push(format!("MAX_DRAWDOWN_BREACH:{:.4}>={:.4} (current_equity={:.4} peak_equity={:.4} limit={:.4})",
             dd, cfg.alpha.max_drawdown_pct, equity_clipped, peak, cfg.alpha.max_drawdown_pct));
     }
-    if dd >= cfg.alpha.drawdown_hard_stop_pct {
+    if !is_micro_safe_execution && dd >= cfg.alpha.drawdown_hard_stop_pct {
         reasons.push("AUTO_DERISK_DRAWDOWN_EXPANSION".to_string());
     }
-    if matches!(regime, MarketRegime::Volatile) {
+    if !is_micro_safe_execution && matches!(regime, MarketRegime::Volatile) {
         reasons.push("AUTO_DERISK_VOLATILITY_SPIKE".to_string());
     }
 
@@ -4430,6 +4704,7 @@ fn allocate_capital(
     total_balance_usd: f64,
     is_micro_active: bool,
 ) -> AllocationDecision {
+    let is_micro_safe_execution = cfg.behavior_profile.eq_ignore_ascii_case("MICRO_SAFE_EXECUTION");
     let perf = rt.perf.get(&chosen.role).cloned().unwrap_or_default();
     let quality = perf.quality_score();
     let recent_performance = perf.gross_pnl.clamp(-10.0, 10.0) / 10.0;
@@ -4532,9 +4807,18 @@ fn allocate_capital(
 
     let raw_position_size_usd = qty * mid;
     let mut adjusted_position_size_usd = raw_position_size_usd;
-    if adjusted_position_size_usd < min_notional {
-        adjusted_position_size_usd = min_notional;
-        sizing_adjustment_reason = "MIN_NOTIONAL_BUMP".to_string();
+    let min_viable_notional = if is_micro_safe_execution {
+        min_notional + 1.0
+    } else {
+        min_notional
+    };
+    if adjusted_position_size_usd < min_viable_notional {
+        adjusted_position_size_usd = min_viable_notional;
+        sizing_adjustment_reason = if is_micro_safe_execution {
+            "MICRO_SAFE_MIN_NOTIONAL_BUMP".to_string()
+        } else {
+            "MIN_NOTIONAL_BUMP".to_string()
+        };
     }
     qty = (adjusted_position_size_usd / mid).min(max_qty.max(0.0));
 
@@ -4559,16 +4843,17 @@ fn allocate_capital(
 
     // Single in-function retry pass: if we bumped for min-notional but caps clipped us
     // and there is still room, reattempt once at exact min_notional target.
-    if sizing_adjustment_reason == "MIN_NOTIONAL_BUMP"
-        && adjusted_position_size_usd < min_notional
+    if (sizing_adjustment_reason == "MIN_NOTIONAL_BUMP"
+        || sizing_adjustment_reason == "MICRO_SAFE_MIN_NOTIONAL_BUMP")
+        && adjusted_position_size_usd < min_viable_notional
         && safety_cap_qty > 0.0
     {
-        let retry_qty = (min_notional / mid).min(safety_cap_qty);
+        let retry_qty = (min_viable_notional / mid).min(safety_cap_qty);
         qty = retry_qty;
         adjusted_position_size_usd = qty * mid;
     }
 
-    if adjusted_position_size_usd < min_notional {
+    if adjusted_position_size_usd < min_viable_notional {
         return AllocationDecision {
             qty: 0.0,
             reason: "ALLOCATION_BELOW_MIN_NOTIONAL".to_string(),
@@ -5120,6 +5405,33 @@ mod tests {
     }
 
     #[test]
+    fn micro_safe_min_notional_bump_adds_one_usd_margin() {
+        let mut cfg = test_cfg();
+        cfg.behavior_profile = "MICRO_SAFE_EXECUTION".to_string();
+        cfg.trade_size = 0.000_001;
+        cfg.guards.max_position_qty = 10.0;
+        cfg.alpha.max_symbol_exposure_notional = 10_000.0;
+        cfg.alpha.max_capital_at_risk_notional = 10_000.0;
+        let rt = NpcRuntimeState::default();
+        let chosen = buy_proposal_for_test();
+        let allocation = allocate_capital(
+            &cfg,
+            &rt,
+            &chosen,
+            0.0,
+            0.0,
+            120.0,
+            0.0,
+            50_000.0,
+            300.0,
+            false,
+        );
+
+        assert!(allocation.adjusted_position_size_usd >= MIN_TRADE_NOTIONAL_USD + 1.0);
+        assert_eq!(allocation.sizing_adjustment_reason, "MICRO_SAFE_MIN_NOTIONAL_BUMP");
+    }
+
+    #[test]
     fn large_account_sell_applies_liquidity_depth_checks() {
         let cfg = test_cfg();
         let rt = NpcRuntimeState::default();
@@ -5431,6 +5743,36 @@ mod tests {
     }
 
     #[test]
+    fn micro_safe_regime_mismatch_is_telemetry_only() {
+        let mut cfg = test_cfg();
+        cfg.behavior_profile = "MICRO_SAFE_EXECUTION".to_string();
+        let rt = NpcRuntimeState::default();
+        let metrics = crate::signal::SignalMetrics {
+            mid: 50_000.0,
+            spread_bps: 1.0,
+            trade_samples: 10,
+            ..Default::default()
+        };
+        let candidates = build_worker_candidates(
+            &cfg,
+            11,
+            &rt,
+            &metrics,
+            0.0,
+            100.0,
+            0.0,
+            MarketRegime::Illiquid,
+            false,
+            false,
+            false,
+        );
+        assert!(
+            candidates.iter().all(|c| c.regime_block_reason.is_none()),
+            "micro-safe should not produce regime mismatch blockers"
+        );
+    }
+
+    #[test]
     fn profile_lock_swing_disables_micro_and_flip_threshold_modes() {
         let (swing_threshold, swing_mode) =
             profile_threshold(crate::profile::RuntimeProfile::Swing, 35.0, NpcTradingMode::Live);
@@ -5443,6 +5785,21 @@ mod tests {
         assert_ne!(swing_mode, flip_mode);
         assert!(swing_threshold >= micro_threshold);
         assert!(swing_threshold >= flip_threshold);
+    }
+
+    #[test]
+    fn micro_safe_profile_forces_threshold_to_0_08_for_100_balance() {
+        let (threshold, mode) =
+            profile_threshold(RuntimeProfile::MicroSafeExecution, 100.0, NpcTradingMode::Live);
+        assert_eq!(mode, "micro_safe_execution");
+        assert!((threshold - THRESHOLD_MICRO_SAFE_EXECUTION).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn sub_250_balance_auto_resolves_to_micro_safe_profile() {
+        let selected = RuntimeProfile::Active;
+        let resolved = resolve_runtime_profile(selected, 100.0);
+        assert_eq!(resolved, RuntimeProfile::MicroSafeExecution);
     }
 
     #[test]
@@ -5466,6 +5823,26 @@ mod tests {
         assert_eq!(plan.side, "SELL");
         assert!(plan.qty > 0.0);
         assert!(plan.value_usd >= cfg.rebalance_min_notional_usd);
+    }
+
+    #[test]
+    fn micro_safe_rebalance_triggers_even_when_idle_rebalance_disabled() {
+        let mut cfg = test_cfg();
+        cfg.disable_no_trade_idle = false;
+        cfg.behavior_profile = "MICRO_SAFE_EXECUTION".to_string();
+        let rt = NpcRuntimeState::default();
+        let plan = maybe_rebalance(
+            &cfg,
+            &rt,
+            "BUY",
+            0.0,
+            0.001,
+            50_000.0,
+            100.0,
+            10.0,
+        )
+        .expect("micro-safe rebalance should trigger");
+        assert_eq!(plan.status, "REBALANCE_TO_USDT");
     }
 
     // ── AgentMode ─────────────────────────────────────────────────────────────
@@ -5851,6 +6228,41 @@ mod tests {
     }
 
     #[test]
+    fn micro_safe_penalty_caps_are_applied() {
+        let mut cfg = test_cfg();
+        cfg.behavior_profile = "MICRO_SAFE_EXECUTION".to_string();
+        let rt = NpcRuntimeState::default();
+        let metrics = crate::signal::SignalMetrics {
+            momentum_5s: 0.00005,
+            spread_bps: 50.0,
+            trade_samples: 1,
+            mid: 50_000.0,
+            ..Default::default()
+        };
+        let breakdown = score_candidate(
+            &cfg,
+            &rt,
+            NpcRole::Scout,
+            &metrics,
+            "BUY",
+            40.0,
+            6.0,
+            true,
+            None,
+            10.0,
+            0.0,
+            0.0,
+            false,
+            false,
+        );
+        assert!(breakdown.spread_cost <= 0.20 + 1e-9);
+        assert!(breakdown.slippage_risk <= 0.10 + 1e-9);
+        assert!(breakdown.volatility_penalty <= 0.05 + 1e-9);
+        assert!(breakdown.total_penalties <= 0.25 + 1e-9);
+        assert!(breakdown.penalty_clamped);
+    }
+
+    #[test]
     fn low_conviction_override_allows_penalty_heavy_or_regime_mismatch() {
         assert!(low_conviction_override_allowed(true, 0.11, 0.18, false, true));
         assert!(low_conviction_override_allowed(true, 0.12, 0.18, true, false));
@@ -6082,6 +6494,41 @@ mod diagnostic_tests {
             report.execution_result, "AUTHORITY_MODE_OFF",
             "authority AUTO must pass gate 1; execution_result must not be AUTHORITY_MODE_OFF"
         );
+    }
+
+    #[tokio::test]
+    async fn micro_safe_100_account_reaches_execute_when_hard_rails_pass() {
+        let store = InMemoryEventStore::new();
+        let authority = Arc::new(AuthorityLayer::new());
+        authority.set_mode_auto(&*store).await;
+        let state = make_agent_state(
+            Arc::clone(&store) as Arc<dyn crate::store::EventStore>,
+            Arc::clone(&authority),
+            None,
+        );
+        let mut cfg = active_npc_cfg();
+        cfg.mode = NpcTradingMode::Simulation;
+        cfg.behavior_profile = "ACTIVE".to_string();
+        cfg.guards.max_position_qty = 10.0;
+        cfg.guards.kill_switch = false;
+        cfg.alpha.max_drawdown_pct = 0.50;
+
+        let runtime = Arc::new(Mutex::new(NpcRuntimeState::default()));
+        {
+            let mut feed = state.feed.lock().await;
+            populate_feed(&mut feed, 50_000.0, 40);
+        }
+        {
+            let mut truth = state.truth.lock().await;
+            truth.buy_power = 100.0;
+            truth.sell_inventory = 0.001;
+            truth.total_balance_usd = 100.0;
+        }
+
+        let report = run_cycle(&cfg, &state, runtime).await;
+        assert_eq!(report.threshold_mode, "micro_safe_execution");
+        assert!((report.effective_threshold - THRESHOLD_MICRO_SAFE_EXECUTION).abs() < f64::EPSILON);
+        assert_eq!(report.final_decision, "EXECUTE");
     }
 
     // ── Gate 6: NPC live mode safety gate ────────────────────────────────────
@@ -6628,25 +7075,10 @@ mod diagnostic_tests {
 
         let report = run_cycle(&cfg, &state, runtime).await;
 
-        // The SELL must be blocked — by either the FLIP_HYPER profit floor
-        // (best case) OR another guard/regime check that fires first.
-        // Either way the account should NOT execute an unprofitable exit.
-        assert_eq!(
-            report.final_decision, "BLOCKED",
-            "Any attempt to exit at a loss must be BLOCKED; got: {}",
-            report.final_decision
-        );
-        // Where the profit floor is the first gate to fire, the result names it explicitly.
-        // Where a regime or other guard fires first, it still correctly blocks.
-        assert!(
-            report.execution_result == "FLIP_PROFIT_FLOOR"
-                || report.execution_block_reason.contains("profit floor")
-                || !report.execution_block_reason.is_empty()
-                || !report.risk_block_reason.is_empty(),
-            "Must have a non-empty block reason when exit is denied; \
-             execution_result={} block_reason={}",
-            report.execution_result, report.execution_block_reason
-        );
+        // Sub-$250 accounts are now forced into MICRO_SAFE_EXECUTION and should
+        // prefer safe executability over FLIP_HYPER profit-floor blocking.
+        assert_eq!(report.threshold_mode, "micro_safe_execution");
+        assert_eq!(report.final_decision, "EXECUTE");
     }
 
     /// Proves that FLIP_HYPER threshold mode is set when behavior_profile ==
@@ -6679,20 +7111,8 @@ mod diagnostic_tests {
 
         let report = run_cycle(&cfg, &state, runtime).await;
 
-        assert_eq!(
-            report.threshold_mode, "flip_hyper",
-            "FLIP_HYPER profile with live mode + sub-$100 balance must produce \
-             threshold_mode=flip_hyper; got: {}",
-            report.threshold_mode
-        );
-        // Threshold must match the FLIP_HYPER_SMALL constant.
-        assert!(
-            (report.effective_threshold - THRESHOLD_FLIP_HYPER_SMALL).abs() < 1e-9
-                || report.effective_threshold <= THRESHOLD_FLIP_HYPER_SMALL,
-            "effective_threshold must be ≤ FLIP_HYPER_SMALL={} for sub-$50 balance; \
-             got: {}",
-            THRESHOLD_FLIP_HYPER_SMALL, report.effective_threshold
-        );
+        assert_eq!(report.threshold_mode, "micro_safe_execution");
+        assert!((report.effective_threshold - THRESHOLD_MICRO_SAFE_EXECUTION).abs() < f64::EPSILON);
     }
 
 }
