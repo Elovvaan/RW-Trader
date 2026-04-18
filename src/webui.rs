@@ -717,7 +717,7 @@ async fn agent_status_json(state: &AppState) -> String {
     let slot_block_reason = snap.slot_block_reason.replace('"', "\\\"");
     let slot_source_ids = snap.slot_source_ids.replace('"', "\\\"");
     let threshold_mode = snap.threshold_mode.replace('"', "\\\"");
-    let adjusted_score = if snap.effective_threshold > 0.0 {
+    let reconstructed_score = if snap.effective_threshold > 0.0 {
         snap.normalized_score * snap.effective_threshold
     } else {
         0.0
@@ -744,7 +744,7 @@ async fn agent_status_json(state: &AppState) -> String {
         cooldown_remaining_ms = snap.cooldown_remaining_ms,
         effective_threshold   = snap.effective_threshold,
         raw_score             = snap.raw_score,
-        adjusted_score        = adjusted_score,
+        adjusted_score        = reconstructed_score,
         threshold_used        = snap.effective_threshold,
         penalty_clamped       = penalty_clamped,
         override_used         = override_used,

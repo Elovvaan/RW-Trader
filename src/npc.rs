@@ -1555,10 +1555,15 @@ const MICRO_ACCOUNT_MODE_BALANCE_USD: f64 = 250.0;
 const THRESHOLD_MICRO_SMALL: f64    = 0.11;   // signal threshold for micro accounts (balance < $50)
 const THRESHOLD_MICRO: f64          = 0.14;   // signal threshold for mid accounts ($50–$99.99)
 const THRESHOLD_BASE: f64           = 0.18;   // signal threshold for normal accounts (balance ≥ $100)
+/// Absolute low-conviction floor for SWING overrides. Below this, execution is blocked.
 const SWING_LOW_CONVICTION_FLOOR: f64 = 0.10;
+/// Minimum adaptive SWING threshold floor for sub-$250 balances.
 const SWING_MIN_THRESHOLD_FLOOR: f64 = 0.08;
+/// Position scale used when executing weak SWING signals (60% size).
 const SWING_WEAK_SIGNAL_SIZE_SCALE: f64 = 0.60;
+/// Max spread-cost penalty contribution in SWING scoring.
 const SWING_SPREAD_COST_CAP: f64 = 0.25;
+/// Max total penalty contribution in SWING scoring.
 const SWING_TOTAL_PENALTIES_CAP: f64 = 0.35;
 
 // ── MICRO_ACTIVE live-mode thresholds (lower than paper/sim micro_aggressive) ──
@@ -1730,6 +1735,11 @@ fn swing_conviction_threshold(base_threshold: f64, total_balance_usd: f64) -> f6
     }
 }
 
+/// Returns whether SWING low-conviction override is allowed.
+/// Override is only possible for scores at/above `SWING_LOW_CONVICTION_FLOOR`
+/// and when conviction was blocked by either:
+/// - penalty-heavy suppression (penalties were clamped and score < cutoff), or
+/// - regime mismatch risk-override path (score < cutoff but regime override enabled).
 fn low_conviction_override_allowed(
     is_swing_profile: bool,
     score: f64,
