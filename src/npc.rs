@@ -340,6 +340,8 @@ struct ScoreBreakdown {
     volatility_penalty: f64,
     conflict_penalty: f64,
     hold_efficiency: f64,
+    total_penalties: f64,
+    penalty_clamped: bool,
 }
 
 impl ScoreBreakdown {
@@ -1553,6 +1555,11 @@ const MICRO_ACCOUNT_MODE_BALANCE_USD: f64 = 250.0;
 const THRESHOLD_MICRO_SMALL: f64    = 0.11;   // signal threshold for micro accounts (balance < $50)
 const THRESHOLD_MICRO: f64          = 0.14;   // signal threshold for mid accounts ($50–$99.99)
 const THRESHOLD_BASE: f64           = 0.18;   // signal threshold for normal accounts (balance ≥ $100)
+const SWING_LOW_CONVICTION_FLOOR: f64 = 0.10;
+const SWING_MIN_THRESHOLD_FLOOR: f64 = 0.08;
+const SWING_WEAK_SIGNAL_SIZE_SCALE: f64 = 0.60;
+const SWING_SPREAD_COST_CAP: f64 = 0.25;
+const SWING_TOTAL_PENALTIES_CAP: f64 = 0.35;
 
 // ── MICRO_ACTIVE live-mode thresholds (lower than paper/sim micro_aggressive) ──
 /// Signal threshold for live micro_active < $50 (lower than micro_aggressive 0.11).
@@ -1711,8 +1718,30 @@ fn profile_threshold(
                 (THRESHOLD_BASE, "flip_hyper")
             }
         }
-        RuntimeProfile::Swing => (THRESHOLD_BASE, "swing"),
+        RuntimeProfile::Swing => (swing_conviction_threshold(THRESHOLD_BASE, total_balance_usd), "swing"),
     }
+}
+
+fn swing_conviction_threshold(base_threshold: f64, total_balance_usd: f64) -> f64 {
+    if total_balance_usd > 0.0 && total_balance_usd < MICRO_ACCOUNT_MODE_BALANCE_USD {
+        (base_threshold * 0.6).max(SWING_MIN_THRESHOLD_FLOOR)
+    } else {
+        base_threshold
+    }
+}
+
+fn low_conviction_override_allowed(
+    is_swing_profile: bool,
+    score: f64,
+    effective_cutoff: f64,
+    allow_despite_regime_mismatch: bool,
+    penalty_clamped: bool,
+) -> bool {
+    if !is_swing_profile || score < SWING_LOW_CONVICTION_FLOOR {
+        return false;
+    }
+    let penalty_heavy_block = score < effective_cutoff && penalty_clamped;
+    penalty_heavy_block || (allow_despite_regime_mismatch && score < effective_cutoff)
 }
 
 fn flip_hyper_profit_floor_for_balance(total_balance_usd: f64) -> f64 {
@@ -2438,6 +2467,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
     let effective_cutoff = if threshold_mode == "micro_aggressive"
         || threshold_mode == "micro_active"
         || threshold_mode == "flip_hyper"
+        || threshold_mode == "swing"
     {
         effective_threshold.min(regime_cutoff)
     } else {
@@ -2485,6 +2515,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
         return no_action(cycle_id, "NO_CANDIDATES".to_string(), "running".to_string());
     };
+    let mut override_used = false;
+    let mut weak_signal_fallback_used = false;
+    let mut weak_signal_fallback_reason = String::new();
 
     for stale in candidates.iter().skip(1) {
         lifecycle(
@@ -2660,10 +2693,32 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         }
     }
 
-    if allow_despite_regime_mismatch && chosen.score < cfg.min_conviction_threshold {
+    let swing_conviction_cutoff = if is_swing_profile {
+        swing_conviction_threshold(THRESHOLD_BASE, total_balance_usd)
+    } else {
+        cfg.min_conviction_threshold
+    };
+    if allow_despite_regime_mismatch && chosen.score < swing_conviction_cutoff {
+        if is_swing_profile && chosen.score >= SWING_LOW_CONVICTION_FLOOR {
+            override_used = true;
+            weak_signal_fallback_used = true;
+            weak_signal_fallback_reason = "regime_mismatch".to_string();
+            log_npc_event(
+                &*state.store,
+                "risk_override",
+                &format!(
+                    "cycle={} action_id={} role={} code=TRADE_ALLOWED_LOW_CONVICTION score={:.4} threshold={:.4} reason=regime_mismatch",
+                    cycle_id,
+                    chosen.action_id,
+                    chosen.role.as_str(),
+                    chosen.score,
+                    swing_conviction_cutoff
+                ),
+            );
+        } else {
         let reason = format!(
             "SWING_RISK_OVERRIDE_CONVICTION_BELOW_THRESHOLD:{:.4}<{:.4}",
-            chosen.score, cfg.min_conviction_threshold
+            chosen.score, swing_conviction_cutoff
         );
         lifecycle(
             &*state.store,
@@ -2684,7 +2739,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                 chosen.side.to_uppercase(),
                 chosen.role.as_str(),
                 chosen.score,
-                cfg.min_conviction_threshold
+                swing_conviction_cutoff
             ),
             no_trade_reason: reason.clone(),
             pipeline_state: "Scanning".to_string(),
@@ -2700,9 +2755,20 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
             top_score_penalties: chosen.score_parts.top_penalties_str(),
         };
+        }
     }
 
-    if chosen.score < effective_cutoff {
+    let penalty_heavy_block = is_swing_profile
+        && chosen.score < effective_cutoff
+        && chosen.score_parts.penalty_clamped;
+    let low_conviction_override = low_conviction_override_allowed(
+        is_swing_profile,
+        chosen.score,
+        effective_cutoff,
+        allow_despite_regime_mismatch,
+        chosen.score_parts.penalty_clamped,
+    );
+    if chosen.score < effective_cutoff && !low_conviction_override {
         lifecycle(
             &*state.store,
             chosen.role,
@@ -2717,10 +2783,14 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
         let score_reason = format!(
             "Signal score {:.4} below minimum threshold {:.4} [{}]. \
-             raw={:.4} norm={:.3} top_penalties=[{}].",
+             raw_score={:.4} adjusted_score={:.4} norm={:.3} threshold_used={:.4} penalty_clamped={} override_used={} top_penalties=[{}].",
             chosen.score, effective_cutoff, threshold_mode,
             chosen.raw_score,
+            chosen.score,
             chosen.raw_score / effective_cutoff.max(f64::EPSILON),
+            effective_cutoff,
+            chosen.score_parts.penalty_clamped,
+            low_conviction_override,
             chosen.score_parts.top_penalties_str()
         );
         return NpcCycleReport {
@@ -2746,6 +2816,40 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
             top_score_penalties: chosen.score_parts.top_penalties_str(),
         };
+    }
+    if low_conviction_override {
+        override_used = true;
+        weak_signal_fallback_used = true;
+        if weak_signal_fallback_reason.is_empty() {
+            weak_signal_fallback_reason = if penalty_heavy_block {
+                "penalty_heavy".to_string()
+            } else {
+                "regime_mismatch".to_string()
+            };
+        }
+        log_npc_event(
+            &*state.store,
+            "risk_override",
+            &format!(
+                "cycle={} action_id={} role={} code=TRADE_ALLOWED_LOW_CONVICTION score={:.4} threshold={:.4} reason={} penalty_clamped={}",
+                cycle_id,
+                chosen.action_id,
+                chosen.role.as_str(),
+                chosen.score,
+                effective_cutoff,
+                weak_signal_fallback_reason,
+                chosen.score_parts.penalty_clamped
+            ),
+        );
+        info!(
+            cycle_id,
+            action_id = chosen.action_id.as_str(),
+            role = chosen.role.as_str(),
+            score = chosen.score,
+            threshold = effective_cutoff,
+            reason = weak_signal_fallback_reason.as_str(),
+            "TRADE_ALLOWED_LOW_CONVICTION"
+        );
     }
 
     // ── COMPOUND_EXECUTION quality gate ──────────────────────────────────────
@@ -2932,9 +3036,17 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         rt.btc_before = sell_inventory;
         rt.btc_after = sell_inventory;
     }
-    let allocation = forced_allocation.unwrap_or_else(|| {
+    let mut allocation = forced_allocation.unwrap_or_else(|| {
         allocate_capital(&effective_cfg, &rt, &chosen, position_size, exposure_notional, buy_power, sell_inventory, metrics.mid, total_balance_usd, is_micro_active)
     });
+    if weak_signal_fallback_used {
+        allocation.qty *= SWING_WEAK_SIGNAL_SIZE_SCALE;
+        allocation.adjusted_position_size_usd *= SWING_WEAK_SIGNAL_SIZE_SCALE;
+        allocation.reason = format!(
+            "{}|LOW_CONVICTION_SIZE_SCALE:{:.2}:reason={}",
+            allocation.reason, SWING_WEAK_SIGNAL_SIZE_SCALE, weak_signal_fallback_reason
+        );
+    }
     rt.sizing_raw_position_size_usd = allocation.raw_position_size_usd;
     rt.sizing_adjusted_position_size_usd = allocation.adjusted_position_size_usd;
     rt.sizing_min_notional_usd = allocation.min_notional;
@@ -3220,6 +3332,21 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             );
         }
     }
+
+    log_npc_event(
+        &*state.store,
+        "score_telemetry",
+        &format!(
+            "cycle={} action_id={} raw_score={:.4} adjusted_score={:.4} threshold_used={:.4} penalty_clamped={} override_used={}",
+            cycle_id,
+            chosen.action_id,
+            chosen.raw_score,
+            chosen.score,
+            effective_cutoff,
+            chosen.score_parts.penalty_clamped,
+            override_used
+        ),
+    );
 
     lifecycle(
         &*state.store,
@@ -3577,11 +3704,16 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         execution_result: "EXECUTED".to_string(),
         status: "running".to_string(),
         last_agent_decision: format!(
-            "{} {} role={} score={:.4} reason={}",
+            "{} {} role={} score={:.4} raw_score={:.4} adjusted_score={:.4} threshold_used={:.4} penalty_clamped={} override_used={} reason={}",
             chosen.side.to_uppercase(),
             state.symbol,
             chosen.role.as_str(),
             chosen.score,
+            chosen.raw_score,
+            chosen.score,
+            effective_cutoff,
+            chosen.score_parts.penalty_clamped,
+            override_used,
             chosen.reason
         ),
         no_trade_reason: String::new(),
@@ -3821,6 +3953,7 @@ fn build_worker_candidates(
             sell_inventory,
             position_size,
             is_micro_active,
+            is_swing_profile,
         );
         let raw_score = score_parts.final_score();
         let score = raw_score.max(-5.0);
@@ -3858,6 +3991,7 @@ fn score_candidate(
     sell_inventory: f64,
     position_size: f64,
     is_micro_active: bool,
+    is_swing_profile: bool,
 ) -> ScoreBreakdown {
     // In MICRO_ACTIVE mode, boost short-term momentum sensitivity (5s) by 1.5×
     // to amplify edge signals on small live accounts where momentum is the primary
@@ -3896,10 +4030,26 @@ fn score_candidate(
     // cost and halving it is a straightforward linear adjustment.
     let penalty_factor = if is_micro_active { MICRO_PENALTY_DAMPEN } else { 1.0 };
 
-    let volatility_penalty = (realized_volatility_bps(&rt.mid_history, 8).unwrap_or(0.0) / cfg.alpha.vol_spike_bps.max(1.0)).clamp(0.0, 3.0) * penalty_factor;
-    let spread_cost = (metrics.spread_bps / cfg.guards.max_spread_bps.max(0.1)).clamp(0.0, 3.0) * penalty_factor;
-    let slippage_risk = (expected_slippage_bps / cfg.guards.max_slippage_bps.max(0.1)).clamp(0.0, 3.0) * penalty_factor;
-    let conflict_penalty = if has_conflict { 1.0 } else { 0.0 } + side_penalty;
+    let mut volatility_penalty = (realized_volatility_bps(&rt.mid_history, 8).unwrap_or(0.0) / cfg.alpha.vol_spike_bps.max(1.0)).clamp(0.0, 3.0) * penalty_factor;
+    let mut spread_cost = (metrics.spread_bps / cfg.guards.max_spread_bps.max(0.1)).clamp(0.0, 3.0) * penalty_factor;
+    let mut slippage_risk = (expected_slippage_bps / cfg.guards.max_slippage_bps.max(0.1)).clamp(0.0, 3.0) * penalty_factor;
+    let mut conflict_penalty = if has_conflict { 1.0 } else { 0.0 } + side_penalty;
+    let mut penalty_clamped = false;
+
+    if is_swing_profile && spread_cost > SWING_SPREAD_COST_CAP {
+        spread_cost = SWING_SPREAD_COST_CAP;
+        penalty_clamped = true;
+    }
+    let mut total_penalties = spread_cost + slippage_risk + volatility_penalty + conflict_penalty;
+    if is_swing_profile && total_penalties > SWING_TOTAL_PENALTIES_CAP {
+        let scale = SWING_TOTAL_PENALTIES_CAP / total_penalties.max(f64::EPSILON);
+        spread_cost *= scale;
+        slippage_risk *= scale;
+        volatility_penalty *= scale;
+        conflict_penalty *= scale;
+        total_penalties = SWING_TOTAL_PENALTIES_CAP;
+        penalty_clamped = true;
+    }
     let hold_efficiency = (1.0 / expected_hold_secs.max(1.0)).clamp(0.01, 0.20);
 
     ScoreBreakdown {
@@ -3910,6 +4060,8 @@ fn score_candidate(
         volatility_penalty,
         conflict_penalty,
         hold_efficiency,
+        total_penalties,
+        penalty_clamped,
     }
 }
 
@@ -5640,6 +5792,61 @@ mod tests {
         assert!((effective_cutoff - 0.08).abs() < f64::EPSILON,
             "normal account should use regime_cutoff=0.08 when it is lower, got {effective_cutoff}");
     }
+
+    #[test]
+    fn swing_threshold_scales_down_for_sub_250_balance() {
+        let (threshold, mode) = profile_threshold(RuntimeProfile::Swing, 120.0, NpcTradingMode::Paper);
+        assert_eq!(mode, "swing");
+        assert!((threshold - 0.108).abs() < 1e-9, "expected 0.108, got {threshold}");
+        assert!(threshold >= SWING_MIN_THRESHOLD_FLOOR);
+    }
+
+    #[test]
+    fn swing_penalties_are_clamped_and_weak_signal_survives() {
+        let cfg = test_cfg();
+        let rt = NpcRuntimeState::default();
+        let metrics = crate::signal::SignalMetrics {
+            momentum_5s: 0.0002,
+            spread_bps: 5.0,
+            trade_samples: 1,
+            mid: 50_000.0,
+            ..Default::default()
+        };
+        let expected_slippage = metrics.spread_bps * 0.55;
+
+        let swing_score = score_candidate(
+            &cfg, &rt, NpcRole::Scout, &metrics, "BUY",
+            expected_slippage, 6.0, false, None,
+            100.0, 0.0, 0.0, false, true,
+        );
+        let unclamped_score = score_candidate(
+            &cfg, &rt, NpcRole::Scout, &metrics, "BUY",
+            expected_slippage, 6.0, false, None,
+            100.0, 0.0, 0.0, false, false,
+        );
+
+        assert!(swing_score.penalty_clamped, "swing penalties must be clamped");
+        assert!(swing_score.spread_cost <= SWING_SPREAD_COST_CAP + 1e-9);
+        assert!(swing_score.total_penalties <= SWING_TOTAL_PENALTIES_CAP + 1e-9);
+        assert!(
+            swing_score.final_score() >= SWING_LOW_CONVICTION_FLOOR && swing_score.final_score() <= 0.15,
+            "weak-signal swing score should stay executable around 0.10–0.15, got {:.4}",
+            swing_score.final_score()
+        );
+        assert!(
+            unclamped_score.final_score() < SWING_LOW_CONVICTION_FLOOR,
+            "without clamp, penalties should suppress score below execution floor; got {:.4}",
+            unclamped_score.final_score()
+        );
+    }
+
+    #[test]
+    fn low_conviction_override_allows_penalty_heavy_or_regime_mismatch() {
+        assert!(low_conviction_override_allowed(true, 0.11, 0.18, false, true));
+        assert!(low_conviction_override_allowed(true, 0.12, 0.18, true, false));
+        assert!(!low_conviction_override_allowed(true, 0.09, 0.18, true, true));
+        assert!(!low_conviction_override_allowed(false, 0.12, 0.18, true, true));
+    }
 }
 
 // ── End-to-end gate diagnostic tests ──────────────────────────────────────────
@@ -6534,12 +6741,14 @@ mod micro_active_tests {
             expected_slippage, 6.0, false, None,
             /* buy_power */ 100.0, /* sell_inventory */ 0.0, /* position_size */ 0.0,
             /* is_micro_active */ false,
+            /* is_swing_profile */ false,
         );
         let score_micro = score_candidate(
             &cfg, &rt, NpcRole::Scout, &metrics, "BUY",
             expected_slippage, 6.0, false, None,
             /* buy_power */ 100.0, /* sell_inventory */ 0.0, /* position_size */ 0.0,
             /* is_micro_active */ true,
+            /* is_swing_profile */ false,
         );
 
         assert!(
@@ -6563,6 +6772,7 @@ mod micro_active_tests {
             expected_slippage, 18.0, false, None,
             /* buy_power */ 50.0, /* sell_inventory */ 0.0, /* position_size */ 0.0,
             /* is_micro_active */ true,
+            /* is_swing_profile */ false,
         );
 
         // Score should be meaningfully positive (not near-zero).
@@ -6588,6 +6798,7 @@ mod micro_active_tests {
             expected_slippage, 6.0, false, None,
             /* buy_power */ 40.0, /* sell_inventory */ 0.0, /* position_size */ 0.0,
             /* is_micro_active */ true,
+            /* is_swing_profile */ false,
         );
         let final_score = score_micro.final_score();
 
@@ -6612,12 +6823,12 @@ mod micro_active_tests {
         let score_normal = score_candidate(
             &cfg, &rt, NpcRole::Scout, &metrics, "BUY",
             expected_slippage, 6.0, false, None,
-            100.0, 0.0, 0.0, false,
+            100.0, 0.0, 0.0, false, false,
         ).final_score();
         let score_micro = score_candidate(
             &cfg, &rt, NpcRole::Scout, &metrics, "BUY",
             expected_slippage, 6.0, false, None,
-            100.0, 0.0, 0.0, true,
+            100.0, 0.0, 0.0, true, false,
         ).final_score();
 
         // micro_active score must be higher.
@@ -6741,6 +6952,8 @@ mod micro_active_tests {
             volatility_penalty: 0.35,
             conflict_penalty: 0.0,
             hold_efficiency: 0.167,
+            total_penalties: 1.10,
+            penalty_clamped: false,
         };
         let s = breakdown.top_penalties_str();
         // spread_cost=0.6 should appear before vol_penalty=0.35 and slippage=0.15
@@ -6918,6 +7131,7 @@ mod flip_hyper_tests {
             expected_slippage, 6.0, false, None,
             100.0, 0.0, 0.0,
             /* is_micro_active */ true, // FLIP_HYPER inherits micro_active scoring
+            /* is_swing_profile */ false,
         ).final_score();
 
         // Score must pass the FLIP_HYPER threshold (0.040) which is lower
