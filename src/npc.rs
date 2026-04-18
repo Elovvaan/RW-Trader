@@ -751,6 +751,13 @@ pub struct NpcLoopSnapshot {
     pub risk_block_reason: String,
     /// Why a strategy/score/execution guard blocked execution (empty when not the cause).
     pub execution_block_reason: String,
+    pub feed_warmed_up: bool,
+    pub exchange_ready: bool,
+    pub balance_ready: bool,
+    pub sizing_ready: bool,
+    pub risk_ready: bool,
+    pub live_ready: bool,
+    pub final_live_blocker_reason: String,
     /// True when SWING profile is active and regime mismatch is informational.
     pub risk_override: bool,
     pub regime_override: bool,
@@ -1111,16 +1118,33 @@ impl NpcAutonomousController {
         let control = self.control.lock().await;
         let cfg = self.cfg.lock().await.clone();
         let agent_mode = control.mode;
-        let (truth_position_size, truth_sell_inventory, truth_total_balance_usd, truth_pending_order_slots, truth_pending_order_ids) = {
+        let authority_mode = self.state.authority.mode().await;
+        let exec_state = self.state.exec.execution_state().await;
+        let exec_system_mode = self.state.exec.system_mode().await;
+        let (truth_position_size, truth_buy_power, truth_sell_inventory, truth_total_balance_usd, truth_can_place_order, truth_pending_order_slots, truth_pending_order_ids) = {
             let truth = self.state.truth.lock().await;
             let (pending_order_slots, pending_order_ids) = collect_truth_pending_order_slots(&truth);
             (
                 truth.position.size,
+                truth.buy_power.max(0.0),
                 truth.sell_inventory,
                 truth.total_balance_usd.max(0.0),
+                truth.can_place_order(),
                 pending_order_slots,
                 pending_order_ids,
             )
+        };
+        let feed_warmed_up = {
+            let feed = self.state.feed.lock().await;
+            let signal = self.state.signal.lock().await;
+            feed.last_seen.is_some()
+                && feed.is_fresh(signal.config.max_feed_staleness)
+                && feed.bid.is_finite()
+                && feed.ask.is_finite()
+                && feed.bid > 0.0
+                && feed.ask > 0.0
+                && feed.mid_history.len() >= signal.config.min_mid_samples
+                && feed.trade_history.len() >= signal.config.min_trade_samples
         };
         let (current_equity, peak_equity, drawdown_pct, compound, sizing, flip, contract, rebalance, contract_last_no_open_reason, slot_usage) = {
             // Compute current equity and drawdown from runtime state (same formula as evaluate_portfolio_controls).
@@ -1299,6 +1323,39 @@ impl NpcAutonomousController {
         ) = contract;
         let selected_profile = RuntimeProfile::from_str(&cfg.behavior_profile);
         let active_profile = resolve_runtime_profile(selected_profile, truth_total_balance_usd);
+        let exchange_ready = exec_system_mode.can_trade() && matches!(exec_state, ExecutionState::Idle);
+        let balance_ready = truth_can_place_order
+            && truth_total_balance_usd.is_finite()
+            && truth_total_balance_usd > 0.0
+            && (truth_buy_power > 0.0 || truth_sell_inventory > 0.0);
+        let sizing_ready = adjusted_position_size_usd.is_finite()
+            && min_notional.is_finite()
+            && adjusted_position_size_usd >= min_notional
+            && min_notional > 0.0;
+        let risk_ready = !cfg.guards.kill_switch
+            && drawdown_pct < cfg.alpha.max_drawdown_pct
+            && truth_position_size <= cfg.guards.max_position_qty.max(0.0) + f64::EPSILON;
+        let live_ready = authority_mode == AuthorityMode::Auto
+            && feed_warmed_up
+            && exchange_ready
+            && balance_ready
+            && sizing_ready
+            && risk_ready;
+        let final_live_blocker_reason = if authority_mode != AuthorityMode::Auto {
+            "AUTHORITY_NOT_AUTO".to_string()
+        } else if !feed_warmed_up {
+            "FEED_NOT_WARMED_UP".to_string()
+        } else if !exchange_ready {
+            "EXCHANGE_UNAVAILABLE".to_string()
+        } else if !balance_ready {
+            "BALANCE_NOT_READY".to_string()
+        } else if !sizing_ready {
+            "SIZING_NOT_READY".to_string()
+        } else if !risk_ready {
+            "RISK_HARD_RAIL_BLOCK".to_string()
+        } else {
+            String::new()
+        };
         NpcLoopSnapshot {
             agent_mode,
             autonomous_mode: agent_mode != AgentMode::Off,
@@ -1317,6 +1374,13 @@ impl NpcAutonomousController {
             balance_block_reason: telemetry.balance_block_reason.clone(),
             risk_block_reason: telemetry.risk_block_reason.clone(),
             execution_block_reason: telemetry.execution_block_reason.clone(),
+            feed_warmed_up,
+            exchange_ready,
+            balance_ready,
+            sizing_ready,
+            risk_ready,
+            live_ready,
+            final_live_blocker_reason,
             risk_override: active_profile == RuntimeProfile::Swing,
             regime_override: telemetry.regime_override,
             active_profile: active_profile.as_str().to_string(),
@@ -2228,6 +2292,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
     }
 
     let exec_state = state.exec.execution_state().await;
+    let exec_system_mode = state.exec.system_mode().await;
     let pending = state.authority.pending_proposals().await;
 
     let selected_profile = RuntimeProfile::from_str(&cfg.behavior_profile);
@@ -2636,24 +2701,23 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                 balance_block_reason: String::new(),
                 risk_block_reason: reason.clone(),
                 execution_block_reason: reason,
-    let Some(mut chosen) = candidates.first().cloned() else {
-        log_npc_event(&*state.store, "no_action", &format!("cycle={} reason=NO_CANDIDATES", cycle_id));
-        observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
-        return no_action(cycle_id, "NO_CANDIDATES".to_string(), "running".to_string());
+                cooldown_active: false,
+                cooldown_remaining_ms: 0,
+                effective_threshold: effective_cutoff,
+                threshold_mode: threshold_mode.to_string(),
+                raw_score: 0.0,
+                normalized_score: 0.0,
+                top_score_penalties: String::new(),
+                regime_override: false,
+                final_blocker_reason: String::new(),
+                sizing_bumped: false,
+            };
+        }
     };
+    let mut chosen = chosen;
     let mut override_used = false;
     let mut weak_signal_fallback_used = false;
     let mut weak_signal_fallback_reason = String::new();
-
-    for stale in candidates.iter().skip(1) {
-        lifecycle(
-            &*state.store,
-            stale.role,
-            &stale.action_id,
-            NpcLifecycleState::Superseded,
-            "lower-ranked candidate superseded by orchestrator ranking",
-        );
-    }
 
     if is_swing_profile {
         let bias = swing_bias(&swing_signals);
@@ -2949,17 +3013,15 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                 cooldown_remaining_ms: 0,
                 effective_threshold: effective_cutoff,
                 threshold_mode: threshold_mode.to_string(),
-            };
-        }
-    };
-
-    if chosen.score < effective_cutoff {
                 raw_score: chosen.raw_score,
                 normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
                 top_score_penalties: chosen.score_parts.top_penalties_str(),
                 sizing_bumped: false,
             };
         }
+    };
+
+    if chosen.score < effective_cutoff {
         lifecycle(
             &*state.store,
             chosen.role,
@@ -3659,48 +3721,99 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         ),
     );
 
-    if effective_cfg.mode == NpcTradingMode::Live
-        && rt.paper_executions == 0
-        && !is_flip_hyper
-        && !is_micro_safe_execution
-    {
-        lifecycle(
-            &*state.store,
-            chosen.role,
-            &chosen.action_id,
-            NpcLifecycleState::Rejected,
-            "live mode requires at least one successful paper execution first",
-        );
-        rt.perf.entry(chosen.role).or_default().blocked += 1;
-        observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
-        return NpcCycleReport {
-            cycle_id,
-            last_action: "NO_ACTION".to_string(),
-            execution_result: "LIVE_REQUIRES_PAPER_EXECUTION".to_string(),
-            status: "blocked".to_string(),
-            last_agent_decision: format!(
-                "HOLD — {} {} authorized but blocked: NPC_TRADING_MODE=live requires one paper execution first",
-                chosen.side.to_uppercase(), chosen.role.as_str()
-            ),
-            no_trade_reason: "Live mode safety gate: set NPC_TRADING_MODE=paper to enable execution. \
-                               One successful paper execution is required before live trades are allowed."
-                .to_string(),
-            pipeline_state: "Trigger Matched — Blocked".to_string(),
-            final_decision: "BLOCKED".to_string(),
-            balance_block_reason: String::new(),
-            risk_block_reason: String::new(),
-            execution_block_reason: "LIVE_REQUIRES_PAPER_EXECUTION".to_string(),
-            cooldown_active: false,
-            cooldown_remaining_ms: 0,
-            effective_threshold: effective_cutoff,
-            threshold_mode: threshold_mode.to_string(),
-            raw_score: chosen.raw_score,
-            normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
-            top_score_penalties: chosen.score_parts.top_penalties_str(),
-                    regime_override: false,
-                    final_blocker_reason: String::new(),
-                    sizing_bumped: false,
+    if effective_cfg.mode == NpcTradingMode::Live {
+        let signal_cfg = { state.signal.lock().await.config.clone() };
+        let feed_warmed_up = {
+            let feed = state.feed.lock().await;
+            feed.last_seen.is_some()
+                && feed.is_fresh(signal_cfg.max_feed_staleness)
+                && feed.bid.is_finite()
+                && feed.ask.is_finite()
+                && feed.bid > 0.0
+                && feed.ask > 0.0
+                && feed.mid_history.len() >= signal_cfg.min_mid_samples
+                && feed.trade_history.len() >= signal_cfg.min_trade_samples
         };
+        let exchange_ready = exec_system_mode.can_trade() && matches!(exec_state, ExecutionState::Idle);
+        let balance_ready = total_balance_usd.is_finite()
+            && total_balance_usd > 0.0
+            && (buy_power > 0.0 || sell_inventory > 0.0);
+        let sizing_ready = allocation.qty.is_finite()
+            && allocation.qty > 0.0
+            && order_notional.is_finite()
+            && allocation.min_notional.is_finite()
+            && order_notional >= allocation.min_notional.max(MIN_TRADE_NOTIONAL_USD);
+        let risk_ready = !effective_cfg.guards.kill_switch
+            && portfolio_controls.is_empty()
+            && guard_reasons.is_empty();
+        let blocker = if mode != AuthorityMode::Auto {
+            "AUTHORITY_NOT_AUTO"
+        } else if !feed_warmed_up {
+            "FEED_NOT_WARMED_UP"
+        } else if !exchange_ready {
+            "EXCHANGE_UNAVAILABLE"
+        } else if !balance_ready {
+            "BALANCE_NOT_READY"
+        } else if !sizing_ready {
+            "INVALID_SIZE_OR_NOTIONAL"
+        } else if !risk_ready {
+            "RISK_HARD_RAIL_BLOCK"
+        } else {
+            ""
+        };
+
+        if !blocker.is_empty() {
+            let block_reason = format!("LIVE_NOT_READY:{}", blocker);
+            lifecycle(
+                &*state.store,
+                chosen.role,
+                &chosen.action_id,
+                NpcLifecycleState::Rejected,
+                &block_reason,
+            );
+            rt.perf.entry(chosen.role).or_default().blocked += 1;
+            observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
+            return NpcCycleReport {
+                cycle_id,
+                last_action: "NO_ACTION".to_string(),
+                execution_result: block_reason.clone(),
+                status: "blocked".to_string(),
+                last_agent_decision: format!(
+                    "HOLD — {} {} authorized but blocked: {}",
+                    chosen.side.to_uppercase(),
+                    chosen.role.as_str(),
+                    blocker
+                ),
+                no_trade_reason: format!("Live readiness block: {}", blocker),
+                pipeline_state: "Trigger Matched — Blocked".to_string(),
+                final_decision: "BLOCKED".to_string(),
+                balance_block_reason: if blocker == "BALANCE_NOT_READY" {
+                    blocker.to_string()
+                } else {
+                    String::new()
+                },
+                risk_block_reason: if blocker == "RISK_HARD_RAIL_BLOCK" {
+                    blocker.to_string()
+                } else {
+                    String::new()
+                },
+                execution_block_reason: if blocker == "BALANCE_NOT_READY" || blocker == "RISK_HARD_RAIL_BLOCK" {
+                    String::new()
+                } else {
+                    block_reason
+                },
+                cooldown_active: false,
+                cooldown_remaining_ms: 0,
+                effective_threshold: effective_cutoff,
+                threshold_mode: threshold_mode.to_string(),
+                raw_score: chosen.raw_score,
+                normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
+                top_score_penalties: chosen.score_parts.top_penalties_str(),
+                regime_override: false,
+                final_blocker_reason: blocker.to_string(),
+                sizing_bumped: false,
+            };
+        }
     }
 
     lifecycle(&*state.store, chosen.role, &chosen.action_id, NpcLifecycleState::Queued, "ready for dispatch");
@@ -6594,16 +6707,46 @@ mod diagnostic_tests {
         assert_eq!(report.final_decision, "EXECUTE");
     }
 
-    // ── Gate 6: NPC live mode safety gate ────────────────────────────────────
+    // ── Live readiness gate ───────────────────────────────────────────────────
 
-    /// DIAGNOSTIC PROOF: NPC_TRADING_MODE=live with zero paper_executions blocks
-    /// every cold start.  paper_executions is in-memory and resets on restart.
-    ///
-    /// Root cause: `rt.paper_executions == 0` at every process start when
-    /// NPC_TRADING_MODE=live.  The operator must first accumulate paper_executions
-    /// by running in Paper mode, or keep NPC_TRADING_MODE=paper (the default).
     #[tokio::test]
-    async fn gate6_live_mode_never_executes_on_cold_start() {
+    async fn live_mode_can_execute_without_prior_paper_execution() {
+        let store = InMemoryEventStore::new();
+        let authority = Arc::new(AuthorityLayer::new());
+        authority.set_mode_auto(&*store).await;
+
+        let state = make_agent_state(
+            Arc::clone(&store) as Arc<dyn crate::store::EventStore>,
+            Arc::clone(&authority),
+            None,
+        );
+        let mut cfg = active_npc_cfg();
+        cfg.mode = NpcTradingMode::Live;
+        cfg.behavior_profile = "ACTIVE".to_string();
+        cfg.guards.max_position_qty = 10.0;
+
+        // Runtime has zero paper_executions (cold start).
+        let runtime = Arc::new(Mutex::new(NpcRuntimeState::default()));
+        state.exec.set_mode_ready().await;
+
+        {
+            let mut feed = state.feed.lock().await;
+            populate_feed(&mut feed, 50_000.0, 40);
+        }
+        {
+            let mut truth = state.truth.lock().await;
+            truth.buy_power = 100.0;
+            truth.sell_inventory = 0.001;
+            truth.total_balance_usd = 100.0;
+        }
+
+        let report = run_cycle(&cfg, &state, runtime).await;
+        assert_eq!(report.final_decision, "EXECUTE");
+        assert_ne!(report.execution_result, "LIVE_REQUIRES_PAPER_EXECUTION");
+    }
+
+    #[tokio::test]
+    async fn live_mode_blocks_when_exchange_not_ready() {
         let store = InMemoryEventStore::new();
         let authority = Arc::new(AuthorityLayer::new());
         authority.set_mode_auto(&*store).await;
@@ -6616,78 +6759,116 @@ mod diagnostic_tests {
         let mut cfg = active_npc_cfg();
         cfg.mode = NpcTradingMode::Live;
 
-        // Runtime has zero paper_executions (cold start).
         let runtime = Arc::new(Mutex::new(NpcRuntimeState::default()));
-
         {
             let mut feed = state.feed.lock().await;
-            populate_feed(&mut feed, 50_000.0, 20);
+            populate_feed(&mut feed, 50_000.0, 40);
         }
         {
             let mut truth = state.truth.lock().await;
-            truth.sell_inventory = 10.0;
-            truth.buy_power = 100_000.0;
-            truth.total_balance_usd = 100_000.0;
+            truth.buy_power = 100.0;
+            truth.sell_inventory = 0.001;
+            truth.total_balance_usd = 100.0;
         }
-
         let report = run_cycle(&cfg, &state, runtime).await;
-
-        // The cycle may block at an earlier gate (score/guards), but must never EXECUTE.
-        assert_ne!(
-            report.final_decision, "EXECUTE",
-            "live mode with zero paper_executions must never reach EXECUTE on cold start; \
-             final_decision={} execution_result={}",
-            report.final_decision, report.execution_result
-        );
-        // If gate 6 was reached, the execution_result must name the live gate.
-        if report.execution_result == "LIVE_REQUIRES_PAPER_EXECUTION" {
-            assert_eq!(
-                report.final_decision, "BLOCKED",
-                "LIVE_REQUIRES_PAPER_EXECUTION must yield final_decision=BLOCKED"
-            );
-            assert!(
-                report.execution_block_reason.contains("LIVE_REQUIRES_PAPER_EXECUTION"),
-                "execution_block_reason must name the live gate; got: {}",
-                report.execution_block_reason
-            );
-        }
+        assert_eq!(report.final_decision, "BLOCKED");
+        assert!(report.execution_result.contains("EXCHANGE_UNAVAILABLE"));
     }
 
-    /// DIAGNOSTIC PROOF: Paper mode does NOT apply the paper_executions gate.
     #[tokio::test]
-    async fn gate6_paper_mode_skips_live_safety_gate() {
+    async fn live_mode_blocks_when_feed_not_warmed_up() {
         let store = InMemoryEventStore::new();
         let authority = Arc::new(AuthorityLayer::new());
         authority.set_mode_auto(&*store).await;
-
         let state = make_agent_state(
             Arc::clone(&store) as Arc<dyn crate::store::EventStore>,
             Arc::clone(&authority),
             None,
         );
         let mut cfg = active_npc_cfg();
-        cfg.mode = NpcTradingMode::Paper;
+        cfg.mode = NpcTradingMode::Live;
+        state.exec.set_mode_ready().await;
 
-        let runtime = Arc::new(Mutex::new(NpcRuntimeState::default()));
         {
             let mut feed = state.feed.lock().await;
-            populate_feed(&mut feed, 50_000.0, 20);
+            populate_feed(&mut feed, 50_000.0, 40);
+            feed.last_seen = Some(Instant::now() - Duration::from_secs(60));
         }
         {
             let mut truth = state.truth.lock().await;
-            truth.sell_inventory = 10.0;
-            truth.buy_power = 100_000.0;
-            truth.total_balance_usd = 100_000.0;
+            truth.buy_power = 100.0;
+            truth.sell_inventory = 0.001;
+            truth.total_balance_usd = 100.0;
         }
 
+        let runtime = Arc::new(Mutex::new(NpcRuntimeState::default()));
         let report = run_cycle(&cfg, &state, runtime).await;
+        assert_eq!(report.final_decision, "BLOCKED");
+        assert!(report.execution_result.contains("FEED_NOT_WARMED_UP"));
+    }
 
-        // Paper mode must never block with the live gate.
-        assert_ne!(
-            report.execution_result, "LIVE_REQUIRES_PAPER_EXECUTION",
-            "paper mode must never block with LIVE_REQUIRES_PAPER_EXECUTION; \
-             execution_result={} final_decision={}",
-            report.execution_result, report.final_decision
+    #[tokio::test]
+    async fn live_mode_blocks_when_balance_not_ready() {
+        let store = InMemoryEventStore::new();
+        let authority = Arc::new(AuthorityLayer::new());
+        authority.set_mode_auto(&*store).await;
+        let state = make_agent_state(
+            Arc::clone(&store) as Arc<dyn crate::store::EventStore>,
+            Arc::clone(&authority),
+            None,
+        );
+        let mut cfg = active_npc_cfg();
+        cfg.mode = NpcTradingMode::Live;
+        state.exec.set_mode_ready().await;
+        {
+            let mut feed = state.feed.lock().await;
+            populate_feed(&mut feed, 50_000.0, 40);
+        }
+        {
+            let mut truth = state.truth.lock().await;
+            truth.buy_power = 100.0;
+            truth.sell_inventory = 0.001;
+            truth.total_balance_usd = 0.0;
+        }
+
+        let runtime = Arc::new(Mutex::new(NpcRuntimeState::default()));
+        let report = run_cycle(&cfg, &state, runtime).await;
+        assert_eq!(report.final_decision, "BLOCKED");
+        assert!(report.execution_result.contains("BALANCE_NOT_READY"));
+    }
+
+    #[tokio::test]
+    async fn live_mode_blocks_when_risk_hard_rail_fails() {
+        let store = InMemoryEventStore::new();
+        let authority = Arc::new(AuthorityLayer::new());
+        authority.set_mode_auto(&*store).await;
+        let state = make_agent_state(
+            Arc::clone(&store) as Arc<dyn crate::store::EventStore>,
+            Arc::clone(&authority),
+            None,
+        );
+        let mut cfg = active_npc_cfg();
+        cfg.mode = NpcTradingMode::Live;
+        cfg.guards.kill_switch = true;
+        state.exec.set_mode_ready().await;
+        {
+            let mut feed = state.feed.lock().await;
+            populate_feed(&mut feed, 50_000.0, 40);
+        }
+        {
+            let mut truth = state.truth.lock().await;
+            truth.buy_power = 100.0;
+            truth.sell_inventory = 0.001;
+            truth.total_balance_usd = 100.0;
+        }
+
+        let runtime = Arc::new(Mutex::new(NpcRuntimeState::default()));
+        let report = run_cycle(&cfg, &state, runtime).await;
+        assert_eq!(report.final_decision, "BLOCKED");
+        assert!(
+            report.execution_result.contains("KILL_SWITCH_ACTIVE")
+                || report.risk_block_reason.contains("KILL_SWITCH_ACTIVE")
+                || report.execution_block_reason.contains("KILL_SWITCH_ACTIVE")
         );
     }
 
@@ -6847,21 +7028,6 @@ mod diagnostic_tests {
         }
     }
 
-    // ── Regime-skip gate: regime-blocked top-scorer must not silence eligible BUY ──
-
-    /// DIAGNOSTIC PROOF (LIVE issue fix): When the highest-scoring candidate is
-    /// regime-blocked (e.g. risk_manager/SELL in TRENDING_UP), the orchestrator
-    /// must skip it and promote the next eligible candidate, not return HOLD.
-    ///
-    /// Root cause of the LIVE no-trade issue: risk_manager scored 0.8366 in
-    /// TRENDING_UP but is REGIME_MISMATCH blocked. The old code picked it as
-    /// `chosen`, marked all others Superseded, then returned HOLD — Scout,
-    /// DipBuyer, and MomentumExecutor (all TRENDING_UP eligible) were never tried.
-    ///
-    /// After the fix the orchestrator walks the scored list, marks blocked roles
-    /// as Blocked (not Superseded), and promotes the first eligible role.
-    #[tokio::test]
-    async fn regime_blocked_top_scorer_does_not_silence_eligible_buy_roles() {
     // ── Post-threshold execution-chain proofs ─────────────────────────────────
     //
     // These tests prove the complete path AFTER a score passes effective_cutoff:
@@ -7016,16 +7182,9 @@ mod diagnostic_tests {
         }
         {
             let mut truth = state.truth.lock().await;
-            truth.sell_inventory = 0.0;      // no inventory → no SELL candidates
-            truth.buy_power     = 5_000.0;   // enough for a BUY order
+            truth.sell_inventory = 0.0;    // no inventory → no SELL candidates
+            truth.buy_power = 5_000.0;     // enough for a BUY order
             truth.total_balance_usd = 5_000.0;
-            populate_feed(&mut feed, 50_000.0, 30);
-        }
-        {
-            let mut truth = state.truth.lock().await;
-            truth.sell_inventory = 10.0;
-            truth.buy_power = 100_000.0;
-            truth.total_balance_usd = 100_000.0;
         }
 
         let report = run_cycle(&cfg, &state, runtime).await;
@@ -7039,6 +7198,7 @@ mod diagnostic_tests {
             "regime-blocked risk_manager must not suppress eligible BUY roles; \
              final_decision={} execution_result={} no_trade_reason={}",
             report.final_decision, report.execution_result, report.no_trade_reason
+        );
         // PROOF: All NPC-internal gates pass; dispatch is the only blocker.
         assert_eq!(
             report.execution_result, "WEB_UI_ADDR_MISSING",

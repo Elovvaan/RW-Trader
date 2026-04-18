@@ -892,6 +892,25 @@ mod tests {
     }
 
     #[test]
+    fn test_engine_starting_clears_after_warmup_samples_present() {
+        let mut engine = Phase1Engine::default();
+        let t = clean_truth();
+        assert_eq!(engine.last_block_reason, "engine_starting");
+
+        for i in 0..=engine.cfg.min_samples {
+            let mut m = base_metrics();
+            m.mid = 50_000.0 + i as f64;
+            m.bid = m.mid - 1.0;
+            m.ask = m.mid + 1.0;
+            m.feed_age_ms = 10.0;
+            let _ = engine.evaluate(&m, &t);
+        }
+
+        assert!(!engine.last_block_reason.contains("engine_starting"));
+        assert!(!engine.last_block_reason.contains("warming_up"));
+    }
+
+    #[test]
     fn test_block_reason_never_empty_on_no_trade() {
         let mut engine = Phase1Engine::default();
         let m = base_metrics();
