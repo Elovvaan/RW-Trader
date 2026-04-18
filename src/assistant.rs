@@ -232,6 +232,23 @@ pub fn interpret_event(e: &crate::events::StoredEvent) -> String {
             p.field, p.local_value, p.exchange_value
         ),
 
+        TradingEvent::ReconcileApplied(p) => {
+            let fill_list: Vec<String> = p.fills
+                .iter()
+                .map(|f| format!("{} {:.6}@{:.2}", f.side, f.qty, f.price))
+                .collect();
+            format!(
+                "{ts}: RECONCILE_APPLIED — {} new fill(s) applied to position: [{}].",
+                p.fills_count,
+                if fill_list.is_empty() { "n/a".to_string() } else { fill_list.join(", ") }
+            )
+        }
+
+        TradingEvent::BalanceUpdated(p) => format!(
+            "{ts}: BALANCE_UPDATED — total {:.2} USD, buy_power {:.8}, sell_inventory {:.8}.",
+            p.total_balance_usd, p.buy_power, p.sell_inventory
+        ),
+
         TradingEvent::WatchdogTimeout(p) => format!(
             "{ts}: WATCHDOG fired — executor stuck in '{}' for {:.1}s. \
              Forced to Recovery; reconciliation triggered.",

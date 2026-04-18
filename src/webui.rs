@@ -27,7 +27,7 @@ use tracing::{debug, error, info};
 use crate::assistant;
 use crate::authority::{AuthorityLayer, AuthorityMode};
 use crate::executor::Executor;
-use crate::profile::RuntimeProfile;
+use crate::profile::{ProfileConfig, RuntimeProfile};
 use crate::reader::{get_trade_timeline, summarise_event, LifecycleStage, TradeOutcome};
 use crate::reconciler::TruthState;
 use crate::risk::{self, RiskEngine, RiskVerdict};
@@ -226,6 +226,8 @@ async fn handle_post(path: &str, _query: &str, body: &str, state: &AppState) -> 
         let profile_str = form.get("profile").map(|s| s.as_str()).unwrap_or("ACTIVE");
         let new_profile = RuntimeProfile::from_str(profile_str);
         *state.profile.lock().await = new_profile;
+        state.npc.set_active_profile(new_profile).await;
+        *state.strategy.lock().await = StrategyEngine::with_profile(&ProfileConfig::for_profile(new_profile));
         log_ui_action(
             &*state.store,
             "ui_profile_changed",
@@ -712,18 +714,95 @@ async fn agent_status_json(state: &AppState) -> String {
     let balance_block = snap.balance_block_reason.replace('"', "\\\"");
     let risk_block = snap.risk_block_reason.replace('"', "\\\"");
     let exec_block = snap.execution_block_reason.replace('"', "\\\"");
+    let slot_block_reason = snap.slot_block_reason.replace('"', "\\\"");
+    let slot_source_ids = snap.slot_source_ids.replace('"', "\\\"");
     let threshold_mode = snap.threshold_mode.replace('"', "\\\"");
+    let reconstructed_score = if snap.effective_threshold > 0.0 {
+        snap.normalized_score * snap.effective_threshold
+    } else {
+        0.0
+    };
+    let penalty_clamped = snap.last_agent_decision.contains("penalty_clamped=true")
+        || snap.last_no_trade_reason.contains("penalty_clamped=true");
+    let override_used = snap.last_agent_decision.contains("override_used=true")
+        || snap.last_no_trade_reason.contains("override_used=true");
     let body = format!(
-        r#"{{"mode":"{mode_str}","state":"{state_label}","agent_state":"{status_str}","last_action":"{last_action}","last_reason":"{last_reason}","last_agent_decision":"{last_decision}","last_no_trade_reason":"{no_trade_reason}","pipeline_state":"{pipeline}","final_decision":"{final_decision}","balance_block_reason":"{balance_block}","risk_block_reason":"{risk_block}","execution_block_reason":"{exec_block}","current_equity":{current_equity},"peak_equity":{peak_equity},"drawdown_pct":{drawdown_pct},"drawdown_limit":{drawdown_limit},"cycle_count":{cycle_count},"running":{running},"cooldown_active":{cooldown_active},"cooldown_remaining_ms":{cooldown_remaining_ms},"effective_threshold":{effective_threshold},"threshold_mode":"{threshold_mode}"}}"#,
+        r#"{{"mode":"{mode_str}","state":"{state_label}","agent_state":"{status_str}","last_action":"{last_action}","last_reason":"{last_reason}","last_agent_decision":"{last_decision}","last_no_trade_reason":"{no_trade_reason}","pipeline_state":"{pipeline}","final_decision":"{final_decision}","balance_block_reason":"{balance_block}","risk_block_reason":"{risk_block}","execution_block_reason":"{exec_block}","max_concurrent_positions":{max_concurrent_positions},"counted_open_positions":{counted_open_positions},"counted_pending_orders":{counted_pending_orders},"counted_reserved_slots":{counted_reserved_slots},"slot_block_reason":"{slot_block_reason}","slot_source_ids":"{slot_source_ids}","risk_override":{risk_override},"regime_override":{regime_override},"active_profile":"{active_profile}","active_profile_label":"{active_profile_label}","PROFILE_LOCK":"{profile_lock}","current_equity":{current_equity},"peak_equity":{peak_equity},"drawdown_pct":{drawdown_pct},"drawdown_limit":{drawdown_limit},"cycle_count":{cycle_count},"running":{running},"cooldown_active":{cooldown_active},"cooldown_remaining_ms":{cooldown_remaining_ms},"effective_threshold":{effective_threshold},"threshold_mode":"{threshold_mode}","raw_score":{raw_score},"adjusted_score":{adjusted_score},"threshold_used":{threshold_used},"penalty_clamped":{penalty_clamped},"override_used":{override_used},"compound_position_size_usd":{compound_pos_usd},"compound_position_size_btc":{compound_pos_btc},"compound_last_trade_pnl":{compound_last_pnl},"compound_session_pnl":{compound_sess_pnl},"compound_peak_balance":{compound_peak_bal},"compound_current_balance":{compound_cur_bal},"compound_consecutive_losses":{compound_consec},"compound_size_scalar":{compound_scalar},"compound_loss_pause_active":{compound_paused},"raw_position_size_usd":{raw_position_size_usd},"adjusted_position_size_usd":{adjusted_position_size_usd},"min_notional":{min_notional},"sizing_adjustment_reason":"{sizing_adjustment_reason}","sizing_bumped":{sizing_bumped},"flip_cycle_phase":"{flip_cycle_phase}","flip_session_pnl":{flip_session_pnl},"flip_rotation_count":{flip_rotation_count},"flip_last_entry_price":{flip_last_entry_price},"flip_last_exit_price":{flip_last_exit_price},"flip_last_pnl_usd":{flip_last_pnl_usd},"flip_last_pnl_pct":{flip_last_pnl_pct},"flip_min_profit_floor":{flip_min_profit_floor},"flip_blocker":"{flip_blocker}","contract_side":"{contract_side}","contract_leverage":{contract_leverage},"contract_entry_price":{contract_entry_price},"contract_mark_price":{contract_mark_price},"contract_notional_usd":{contract_notional_usd},"contract_unrealized_pnl":{contract_unrealized_pnl},"contract_realized_pnl_session":{contract_realized_pnl_session},"contract_liquidation_price":{contract_liquidation_price},"contract_stop_loss":{contract_stop_loss},"contract_take_profit":{contract_take_profit},"contract_liquidation_buffer_pct":{contract_liquidation_buffer_pct},"contract_duration_secs":{contract_duration_secs},"contract_exit_reason":"{contract_exit_reason}","contract_last_trade_result":{contract_last_trade_result},"contract_paper_mode":{contract_paper_mode},"contract_last_no_open_reason":"{contract_last_no_open_reason}","rebalance_status":"{rebalance_status}","rebalance_triggered":{rebalance_triggered},"rebalance_reason":"{rebalance_reason}","rebalance_side":"{rebalance_side}","rebalance_qty":{rebalance_qty},"rebalance_value_usd":{rebalance_value_usd},"free_usdt_before":{free_usdt_before},"free_usdt_after":{free_usdt_after},"btc_before":{btc_before},"btc_after":{btc_after},"final_blocker_reason":"{final_blocker_reason}"}}"#,
         current_equity  = snap.current_equity,
         peak_equity     = snap.peak_equity,
         drawdown_pct    = snap.drawdown_pct,
         drawdown_limit  = snap.drawdown_limit,
+        max_concurrent_positions = snap.max_concurrent_positions,
+        counted_open_positions   = snap.counted_open_positions,
+        counted_pending_orders   = snap.counted_pending_orders,
+        counted_reserved_slots   = snap.counted_reserved_slots,
+        slot_block_reason        = slot_block_reason,
+        slot_source_ids          = slot_source_ids,
         cycle_count = snap.cycle_count,
         running     = snap.running,
         cooldown_active       = snap.cooldown_active,
         cooldown_remaining_ms = snap.cooldown_remaining_ms,
         effective_threshold   = snap.effective_threshold,
+        raw_score             = snap.raw_score,
+        adjusted_score        = reconstructed_score,
+        threshold_used        = snap.effective_threshold,
+        penalty_clamped       = penalty_clamped,
+        override_used         = override_used,
+        risk_override         = snap.risk_override,
+        regime_override       = snap.regime_override,
+        active_profile        = snap.active_profile.replace('"', "\\\""),
+        active_profile_label  = snap.active_profile_label.replace('"', "\\\""),
+        profile_lock          = snap.profile_lock.replace('"', "\\\""),
+        compound_pos_usd   = snap.compound_position_size_usd,
+        compound_pos_btc   = snap.compound_position_size_btc,
+        compound_last_pnl  = snap.compound_last_trade_pnl,
+        compound_sess_pnl  = snap.compound_session_pnl,
+        compound_peak_bal  = snap.compound_peak_balance,
+        compound_cur_bal   = snap.compound_current_balance,
+        compound_consec    = snap.compound_consecutive_losses,
+        compound_scalar    = snap.compound_size_scalar,
+        compound_paused    = snap.compound_loss_pause_active,
+        raw_position_size_usd = snap.raw_position_size_usd,
+        adjusted_position_size_usd = snap.adjusted_position_size_usd,
+        min_notional = snap.min_notional,
+        sizing_adjustment_reason = snap.sizing_adjustment_reason.replace('"', "\\\""),
+        sizing_bumped = snap.sizing_bumped,
+        flip_cycle_phase      = snap.flip_cycle_phase.replace('"', "\\\""),
+        flip_session_pnl      = snap.flip_session_pnl,
+        flip_rotation_count   = snap.flip_rotation_count,
+        flip_last_entry_price = snap.flip_last_entry_price,
+        flip_last_exit_price  = snap.flip_last_exit_price,
+        flip_last_pnl_usd     = snap.flip_last_pnl_usd,
+        flip_last_pnl_pct     = snap.flip_last_pnl_pct,
+        flip_min_profit_floor = snap.flip_min_profit_floor,
+        flip_blocker          = snap.flip_blocker.replace('"', "\\\""),
+        contract_side                 = snap.contract_side.replace('"', "\\\""),
+        contract_leverage             = snap.contract_leverage,
+        contract_entry_price          = snap.contract_entry_price,
+        contract_mark_price           = snap.contract_mark_price,
+        contract_notional_usd         = snap.contract_notional_usd,
+        contract_unrealized_pnl       = snap.contract_unrealized_pnl,
+        contract_realized_pnl_session = snap.contract_realized_pnl_session,
+        contract_liquidation_price    = snap.contract_liquidation_price,
+        contract_stop_loss            = snap.contract_stop_loss,
+        contract_take_profit          = snap.contract_take_profit,
+        contract_liquidation_buffer_pct = snap.contract_liquidation_buffer_pct,
+        contract_duration_secs        = snap.contract_duration_secs,
+        contract_exit_reason          = snap.contract_exit_reason.replace('"', "\\\""),
+        contract_last_trade_result    = snap.contract_last_trade_result,
+        contract_paper_mode           = snap.contract_paper_mode,
+        contract_last_no_open_reason  = snap.contract_last_no_open_reason.replace('"', "\\\""),
+        rebalance_status              = snap.rebalance_status.replace('"', "\\\""),
+        rebalance_triggered           = snap.rebalance_triggered,
+        rebalance_reason              = snap.rebalance_reason.replace('"', "\\\""),
+        rebalance_side                = snap.rebalance_side.replace('"', "\\\""),
+        rebalance_qty                 = snap.rebalance_qty,
+        rebalance_value_usd           = snap.rebalance_value_usd,
+        free_usdt_before              = snap.free_usdt_before,
+        free_usdt_after               = snap.free_usdt_after,
+        btc_before                    = snap.btc_before,
+        btc_after                     = snap.btc_after,
+        final_blocker_reason          = snap.final_blocker_reason.replace('"', "\\\""),
     );
     json_resp(&body)
 }
@@ -889,7 +968,9 @@ fn event_tag_class(et: &str) -> &'static str {
         "order_rejected"             => "REJECT",
         "reconcile_started"
         | "reconcile_completed"
-        | "reconcile_mismatch"       => "RECON",
+        | "reconcile_mismatch"
+        | "reconcile_applied"
+        | "balance_updated"              => "RECON",
         "watchdog_timeout"
         | "circuit_breaker_tripped"  => "SAFETY",
         _                            => "OTHER",
@@ -1098,7 +1179,22 @@ async fn page_events(state: &AppState, query: &str) -> String {
     let inventory_value_usd = sell_inventory * latest_mid;
     // Profile banner — shown prominently on LIVE page.
     let profile_banner = {
-        let (extra_style, text) = if current_profile == RuntimeProfile::MicroTest {
+        let (extra_style, text) = if current_profile == RuntimeProfile::FlipHyper {
+            (
+                "background:rgba(240,185,11,0.10);border-color:#f0b90b;color:#f0b90b;",
+                format!("{}", esc(current_profile.label())),
+            )
+        } else if current_profile == RuntimeProfile::MicroActive {
+            (
+                "background:rgba(82,255,168,0.10);border-color:#52ffa8;color:#52ffa8;",
+                format!("{}", esc(current_profile.label())),
+            )
+        } else if current_profile == RuntimeProfile::MicroSafeExecution {
+            (
+                "background:rgba(34,197,94,0.10);border-color:#22c55e;color:#22c55e;",
+                format!("{}", esc(current_profile.label())),
+            )
+        } else if current_profile == RuntimeProfile::MicroTest {
             (
                 "background:rgba(240,185,11,0.12);border-color:#f0b90b;color:#f0b90b;",
                 format!("⚡ {}", esc(current_profile.label())),
@@ -1290,7 +1386,30 @@ async fn page_events(state: &AppState, query: &str) -> String {
         } else {
             "inactive".to_string()
         };
-        let micro_mode_badge = if npc_loop.threshold_mode == "micro_aggressive" {
+        let micro_mode_badge = if npc_loop.threshold_mode == "flip_hyper" {
+            format!(
+                "<div style='grid-column:1/-1;padding:4px 8px;background:rgba(240,185,11,.12);\
+                 border:1px solid rgba(240,185,11,.4);border-radius:8px;color:#f0b90b;font-weight:700'>\
+                 🔄 FLIP_HYPER (live) — threshold {:.2}, capital-rotation mode ON — \
+                 phase: {}</div>",
+                npc_loop.effective_threshold,
+                esc(&npc_loop.flip_cycle_phase)
+            )
+        } else if npc_loop.threshold_mode == "micro_active" {
+            format!(
+                "<div style='grid-column:1/-1;padding:4px 8px;background:rgba(34,197,94,.12);\
+                 border:1px solid rgba(34,197,94,.4);border-radius:8px;color:#22c55e;font-weight:700'>\
+                 ⚡ MICRO_ACTIVE (live) — threshold {:.2}, penalty dampening ON</div>",
+                npc_loop.effective_threshold
+            )
+        } else if npc_loop.threshold_mode == "micro_safe_execution" {
+            format!(
+                "<div style='grid-column:1/-1;padding:4px 8px;background:rgba(34,197,94,.12);\
+                 border:1px solid rgba(34,197,94,.4);border-radius:8px;color:#22c55e;font-weight:700'>\
+                 🛡 MICRO_SAFE_EXECUTION — threshold {:.2}, regime override and penalty clamps ON</div>",
+                npc_loop.effective_threshold
+            )
+        } else if npc_loop.threshold_mode == "micro_aggressive" {
             format!(
                 "<div style='grid-column:1/-1;padding:4px 8px;background:rgba(240,185,11,.12);\
                  border:1px solid rgba(240,185,11,.4);border-radius:8px;color:#f0b90b;font-weight:700'>\
@@ -1303,20 +1422,248 @@ async fn page_events(state: &AppState, query: &str) -> String {
                 npc_loop.effective_threshold, esc(&npc_loop.threshold_mode)
             )
         };
+        let score_telemetry = {
+            let raw = npc_loop.raw_score;
+            let norm = npc_loop.normalized_score;
+            let top = esc(&npc_loop.top_score_penalties);
+            let norm_pct = (norm * 100.0).round() as i64;
+            let bar_color = if norm >= 1.0 { "#22c55e" } else if norm >= 0.5 { "#f0b90b" } else { "#ef4444" };
+            format!(
+                "<div style='grid-column:1/-1;margin-top:4px;padding:4px 8px;border:1px solid rgba(130,144,159,.2);border-radius:6px;background:rgba(0,0,0,.15)'>\
+                 <span class='dim' style='font-size:10px'>Score: </span>\
+                 <span style='color:#e2e8f0'>raw={:.4}</span>\
+                 <span class='dim'> | </span>\
+                 <span style='color:{bar_color}'>norm={:.3} ({norm_pct}%)</span>\
+                 <span class='dim'> | threshold={:.3}</span>\
+                 <br><span class='dim' style='font-size:10px'>Top penalties: </span><span style='color:#94a3b8'>{top}</span></div>",
+                raw, norm, npc_loop.effective_threshold
+            )
+        };
         format!(
             "<div style='display:grid;grid-template-columns:repeat(2,1fr);gap:6px;margin-top:6px;font-size:11px'>\
                <div><span class='dim'>Final decision: </span>{final_dec}</div>\
                <div><span class='dim'>Drawdown: </span>{dd_info}</div>\
                <div><span class='dim'>Cooldown: </span>{cooldown_info}</div>\
+               <div><span class='dim'>Working capital (USDT): </span>{:.2}</div>\
+               <div><span class='dim'>Idle BTC inventory: </span>{:.8}</div>\
+               <div style='grid-column:1/-1'><span class='dim'>Rebalance status: </span>{}{}{}{}{} </div>\
                {micro_mode_badge}\
+               {score_telemetry}\
                <div style='grid-column:1/-1'><span class='dim'>Balance block: </span>{}</div>\
                <div style='grid-column:1/-1'><span class='dim'>Risk block: </span>{}</div>\
                <div style='grid-column:1/-1'><span class='dim'>Execution block: </span>{}</div>\
-             </div>",
+              </div>",
+            buy_power,
+            sell_inventory,
+            esc(&npc_loop.rebalance_status),
+            if npc_loop.rebalance_triggered { " · triggered" } else { "" },
+            if npc_loop.rebalance_reason.is_empty() { "".to_string() } else { format!(" · {}", esc(&npc_loop.rebalance_reason)) },
+            if npc_loop.rebalance_side.is_empty() { "".to_string() } else { format!(" · side={} qty={:.8}", esc(&npc_loop.rebalance_side), npc_loop.rebalance_qty) },
+            if npc_loop.rebalance_value_usd > 0.0 { format!(" · value=${:.2}", npc_loop.rebalance_value_usd) } else { "".to_string() },
             if bal_block.is_empty() { "—".to_string() } else { bal_block },
             if risk_block.is_empty() { "—".to_string() } else { risk_block },
             if exec_block.is_empty() { "—".to_string() } else { exec_block },
         )
+    };
+
+    // ── COMPOUND_EXECUTION status panel ─────────────────────────────────────
+    let compound_panel = if npc_loop.threshold_mode == "micro_active" {
+        let last_pnl_color = if npc_loop.compound_last_trade_pnl > 0.0 { "#22c55e" }
+                             else if npc_loop.compound_last_trade_pnl < 0.0 { "#ef4444" }
+                             else { "#82909f" };
+        let sess_pnl_color = if npc_loop.compound_session_pnl > 0.0 { "#22c55e" }
+                             else if npc_loop.compound_session_pnl < 0.0 { "#ef4444" }
+                             else { "#82909f" };
+        let pause_badge = if npc_loop.compound_loss_pause_active {
+            "<span style='color:#ef4444;font-weight:700'>⛔ LOSS PAUSE</span>"
+        } else {
+            ""
+        };
+        let scalar_color = if npc_loop.compound_size_scalar >= 0.9 { "#22c55e" }
+                           else if npc_loop.compound_size_scalar >= 0.5 { "#f0b90b" }
+                           else { "#ef4444" };
+        let peak_growth = if npc_loop.compound_peak_balance > 0.0 && npc_loop.compound_current_balance > 0.0 {
+            let pct = (npc_loop.compound_current_balance / npc_loop.compound_peak_balance - 1.0) * 100.0;
+            if pct >= 0.0 {
+                format!("<span style='color:#22c55e'>+{:.1}% vs peak</span>", pct)
+            } else {
+                format!("<span style='color:#ef4444'>{:.1}% vs peak</span>", pct)
+            }
+        } else {
+            "—".to_string()
+        };
+        format!(
+            "<div style='margin-top:8px;padding:6px 8px;background:rgba(34,197,94,.06);\
+             border:1px solid rgba(34,197,94,.2);border-radius:8px;font-size:11px'>\
+             <div style='font-weight:700;color:#22c55e;margin-bottom:4px'>⚡ COMPOUND_EXECUTION {pause_badge}</div>\
+             <div style='display:grid;grid-template-columns:repeat(2,1fr);gap:4px'>\
+               <div><span class='dim'>Position: </span>\
+                 <span style='color:#e2e8f0'>${pos_usd:.2} / {pos_btc:.8} BTC</span></div>\
+               <div><span class='dim'>Last trade PnL: </span>\
+                 <span style='color:{last_pnl_color}'>{last_pnl:+.4}</span></div>\
+               <div><span class='dim'>Session PnL: </span>\
+                 <span style='color:{sess_pnl_color}'>{sess_pnl:+.4}</span></div>\
+               <div><span class='dim'>Consec losses: </span>\
+                 <span style='color:{loss_color}'>{consec_losses}</span></div>\
+               <div><span class='dim'>Size scalar: </span>\
+                 <span style='color:{scalar_color}'>{size_scalar:.0}%</span></div>\
+               <div><span class='dim'>Balance: </span>\
+                 ${cur_bal:.2} / peak ${peak_bal:.2} {peak_growth}</div>\
+             </div>\
+             </div>",
+            pos_usd = npc_loop.compound_position_size_usd,
+            pos_btc = npc_loop.compound_position_size_btc,
+            last_pnl = npc_loop.compound_last_trade_pnl,
+            sess_pnl = npc_loop.compound_session_pnl,
+            consec_losses = npc_loop.compound_consecutive_losses,
+            loss_color = if npc_loop.compound_consecutive_losses == 0 { "#22c55e" }
+                         else if npc_loop.compound_consecutive_losses < 3 { "#f0b90b" }
+                         else { "#ef4444" },
+            size_scalar = npc_loop.compound_size_scalar * 100.0,
+            cur_bal = npc_loop.compound_current_balance,
+            peak_bal = npc_loop.compound_peak_balance,
+        )
+    } else {
+        String::new()
+    };
+
+    // ── FLIP_HYPER capital rotation panel ─────────────────────────────────────
+    let flip_hyper_panel = if npc_loop.threshold_mode == "flip_hyper" {
+        let phase_color = match npc_loop.flip_cycle_phase.as_str() {
+            "SEEK_ENTRY"        => "#22c55e",
+            "ENTERING"         => "#f0b90b",
+            "HOLDING_POSITION" => "#e2e8f0",
+            "SEEK_EXIT"        => "#f0b90b",
+            "EXITING"          => "#ef4444",
+            "REBUY_READY"      => "#22c55e",
+            _                  => "#82909f",
+        };
+        let sess_pnl_color = if npc_loop.flip_session_pnl > 0.0 { "#22c55e" }
+                             else if npc_loop.flip_session_pnl < 0.0 { "#ef4444" }
+                             else { "#82909f" };
+        let last_pnl_color = if npc_loop.flip_last_pnl_usd > 0.0 { "#22c55e" }
+                             else if npc_loop.flip_last_pnl_usd < 0.0 { "#ef4444" }
+                             else { "#82909f" };
+        let blocker_section = if !npc_loop.flip_blocker.is_empty() {
+            format!(
+                "<div style='grid-column:1/-1;margin-top:2px;padding:4px 6px;\
+                 background:rgba(239,68,68,.10);border:1px solid rgba(239,68,68,.35);\
+                 border-radius:6px;font-size:10px;color:#ef4444'>\
+                 ⚠ {}</div>",
+                esc(&npc_loop.flip_blocker)
+            )
+        } else {
+            String::new()
+        };
+        let last_flip_section = if npc_loop.flip_last_exit_price > 0.0 {
+            let last_flip_entry_price = if npc_loop.flip_last_entry_price > 0.0 {
+                format!("{:.2}", npc_loop.flip_last_entry_price)
+            } else {
+                "—".to_string()
+            };
+            format!(
+                "<div style='grid-column:1/-1;margin-top:2px;padding:4px 6px;\
+                 background:rgba(0,0,0,.15);border-radius:6px;font-size:10px'>\
+                 <span class='dim'>Last flip: </span>\
+                 <span style='color:#94a3b8'>entry {} → exit {:.2}</span>\
+                 <span class='dim'> | </span>\
+                 <span style='color:{last_pnl_color}'>{:+.4} USD ({:+.2}%)</span></div>",
+                last_flip_entry_price,
+                npc_loop.flip_last_exit_price,
+                npc_loop.flip_last_pnl_usd,
+                npc_loop.flip_last_pnl_pct,
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            "<div style='margin-top:8px;padding:6px 8px;background:rgba(240,185,11,.06);\
+             border:1px solid rgba(240,185,11,.25);border-radius:8px;font-size:11px'>\
+             <div style='font-weight:700;color:#f0b90b;margin-bottom:4px'>🔄 FLIP_HYPER — Capital Rotation</div>\
+             <div style='display:grid;grid-template-columns:repeat(2,1fr);gap:4px'>\
+               <div><span class='dim'>Mode: </span>\
+                 <span style='color:#f0b90b;font-weight:700'>FLIP_HYPER</span></div>\
+               <div><span class='dim'>Phase: </span>\
+                 <span style='color:{phase_color};font-weight:700'>{flip_phase}</span></div>\
+               <div><span class='dim'>Session PnL: </span>\
+                 <span style='color:{sess_pnl_color}'>{sess_pnl:+.4} USD</span></div>\
+               <div><span class='dim'>Flips today: </span>\
+                 <span style='color:#e2e8f0'>{rotation_count}</span></div>\
+               <div><span class='dim'>Free BTC: </span>\
+                 <span style='color:#e2e8f0'>{free_btc:.8}</span></div>\
+               <div><span class='dim'>Free USDT: </span>\
+                 <span style='color:#e2e8f0'>{free_usdt:.2}</span></div>\
+               <div><span class='dim'>Min profit floor: </span>\
+                 <span style='color:#94a3b8'>${min_floor:.2}</span></div>\
+               <div><span class='dim'>Entry price: </span>\
+                 <span style='color:{entry_color}'>{entry_price}</span></div>\
+               {last_flip_section}\
+               {blocker_section}\
+             </div>\
+             </div>",
+            flip_phase     = esc(&npc_loop.flip_cycle_phase),
+            sess_pnl       = npc_loop.flip_session_pnl,
+            rotation_count = npc_loop.flip_rotation_count,
+            free_btc       = sell_inventory,
+            free_usdt      = buy_power,
+            min_floor      = npc_loop.flip_min_profit_floor,
+            entry_color    = if npc_loop.flip_last_entry_price > 0.0 { "#f0b90b" } else { "#82909f" },
+            entry_price    = if npc_loop.flip_last_entry_price > 0.0 {
+                format!("{:.2}", npc_loop.flip_last_entry_price)
+            } else {
+                "—".to_string()
+            },
+        )
+    } else {
+        String::new()
+    };
+    let contract_panel = if npc_loop.threshold_mode == "swing"
+        || npc_loop.contract_side != "FLAT"
+        || npc_loop.contract_realized_pnl_session.abs() > 0.0
+    {
+        let side_color = match npc_loop.contract_side.as_str() {
+            "LONG" => "#22c55e",
+            "SHORT" => "#ef4444",
+            _ => "#82909f",
+        };
+        let unreal_color = if npc_loop.contract_unrealized_pnl > 0.0 { "#22c55e" }
+            else if npc_loop.contract_unrealized_pnl < 0.0 { "#ef4444" } else { "#82909f" };
+        let realized_color = if npc_loop.contract_realized_pnl_session > 0.0 { "#22c55e" }
+            else if npc_loop.contract_realized_pnl_session < 0.0 { "#ef4444" } else { "#82909f" };
+        let last_result_color = if npc_loop.contract_last_trade_result > 0.0 { "#22c55e" }
+            else if npc_loop.contract_last_trade_result < 0.0 { "#ef4444" } else { "#82909f" };
+        format!(
+            "<div style='margin-top:8px;padding:6px 8px;background:rgba(59,130,246,.08);\
+             border:1px solid rgba(59,130,246,.25);border-radius:8px;font-size:11px'>\
+             <div style='font-weight:700;color:#60a5fa;margin-bottom:4px'>📄 CONTRACT_EXECUTOR {paper_badge}</div>\
+             <div style='display:grid;grid-template-columns:repeat(2,1fr);gap:4px'>\
+               <div><span class='dim'>Side: </span><span style='color:{side_color};font-weight:700'>{side}</span></div>\
+               <div><span class='dim'>Leverage: </span><span style='color:#e2e8f0'>{leverage:.1}x</span></div>\
+               <div><span class='dim'>Entry / Mark: </span><span style='color:#e2e8f0'>{entry:.2} / {mark:.2}</span></div>\
+               <div><span class='dim'>Notional: </span><span style='color:#e2e8f0'>${notional:.2}</span></div>\
+               <div><span class='dim'>PnL (U/R): </span><span style='color:{unreal_color}'>{unreal:+.4}</span> / <span style='color:{realized_color}'>{realized:+.4}</span></div>\
+               <div><span class='dim'>Liq buffer: </span><span style='color:#e2e8f0'>{liq_buffer:.2}%</span></div>\
+               <div><span class='dim'>Stop / TP: </span><span style='color:#94a3b8'>{stop:.2} / {tp:.2}</span></div>\
+               <div><span class='dim'>Duration: </span><span style='color:#e2e8f0'>{duration:.0}s</span></div>\
+               <div style='grid-column:1/-1'><span class='dim'>Last trade result: </span><span style='color:{last_result_color}'>{last_result:+.4}</span> <span class='dim'>({exit_reason})</span></div>\
+             </div></div>",
+            paper_badge = if npc_loop.contract_paper_mode { "<span style='color:#22c55e;font-size:10px'>(paper-only)</span>" } else { "" },
+            side = esc(&npc_loop.contract_side),
+            leverage = npc_loop.contract_leverage,
+            entry = npc_loop.contract_entry_price,
+            mark = npc_loop.contract_mark_price,
+            notional = npc_loop.contract_notional_usd,
+            unreal = npc_loop.contract_unrealized_pnl,
+            realized = npc_loop.contract_realized_pnl_session,
+            liq_buffer = npc_loop.contract_liquidation_buffer_pct * 100.0,
+            stop = npc_loop.contract_stop_loss,
+            tp = npc_loop.contract_take_profit,
+            duration = npc_loop.contract_duration_secs,
+            last_result = npc_loop.contract_last_trade_result,
+            exit_reason = esc(&npc_loop.contract_exit_reason),
+        )
+    } else {
+        String::new()
     };
 
     let agent_control_card = format!(
@@ -1335,6 +1682,9 @@ async fn page_events(state: &AppState, query: &str) -> String {
            </div>\
            {sell_blocked_banner}\
            {buy_blocked_banner}\
+           {compound_panel}\
+           {flip_hyper_panel}\
+           {contract_panel}\
            <details style='margin-top:6px'><summary class='dim' style='cursor:pointer;font-size:11px'>Decision transparency</summary>{decision_transparency}</details>\
            <div style='display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:10px'>\
              <form method='post' action='/agent/mode'><input type='hidden' name='mode' value='off'>\
@@ -1468,18 +1818,200 @@ async fn page_events(state: &AppState, query: &str) -> String {
             balances_rows
         )
     };
-    let event_feed = events.iter().take(10).map(|e| format!(
-        "<div class='event-item'><div class='time'>{} · {}</div><div class='summary'>{}</div>\
-         <details style='margin-top:6px'><summary class='dim'>Details</summary><div class='dim' style='margin-top:4px'>type={} · event_id={}</div></details></div>",
-        e.occurred_at.format("%H:%M:%S"),
-        esc(e.symbol.as_deref().unwrap_or("SYSTEM")),
-        esc(&summarise_event(e)),
-        esc(&e.event_type),
-        esc(&e.event_id),
-    )).collect::<Vec<_>>().join("");
+
+    // ── LAST TRADE panel ─────────────────────────────────────────────────────
+    // Find the most recent fill from ReconcileApplied (with fills) or OrderFilled events.
+    let last_fill_panel = {
+        #[derive(Clone)]
+        struct FillInfo { side: String, qty: f64, price: f64, age_secs: f64 }
+        let now_utc = chrono::Utc::now();
+        let fill_info: Option<FillInfo> = events.iter().find_map(|e| {
+            match &e.payload {
+                crate::events::TradingEvent::ReconcileApplied(p) if !p.fills.is_empty() => {
+                    let f = &p.fills[0];
+                    let age_secs = (now_utc - e.occurred_at).num_milliseconds().max(0) as f64 / 1000.0;
+                    Some(FillInfo { side: f.side.clone(), qty: f.qty, price: f.price, age_secs })
+                }
+                crate::events::TradingEvent::OrderFilled(p) => {
+                    let age_secs = (now_utc - e.occurred_at).num_milliseconds().max(0) as f64 / 1000.0;
+                    Some(FillInfo { side: p.side.clone(), qty: p.filled_qty, price: p.avg_fill_price, age_secs })
+                }
+                _ => None,
+            }
+        });
+        match fill_info {
+            Some(fi) => {
+                let is_buy = fi.side.eq_ignore_ascii_case("BUY");
+                // Live PnL: unrealized mark-to-market from fill price to current mid.
+                // Falls back to 0.0 when mid is unavailable (no market tick yet) or
+                // qty is zero — both are legitimate "no data" states, not errors.
+                let live_pnl = if latest_mid > 0.0 && fi.qty > 0.0 {
+                    if is_buy { fi.qty * (latest_mid - fi.price) }
+                    else      { fi.qty * (fi.price - latest_mid) }
+                } else { 0.0 };
+                let pnl_class  = if live_pnl >= 0.0 { "#22C55E" } else { "#ef4444" };
+                let side_color = if is_buy { "#22C55E" } else { "#ef4444" };
+                let side_bg    = if is_buy { "rgba(34,197,94,.12)" } else { "rgba(239,68,68,.12)" };
+                let side_border = if is_buy { "rgba(34,197,94,.40)" } else { "rgba(239,68,68,.40)" };
+                // Flash CSS animation when fill happened within the last 10 seconds.
+                let flash_style = if fi.age_secs < 10.0 {
+                    format!(
+                        "animation:last-trade-flash 1s ease-out;background:{side_bg};\
+                         border:1px solid {side_border};border-radius:10px;padding:10px 12px;margin-bottom:10px"
+                    )
+                } else {
+                    format!(
+                        "background:{side_bg};border:1px solid {side_border};\
+                         border-radius:10px;padding:10px 12px;margin-bottom:10px"
+                    )
+                };
+                // Fill details: show all fills if ReconcileApplied
+                let fill_details_html = {
+                    let fills: Vec<String> = events.iter().find_map(|e| {
+                        if let crate::events::TradingEvent::ReconcileApplied(p) = &e.payload {
+                            if !p.fills.is_empty() {
+                                return Some(p.fills.iter().map(|f| {
+                                    let c = if f.side.eq_ignore_ascii_case("BUY") { "#22C55E" } else { "#ef4444" };
+                                    format!(
+                                        "<div style='font-size:10px;color:#94a3b8'>\
+                                         <span style='color:{c};font-weight:700'>{}</span> \
+                                         {:.6} @ {:.2} \
+                                         <span class='dim'>notional {:.2}</span></div>",
+                                        esc(&f.side), f.qty, f.price, f.qty * f.price
+                                    )
+                                }).collect());
+                            }
+                        }
+                        None
+                    }).unwrap_or_default();
+                    fills.join("")
+                };
+                format!(
+                    "<style>@keyframes last-trade-flash{{\
+                       0%{{box-shadow:0 0 0 0 {side_border}}}\
+                       50%{{box-shadow:0 0 16px 4px {side_border}}}\
+                       100%{{box-shadow:0 0 0 0 transparent}}}}</style>\
+                     <div style='{flash_style}'>\
+                       <div style='display:flex;align-items:center;justify-content:space-between'>\
+                         <div class='label' style='color:#94a3b8'>LAST TRADE</div>\
+                         <div style='font-size:10px;color:#64748b'>{:.0}s ago</div>\
+                       </div>\
+                       <div style='display:grid;grid-template-columns:repeat(2,1fr);gap:6px;margin-top:8px;font-size:12px'>\
+                         <div><span class='dim'>Side: </span>\
+                           <strong style='color:{side_color}'>{}</strong></div>\
+                         <div><span class='dim'>Qty: </span>{:.6}</div>\
+                         <div><span class='dim'>Price: </span>{:.2}</div>\
+                         <div><span class='dim'>Live PnL: </span>\
+                           <strong style='color:{pnl_class}'>{:+.4}</strong></div>\
+                       </div>\
+                       {fill_details_html}\
+                     </div>",
+                    fi.age_secs,
+                    esc(&fi.side.to_uppercase()),
+                    fi.qty,
+                    fi.price,
+                    live_pnl,
+                )
+            }
+            None => String::new(),
+        }
+    };
+
+    // ── Enhanced event feed ──────────────────────────────────────────────────
+    // ReconcileApplied, BalanceUpdated and fill events are highlighted.
+    let event_feed = events.iter().take(10).map(|e| {
+        let (item_style, type_badge) = match &e.payload {
+            crate::events::TradingEvent::ReconcileApplied(p) if p.fills_count > 0 => (
+                "border-left:3px solid #22C55E;padding-left:8px",
+                format!("<span style='color:#22C55E;font-weight:700;font-size:10px'>FILL ×{}</span>", p.fills_count),
+            ),
+            crate::events::TradingEvent::ReconcileApplied(_) => (
+                "border-left:3px solid #52ffa8;padding-left:8px",
+                "<span style='color:#52ffa8;font-size:10px'>RECONCILE</span>".to_string(),
+            ),
+            crate::events::TradingEvent::BalanceUpdated(_) => (
+                "border-left:3px solid #f0b90b;padding-left:8px",
+                "<span style='color:#f0b90b;font-size:10px'>BALANCE</span>".to_string(),
+            ),
+            crate::events::TradingEvent::OrderFilled(_) => (
+                "border-left:3px solid #22C55E;padding-left:8px",
+                "<span style='color:#22C55E;font-weight:700;font-size:10px'>FILL</span>".to_string(),
+            ),
+            crate::events::TradingEvent::OrderSubmitted(_) | crate::events::TradingEvent::OrderAcked(_) => (
+                "border-left:3px solid #3b82f6;padding-left:8px",
+                "<span style='color:#3b82f6;font-size:10px'>ORDER</span>".to_string(),
+            ),
+            _ => (
+                "",
+                format!("<span style='font-size:10px;color:#64748b'>{}</span>", esc(&e.event_type)),
+            ),
+        };
+        format!(
+            "<div class='event-item' style='{item_style}'>\
+             <div class='time'>{} · {} {type_badge}</div>\
+             <div class='summary'>{}</div>\
+             <details style='margin-top:6px'><summary class='dim'>Details</summary>\
+             <div class='dim' style='margin-top:4px'>event_id={}</div></details></div>",
+            e.occurred_at.format("%H:%M:%S"),
+            esc(e.symbol.as_deref().unwrap_or("SYSTEM")),
+            esc(&summarise_event(e)),
+            esc(&e.event_id),
+        )
+    }).collect::<Vec<_>>().join("");
+
+    // ── Balance / ReconcileApplied summary banner ────────────────────────────
+    let recon_balance_banner = {
+        let last_balance = events.iter().find_map(|e| {
+            if let crate::events::TradingEvent::BalanceUpdated(p) = &e.payload {
+                Some(format!(
+                    "total={:.2} buy_power={:.2} inventory={:.8}",
+                    p.total_balance_usd, p.buy_power, p.sell_inventory
+                ))
+            } else { None }
+        });
+        let last_recon = events.iter().find_map(|e| {
+            if let crate::events::TradingEvent::ReconcileApplied(p) = &e.payload {
+                if p.fills_count > 0 {
+                    Some(format!(
+                        "{} fill(s): {}",
+                        p.fills_count,
+                        p.fills.iter().map(|f| format!("{}@{:.2}", esc(&f.side), f.price))
+                            .collect::<Vec<_>>().join(", ")
+                    ))
+                } else { None }
+            } else { None }
+        });
+        match (last_balance, last_recon) {
+            (Some(bal), Some(recon)) => format!(
+                "<div style='margin-top:6px;font-size:11px;display:grid;grid-template-columns:1fr 1fr;gap:6px'>\
+                 <div style='padding:6px 8px;background:rgba(240,185,11,.08);border:1px solid rgba(240,185,11,.3);border-radius:8px'>\
+                 <div style='color:#f0b90b;font-weight:700;font-size:10px'>BALANCE UPDATED</div>\
+                 <div style='color:#d0d6dd'>{bal}</div></div>\
+                 <div style='padding:6px 8px;background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.3);border-radius:8px'>\
+                 <div style='color:#22C55E;font-weight:700;font-size:10px'>RECONCILE APPLIED</div>\
+                 <div style='color:#d0d6dd'>{recon}</div></div></div>"
+            ),
+            (Some(bal), None) => format!(
+                "<div style='margin-top:6px;font-size:11px'>\
+                 <div style='padding:6px 8px;background:rgba(240,185,11,.08);border:1px solid rgba(240,185,11,.3);border-radius:8px'>\
+                 <div style='color:#f0b90b;font-weight:700;font-size:10px'>BALANCE UPDATED</div>\
+                 <div style='color:#d0d6dd'>{bal}</div></div></div>"
+            ),
+            (None, Some(recon)) => format!(
+                "<div style='margin-top:6px;font-size:11px'>\
+                 <div style='padding:6px 8px;background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.3);border-radius:8px'>\
+                 <div style='color:#22C55E;font-weight:700;font-size:10px'>RECONCILE APPLIED</div>\
+                 <div style='color:#d0d6dd'>{recon}</div></div></div>"
+            ),
+            _ => String::new(),
+        }
+    };
+
     let context_body = format!(
-        "<div class='soft-title'>Recent Activity</div>\
-         <div class='event-list tier-3'>{}</div>\
+        "{last_fill_panel}\
+         <div class='soft-title'>Recent Activity</div>\
+         {recon_balance_banner}\
+         <div class='event-list tier-3' style='margin-top:8px'>{event_feed}</div>\
          <div class='sum' style='margin-top:8px'>Position {:.6} · Open orders {} · <a href='{}'>Open timeline view</a></div>\
          <div class='sum' style='margin-top:8px'>\
            <strong>Last agent decision:</strong> {} · cycle {}\
@@ -1488,7 +2020,6 @@ async fn page_events(state: &AppState, query: &str) -> String {
            <strong>Last no-trade reason:</strong> {}\
          </div>\
          <details style='margin-top:10px'><summary class='soft-title' style='cursor:pointer'>Advanced / Diagnostics</summary>{}</details>",
-        event_feed,
         pos_size,
         open_orders,
         corr_link,
@@ -1618,10 +2149,22 @@ async fn page_events(state: &AppState, query: &str) -> String {
                    background:{regime_bg};color:{regime_color}'>{regime_str}</span>\
                  <span class='dim' style='font-size:11px'>Timeframe stack: 4H bias · 1H setup · 15M trigger</span>\
                </div>\
+               <div style='margin-top:6px;font-size:11px;color:#93a2b3'>\
+                 Behavior: <strong style='color:{bmode_color}'>{bmode}</strong> &nbsp;·&nbsp;\
+                 Trigger window: <strong>{tw:.0}s</strong> &nbsp;·&nbsp;\
+                 Min drift: <strong>{drift:.4}%</strong>\
+               </div>\
                {block_row}\
                {setup_row}\
                {position_row}\
-             </div>"
+             </div>",
+            bmode       = esc(&phase1_status.behavior_mode),
+            bmode_color = if current_profile == RuntimeProfile::FlipHyper { "#f0b90b" }
+                         else if current_profile == RuntimeProfile::MicroActive { "#52ffa8" }
+                         else if current_profile == RuntimeProfile::MicroSafeExecution { "#22c55e" }
+                         else { "#93a2b3" },
+            tw          = phase1_status.effective_trigger_window_secs,
+            drift       = phase1_status.effective_min_trend_drift * 100.0,
         )
     };
 
@@ -1839,16 +2382,22 @@ async fn page_assistant(state: &AppState, query: &str) -> String {
     let (health_class, health_text) = system_health_summary(sys_mode, exec_state.clone(), kill_active);
     let recent_events = state.store.fetch_recent(10).unwrap_or_default();
 
-    // Profile selector options
+    // Profile selector options (single-active radio semantics).
     let profile_options = [
         ("CONSERVATIVE", "Conservative — cautious, long cooldowns"),
         ("ACTIVE",       "Active — balanced defaults"),
         ("MICRO_TEST",   "Micro-Test — faster decisions for small balances"),
+        ("MICRO_ACTIVE", "⚡ Micro Active — high-frequency mode for balances under $100"),
+        ("MICRO_SAFE_EXECUTION", "🛡 Micro Safe Execution — aggressive micro-safe mode for balances under $250"),
+        ("FLIP_HYPER",   "🔄 Flip Hyper — rapid capital-rotation mode for sub-$100 live accounts"),
+        ("SWING",        "📈 Swing — directional trend mode (minutes to hours)"),
     ]
     .iter()
     .map(|(val, label)| {
-        let selected = if *val == current_profile.as_str() { " selected" } else { "" };
-        format!("<option value='{val}'{selected}>{label}</option>")
+        let checked = if *val == current_profile.as_str() { " checked" } else { "" };
+        format!(
+            "<label style='display:block;margin:4px 0'><input type='radio' name='profile' value='{val}'{checked}> {label}</label>"
+        )
     })
     .collect::<Vec<_>>()
     .join("");
@@ -1861,7 +2410,7 @@ async fn page_assistant(state: &AppState, query: &str) -> String {
           <div class='metric-card'><div class='metric-label'>Kill Switch</div><div class='metric-value {}'>{}</div></div>\
           <div class='metric-card'><div class='metric-label'>Agent Mode</div><div class='metric-value'>{}</div></div>\
           <div class='metric-card'><div class='metric-label'>Loop Cycles</div><div class='metric-value'>{}</div></div>\
-          <div class='metric-card'><div class='metric-label'>Runtime Profile</div><div class='metric-value'>{}</div></div>\
+          <div class='metric-card'><div class='metric-label'>CURRENT ACTIVE PROFILE</div><div class='metric-value'>{}</div></div>\
         </div>",
         health_class,
         esc(&health_text),
@@ -1876,11 +2425,11 @@ async fn page_assistant(state: &AppState, query: &str) -> String {
 
     let primary_body = format!("<div style='display:grid;gap:10px'>\
       <div class='signal-box'><div class='label'>Trading Controls</div><div class='sum'>Operator-level controls for runtime behavior and authority-safe interventions.</div><div style='margin-top:8px'>Authority workflows available in <a href='/authority'>FUNDS → approvals</a>. Agent control panel available on <a href='/events'>LIVE</a>.</div></div>\
-      <div class='signal-box'><div class='label'>Runtime Profile</div>\
+      <div class='signal-box'><div class='label'>CURRENT ACTIVE PROFILE</div>\
         <div class='sum'>Current: <strong>{}</strong></div>\
         <div class='sum' style='margin-top:4px'>{}</div>\
-        <form method='post' action='/assistant/profile' style='margin-top:8px;display:flex;gap:8px;align-items:center'>\
-          <select name='profile' style='flex:1'>{}</select>\
+        <form method='post' action='/assistant/profile' style='margin-top:8px'>\
+          {}\
           <button class='btn' type='submit'>Apply</button>\
         </form>\
         <div class='sum' style='margin-top:6px;font-size:11px'>Note: profile change takes effect on the next trading cycle. Spread guard, kill switch, and risk engine remain active on all profiles.</div>\
@@ -2668,14 +3217,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_events_micro_active_banner() {
+        let state = make_state();
+        *state.profile.lock().await = crate::profile::RuntimeProfile::MicroActive;
+        let r = page_events(&state, "").await;
+        assert!(r.contains("Runtime Profile"), "LIVE page must show 'Runtime Profile' heading");
+        assert!(
+            r.contains("Micro Active") || r.contains("MICRO_ACTIVE"),
+            "LIVE page must show MICRO_ACTIVE indicator; got page excerpt missing that text"
+        );
+        assert!(
+            r.contains("$100") || r.contains("high-frequency"),
+            "LIVE page must include MICRO_ACTIVE plain-language description mentioning $100 or high-frequency"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_assistant_shows_micro_active_option() {
+        let state = make_state();
+        let r = page_assistant(&state, "").await;
+        assert!(r.contains("value='MICRO_ACTIVE'"), "SETTINGS page must include MICRO_ACTIVE option");
+        assert!(r.contains("value='MICRO_SAFE_EXECUTION'"), "SETTINGS page must include MICRO_SAFE_EXECUTION option");
+        assert!(
+            r.contains("high-frequency") || r.contains("Micro Active") || r.contains("$100"),
+            "MICRO_ACTIVE option must have a descriptive label"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_assistant_micro_active_selected_matches_state() {
+        let state = make_state();
+        *state.profile.lock().await = crate::profile::RuntimeProfile::MicroActive;
+        let r = page_assistant(&state, "").await;
+        assert!(
+            r.contains("value='MICRO_ACTIVE' checked"),
+            "MICRO_ACTIVE radio must be checked when profile is MICRO_ACTIVE"
+        );
+    }
+
+    #[tokio::test]
     async fn test_assistant_shows_profile_selector() {
         let state = make_state();
         let r = page_assistant(&state, "").await;
         // The interactive selector element must be present.
-        assert!(r.contains("name='profile'"), "SETTINGS page must render profile <select> element");
+        assert!(r.contains("name='profile'"), "SETTINGS page must render profile selector controls");
+        assert!(r.contains("type='radio'"), "SETTINGS page must render profile radio controls");
         assert!(r.contains("value='CONSERVATIVE'"), "CONSERVATIVE option must be present");
         assert!(r.contains("value='ACTIVE'"),       "ACTIVE option must be present");
         assert!(r.contains("value='MICRO_TEST'"),   "MICRO_TEST option must be present");
+        assert!(r.contains("value='MICRO_ACTIVE'"), "MICRO_ACTIVE option must be present");
+        assert!(r.contains("value='MICRO_SAFE_EXECUTION'"), "MICRO_SAFE_EXECUTION option must be present");
         assert!(r.contains("Apply"),                "Apply button must be present");
     }
 
@@ -2684,15 +3275,22 @@ mod tests {
         let state = make_state();
         *state.profile.lock().await = crate::profile::RuntimeProfile::MicroTest;
         let r = page_assistant(&state, "").await;
-        // MICRO_TEST option must carry the `selected` attribute.
+        // MICRO_TEST option must carry the `checked` attribute.
         assert!(
-            r.contains("value='MICRO_TEST' selected") || r.contains("value='MICRO_TEST'  selected"),
-            "MICRO_TEST option must be marked as selected"
+            r.contains("value='MICRO_TEST' checked"),
+            "MICRO_TEST option must be marked as checked"
         );
         assert!(
             r.contains("faster decisions") || r.contains("small balances"),
             "Micro-test label must appear in the profile description"
         );
+    }
+
+    #[tokio::test]
+    async fn test_assistant_shows_current_active_profile_label() {
+        let state = make_state();
+        let r = page_assistant(&state, "").await;
+        assert!(r.contains("CURRENT ACTIVE PROFILE"));
     }
 
     // ── Agent Control Panel ───────────────────────────────────────────────────
@@ -2869,8 +3467,17 @@ mod tests {
         assert!(r.contains("\"balance_block_reason\""), "JSON must contain balance_block_reason");
         assert!(r.contains("\"risk_block_reason\""), "JSON must contain risk_block_reason");
         assert!(r.contains("\"execution_block_reason\""), "JSON must contain execution_block_reason");
+        assert!(r.contains("\"risk_override\""), "JSON must contain risk_override");
         assert!(r.contains("\"cooldown_active\""), "JSON must contain cooldown_active");
         assert!(r.contains("\"cooldown_remaining_ms\""), "JSON must contain cooldown_remaining_ms");
+        assert!(r.contains("\"raw_score\""), "JSON must contain raw_score");
+        assert!(r.contains("\"adjusted_score\""), "JSON must contain adjusted_score");
+        assert!(r.contains("\"threshold_used\""), "JSON must contain threshold_used");
+        assert!(r.contains("\"penalty_clamped\""), "JSON must contain penalty_clamped");
+        assert!(r.contains("\"override_used\""), "JSON must contain override_used");
+        assert!(r.contains("\"regime_override\""), "JSON must contain regime_override");
+        assert!(r.contains("\"sizing_bumped\""), "JSON must contain sizing_bumped");
+        assert!(r.contains("\"final_blocker_reason\""), "JSON must contain final_blocker_reason");
     }
 
     #[tokio::test]
@@ -2907,6 +3514,22 @@ mod tests {
         let r = agent_status_json(&state).await;
         assert!(r.contains("\"effective_threshold\""), "JSON must contain effective_threshold");
         assert!(r.contains("\"threshold_mode\""), "JSON must contain threshold_mode");
+        assert!(r.contains("\"threshold_used\""), "JSON must contain threshold_used");
+        assert!(r.contains("\"active_profile\""), "JSON must contain active_profile");
+        assert!(r.contains("\"active_profile_label\""), "JSON must contain active_profile_label");
+        assert!(r.contains("\"PROFILE_LOCK\""), "JSON must contain PROFILE_LOCK");
+        assert!(r.contains("\"max_concurrent_positions\""), "JSON must contain max_concurrent_positions");
+        assert!(r.contains("\"counted_open_positions\""), "JSON must contain counted_open_positions");
+        assert!(r.contains("\"counted_pending_orders\""), "JSON must contain counted_pending_orders");
+        assert!(r.contains("\"counted_reserved_slots\""), "JSON must contain counted_reserved_slots");
+        assert!(r.contains("\"slot_block_reason\""), "JSON must contain slot_block_reason");
+        assert!(r.contains("\"slot_source_ids\""), "JSON must contain slot_source_ids");
+        assert!(r.contains("\"rebalance_status\""), "JSON must contain rebalance_status");
+        assert!(r.contains("\"contract_last_no_open_reason\""), "JSON must contain contract_last_no_open_reason");
+        assert!(r.contains("\"raw_position_size_usd\""), "JSON must contain raw_position_size_usd");
+        assert!(r.contains("\"adjusted_position_size_usd\""), "JSON must contain adjusted_position_size_usd");
+        assert!(r.contains("\"min_notional\""), "JSON must contain min_notional");
+        assert!(r.contains("\"sizing_adjustment_reason\""), "JSON must contain sizing_adjustment_reason");
     }
 
     #[tokio::test]
@@ -2922,6 +3545,176 @@ mod tests {
         assert!(
             !r.contains("Micro mode active"),
             "Must not show micro mode badge when threshold_mode is normal"
+        );
+    }
+
+    // ── Post-threshold executor-submit proof (Requirement 5) ──────────────────
+    //
+    // DIAGNOSTIC PROOF: When the /trade/request handler receives a valid request
+    // and all authority/risk gates pass, exec.submit_market_order() is called.
+    //
+    // Exact file/function: webui.rs :: handle_post :: /trade/request
+    //   After authority.check() returns Proceed, the handler calls
+    //   state.exec.submit_market_order(...).await.  If the exchange client has an
+    //   empty base_url, the inner BinanceClient::post_order builds a relative URL
+    //   ("/api/v3/order"), which reqwest rejects immediately with a non-transient
+    //   "relative URL without a base" error — no retries, no network latency.
+    //   The handler then redirects to /authority?err=Trade%20execution%20failed…
+    //
+    // A redirect that contains "Trade%20execution%20failed" (rather than
+    // "No%20exchange%20client" or an earlier gate message) is conclusive proof:
+    //   1. Side/size validation passed.
+    //   2. Authority mode was not OFF.
+    //   3. Executor was Idle (idempotency guard cleared).
+    //   4. Risk check approved the order.
+    //   5. authority.check() returned Proceed.
+    //   6. exec.submit_market_order() was invoked.
+    //
+    // This test closes the chain: NPC dispatch → POST /trade/request
+    // → executor submit (submit_market_order → BinanceClient::post_order).
+
+    /// Helper: build an AppState where all gates are clear and a (failing)
+    /// exchange client is present, so /trade/request reaches executor submit.
+    fn make_state_gates_clear_failing_client() -> AppState {
+        use crate::client::BinanceClient;
+        use crate::executor::Executor;
+        use crate::withdrawal::{WithdrawalConfig, WithdrawalManager};
+
+        let pos  = Position::new("BTCUSDT");
+        let risk = RiskEngine::new(RiskConfig {
+            max_position_qty:       0.01,
+            max_daily_loss_usd:     50.0,
+            max_drawdown_usd:       100.0,
+            max_consecutive_losses: 3,
+            cooldown_after_loss:    Duration::from_secs(300),
+            max_spread_bps:         10.0,
+            max_feed_staleness:     Duration::from_secs(5),
+            min_order_interval:     Duration::from_secs(1),
+            signal_dedup_window:    Duration::from_secs(5),
+            max_open_orders:        1,
+            max_slippage_bps:       20.0,
+        }, &pos);
+        let store: Arc<dyn EventStore> = InMemoryEventStore::new();
+        let exec  = Arc::new(Executor::new(
+            "BTCUSDT".into(),
+            CircuitBreakerConfig::default(),
+            WatchdogConfig::default(),
+        ));
+        let authority = Arc::new(crate::authority::AuthorityLayer::new());
+        let withdrawals = Arc::new(WithdrawalManager::new(WithdrawalConfig::default()));
+        let signal = Arc::new(tokio::sync::Mutex::new(crate::signal::SignalEngine::new(
+            crate::signal::SignalConfig {
+                order_qty: 0.001,
+                momentum_threshold: 0.0,
+                imbalance_threshold: 0.0,
+                max_entry_spread_bps: 5.0,
+                max_feed_staleness: Duration::from_secs(3),
+                stop_loss_pct: 0.0,
+                take_profit_pct: 0.0,
+                max_hold_duration: Duration::from_secs(10),
+                min_mid_samples: 1,
+                min_trade_samples: 1,
+            },
+        )));
+        let truth = Arc::new(tokio::sync::Mutex::new(TruthState::new("BTCUSDT", 0.0)));
+        let npc = Arc::new(crate::npc::NpcAutonomousController::new(
+            crate::npc::NpcConfig::from_trade_cfg(&crate::agent::TradeAgentConfig {
+                enabled: false,
+                trade_size: 0.0,
+                momentum_threshold: 0.0,
+                poll_interval: Duration::from_millis(1000),
+                max_spread_bps: 5.0,
+            }),
+            crate::agent::AgentState {
+                store: Arc::clone(&store),
+                exec: Arc::clone(&exec),
+                feed: Arc::new(tokio::sync::Mutex::new(
+                    crate::feed::FeedState::new(Duration::from_secs(10))
+                )),
+                signal,
+                truth: Arc::clone(&truth),
+                authority: Arc::clone(&authority),
+                withdrawals: Arc::clone(&withdrawals),
+                // Use empty base_url so BinanceClient::post_order builds a
+                // relative URL that reqwest rejects immediately (non-transient,
+                // no retries) — proving submit_market_order was invoked.
+                client: Arc::new(BinanceClient::new(
+                    String::new(), String::new(), String::new(),
+                )),
+                symbol: "BTCUSDT".into(),
+                web_base_url: None,
+            },
+        ));
+        AppState {
+            store,
+            exec,
+            truth,
+            risk: Arc::new(tokio::sync::Mutex::new(risk)),
+            authority,
+            strategy: Arc::new(tokio::sync::Mutex::new(
+                crate::strategy::StrategyEngine::new()
+            )),
+            // Failing client: empty base_url → "relative URL without a base"
+            // (non-transient, no retries, immediate return).
+            client: Some(Arc::new(BinanceClient::new(
+                String::new(), String::new(), String::new(),
+            ))),
+            withdrawals,
+            npc,
+            profile: Arc::new(tokio::sync::Mutex::new(
+                crate::profile::RuntimeProfile::default()
+            )),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trade_request_reaches_executor_submit_when_authority_proceeds() {
+        let state = make_state_gates_clear_failing_client();
+
+        // Transition executor to Ready so sys_mode.can_trade() is true.
+        state.exec.set_mode_reconciling().await;
+        state.exec.set_mode_ready().await;
+
+        // Set authority to AUTO.
+        state.authority.set_mode_auto(&*state.store).await;
+
+        {
+            let mut truth = state.truth.lock().await;
+            // BUY side: needs buy_power > 0.
+            truth.buy_power = 1_000.0;
+            // can_place_order() = !state_dirty && !recon_in_progress && reconciled_at.is_some()
+            truth.state_dirty = false;
+            truth.last_reconciled_at = Some(std::time::Instant::now());
+            // Risk check uses mark_price as bid/ask; must be > 0 to pass InvalidMarketData guard.
+            truth.position.mark_price = 50_000.0;
+        }
+
+        // POST a small BUY request — all gates should clear and executor submit fires.
+        let body = "symbol=BTCUSDT&side=BUY&size=0.001&reason=diagnostic_test";
+        let resp = handle_post("/trade/request", "", body, &state).await;
+
+        // PROOF (Req. 5): executor submit was called.
+        // With an empty-URL client the HTTP POST returns a "relative URL without
+        // a base" error immediately (non-transient → no retries).  The handler
+        // wraps this in a redirect to /authority?err=Trade%20execution%20failed…
+        assert!(
+            resp.contains("Trade%20execution%20failed") || resp.contains("Trade execution failed"),
+            "Response must indicate executor submit was reached and failed; \
+             expected 'Trade execution failed' in redirect Location but got: {}",
+            &resp[..resp.len().min(300)]
+        );
+        // The handler must NOT have returned an earlier gate message.
+        assert!(
+            !resp.contains("No%20exchange%20client") && !resp.contains("No exchange client"),
+            "Must not return client-missing error (client IS configured)"
+        );
+        assert!(
+            !resp.contains("Authority%20mode%20OFF") && !resp.contains("Authority mode OFF"),
+            "Must not return authority-OFF error (authority is AUTO)"
+        );
+        assert!(
+            !resp.contains("executor%20is%20busy") && !resp.contains("executor is busy"),
+            "Must not return idempotency-guard error (executor is Idle)"
         );
     }
 

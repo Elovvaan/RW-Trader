@@ -103,7 +103,7 @@ async fn main() -> Result<()> {
                 executor::WatchdogConfig::default(),
             ));
             let stub_truth = Arc::new(Mutex::new(reconciler::TruthState::new("BTCUSDT", 0.0)));
-            let stub_feed = Arc::new(Mutex::new(feed::FeedState::new(Duration::from_secs(10))));
+            let stub_feed = Arc::new(Mutex::new(feed::FeedState::new(Duration::from_secs(1_200))));
             let stub_signal = Arc::new(Mutex::new(signal::SignalEngine::new(signal::SignalConfig {
                 order_qty: 0.0,
                 momentum_threshold: 0.0,
@@ -220,7 +220,7 @@ async fn main() -> Result<()> {
     let bnb_price: f64 = env_f64("BNB_PRICE_USD", 0.0);
 
     // ── Runtime profile ──────────────────────────────────────────────────────
-    // RUNTIME_PROFILE env-var: CONSERVATIVE | ACTIVE | MICRO_TEST (default: ACTIVE)
+    // RUNTIME_PROFILE env-var: CONSERVATIVE | ACTIVE | MICRO_TEST | MICRO_ACTIVE (default: ACTIVE)
     let runtime_profile = profile::RuntimeProfile::from_str(
         &std::env::var("RUNTIME_PROFILE").unwrap_or_else(|_| "ACTIVE".into()),
     );
@@ -346,15 +346,37 @@ async fn main() -> Result<()> {
     }));
 
     // ── 5. Signal engine + Strategy engine ───────────────────────────────────
+    // Apply profile-level signal threshold overrides unless operator has set them explicitly.
+    let signal_momentum_thresh = if std::env::var("SIGNAL_MOMENTUM_THRESH").is_ok() {
+        env_f64("SIGNAL_MOMENTUM_THRESH", 0.00005)
+    } else {
+        profile_cfg.signal_momentum_threshold.unwrap_or(0.00005)
+    };
+    let signal_imbalance_thresh = if std::env::var("SIGNAL_IMBALANCE_THRESH").is_ok() {
+        env_f64("SIGNAL_IMBALANCE_THRESH", 0.10)
+    } else {
+        profile_cfg.signal_imbalance_threshold.unwrap_or(0.10)
+    };
+    let signal_max_hold_secs = if std::env::var("SIGNAL_MAX_HOLD_SECS").is_ok() {
+        env_u64("SIGNAL_MAX_HOLD_SECS", 120)
+    } else {
+        profile_cfg.signal_max_hold_secs.unwrap_or(120)
+    };
+    info!(
+        momentum_threshold   = signal_momentum_thresh,
+        imbalance_threshold  = signal_imbalance_thresh,
+        max_hold_secs        = signal_max_hold_secs,
+        "[SIGNAL] Effective thresholds (profile={})", runtime_profile.as_str()
+    );
     let signal_config = signal::SignalConfig {
         order_qty:             env_f64("SIGNAL_QTY",              0.001),
-        momentum_threshold:    env_f64("SIGNAL_MOMENTUM_THRESH",  0.00005),
-        imbalance_threshold:   env_f64("SIGNAL_IMBALANCE_THRESH", 0.10),
+        momentum_threshold:    signal_momentum_thresh,
+        imbalance_threshold:   signal_imbalance_thresh,
         max_entry_spread_bps:  env_f64("SIGNAL_MAX_SPREAD_BPS",   5.0),
         max_feed_staleness:    Duration::from_secs(env_u64("RISK_FEED_STALE_SECS", 3)),
         stop_loss_pct:         env_f64("SIGNAL_STOP_LOSS_PCT",    0.0020),
         take_profit_pct:       env_f64("SIGNAL_TAKE_PROFIT_PCT",  0.0040),
-        max_hold_duration:     Duration::from_secs(env_u64("SIGNAL_MAX_HOLD_SECS", 120)),
+        max_hold_duration:     Duration::from_secs(signal_max_hold_secs),
         min_mid_samples:       3,
         min_trade_samples:     3,
     };
@@ -362,8 +384,10 @@ async fn main() -> Result<()> {
     // signal_engine retained for compute_metrics (SignalEngine still computes
     // the shared SignalMetrics that all strategies receive).
     let signal_engine  = Arc::new(Mutex::new(signal::SignalEngine::new(signal_config)));
-    // StrategyEngine replaces direct use of signal_engine for decision-making.
-    let strategy_engine = Arc::new(Mutex::new(strategy::StrategyEngine::new()));
+    // StrategyEngine applies profile-specific behavior overrides (Phase1 config,
+    // confidence thresholds, imbalance floor, no-trade lowering window).
+    // All hard safety rails remain active regardless of profile.
+    let strategy_engine = Arc::new(Mutex::new(strategy::StrategyEngine::with_profile(&profile_cfg)));
     // min_confidence_normal is overridden by the profile unless explicitly set.
     let min_conf_normal = if std::env::var("PORTFOLIO_MIN_CONF_NORMAL").is_ok() {
         env_f64("PORTFOLIO_MIN_CONF_NORMAL", 0.70)
@@ -403,7 +427,8 @@ async fn main() -> Result<()> {
     let execution_quality = Arc::new(Mutex::new(portfolio::ExecutionQualityTracker::default()));
 
     // ── 6. Feed state ────────────────────────────────────────────────────────
-    let feed_state = Arc::new(Mutex::new(feed::FeedState::new(Duration::from_secs(10))));
+    // Keep enough history for SWING mode (15m trend + buffer).
+    let feed_state = Arc::new(Mutex::new(feed::FeedState::new(Duration::from_secs(1_200))));
 
     // ── 6b. Spawn web UI now that all live components exist ───────────────────
     // AppState holds Arc refs to event_store, exec, truth, risk_engine, authority.
@@ -441,7 +466,13 @@ async fn main() -> Result<()> {
         poll_interval: Duration::from_secs(trade_interval_secs),
         max_spread_bps: env_f64("SIGNAL_MAX_SPREAD_BPS", 5.0),
     };
-    let web_base_url = web_ui_addr.as_ref().map(|addr| format!("http://{}", addr));
+    let web_base_url = resolve_web_base_url();
+    if let Some(ref base) = web_base_url {
+        info!("[DISPATCH] Resolved dispatch base URL: {}", base);
+        info!("[DISPATCH] Trade requests will be sent to: {}/trade/request", base);
+    } else {
+        warn!("[DISPATCH] No dispatch base URL resolved — trade dispatch will be blocked (WEB_UI_ADDR_MISSING)");
+    }
     let npc_controller = Arc::new(npc::NpcAutonomousController::new(
         npc::NpcConfig::from_trade_cfg(&trade_cfg),
         agent::AgentState {
@@ -493,7 +524,7 @@ async fn main() -> Result<()> {
         sweep_interval: Duration::from_secs(env_u64("SWEEP_INTERVAL", 30)),
         sweep_network: std::env::var("WITHDRAW_DEFAULT_NETWORK").unwrap_or_else(|_| "ETH".to_string()),
     };
-    let web_base_url = web_ui_addr.as_ref().map(|addr| format!("http://{}", addr));
+    let web_base_url = resolve_web_base_url();
     agent::spawn_profit_sweep_agent(
         sweep_cfg,
         agent::AgentState {
@@ -1131,4 +1162,64 @@ fn env_bool(key: &str, default: bool) -> bool {
         .ok()
         .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(default)
+}
+
+/// Resolve the base URL used for all internal dispatch requests (e.g. POST /trade/request).
+///
+/// Priority (first non-empty value wins):
+///   1. `WEB_BASE_URL`          — explicit absolute URL with scheme (e.g. https://host)
+///   2. `RAILWAY_PUBLIC_DOMAIN` — Railway-injected public hostname → https://{domain}
+///   3. `WEB_UI_ADDR`           — bind address, with scheme auto-added when absent
+///   4. `PORT`                  — fallback loopback URL http://127.0.0.1:{port}
+///
+/// Returns `None` when no address source is configured at all.
+/// When `Some` is returned, the value is guaranteed to be non-empty, start with
+/// "http://" or "https://", and have no trailing slash, so that appending
+/// "/trade/request" produces a valid absolute URL without double slashes.
+fn resolve_web_base_url() -> Option<String> {
+    // 1. Explicit absolute base URL (highest priority).
+    if let Ok(v) = std::env::var("WEB_BASE_URL") {
+        let v = v.trim().trim_end_matches('/').to_string();
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+
+    // 2. Railway-injected public domain (no scheme).
+    if let Ok(domain) = std::env::var("RAILWAY_PUBLIC_DOMAIN") {
+        let domain = domain.trim().trim_end_matches('/').to_string();
+        if !domain.is_empty() {
+            return Some(format!("https://{}", domain));
+        }
+    }
+
+    // 3. WEB_UI_ADDR — may be a bare host:port or a full URL.
+    if let Ok(addr) = std::env::var("WEB_UI_ADDR") {
+        let addr = addr.trim().trim_end_matches('/').to_string();
+        if !addr.is_empty() {
+            if addr.starts_with("http://") || addr.starts_with("https://") {
+                return Some(addr);
+            }
+
+            let normalized_addr = if let Some(rest) = addr.strip_prefix("0.0.0.0:") {
+                format!("127.0.0.1:{}", rest)
+            } else if addr == "0.0.0.0" {
+                "127.0.0.1".to_string()
+            } else {
+                addr
+            };
+
+            return Some(format!("http://{}", normalized_addr));
+        }
+    }
+
+    // 4. PORT only — dispatch to self via loopback.
+    if let Ok(port) = std::env::var("PORT") {
+        let port = port.trim().to_string();
+        if !port.is_empty() {
+            return Some(format!("http://127.0.0.1:{}", port));
+        }
+    }
+
+    None
 }

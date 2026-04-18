@@ -113,6 +113,14 @@ pub enum TradingEvent {
     /// A human operator performed an action (kill switch, halt clear, etc.).
     OperatorAction(OperatorActionPayload),
 
+    // ── Reconcile lifecycle ───────────────────────────────────────────────────
+    /// Reconciliation applied new fills to position. Emitted when new fill IDs
+    /// are discovered and the position is updated from exchange trade history.
+    ReconcileApplied(ReconcileAppliedPayload),
+    /// Account balances changed during a reconciliation cycle.
+    /// Emitted whenever buy_power or sell_inventory differ from the previous cycle.
+    BalanceUpdated(BalanceUpdatedPayload),
+
     // ── Replay ───────────────────────────────────────────────────────────────
     /// A replay session started.
     ReplayStarted(ReplayStartedPayload),
@@ -135,6 +143,8 @@ impl TradingEvent {
             TradingEvent::ReconcileStarted(_)      => "reconcile_started",
             TradingEvent::ReconcileCompleted(_)    => "reconcile_completed",
             TradingEvent::ReconcileMismatch(_)     => "reconcile_mismatch",
+            TradingEvent::ReconcileApplied(_)      => "reconcile_applied",
+            TradingEvent::BalanceUpdated(_)        => "balance_updated",
             TradingEvent::WatchdogTimeout(_)       => "watchdog_timeout",
             TradingEvent::CircuitBreakerTripped(_) => "circuit_breaker_tripped",
             TradingEvent::SystemModeChange(_)      => "system_mode_change",
@@ -275,6 +285,42 @@ pub struct ReconcileMismatchPayload {
     pub field:          String,
     pub local_value:    String,
     pub exchange_value: String,
+}
+
+/// Summary of a single fill discovered during reconciliation.
+///
+/// Note: `qty` is the raw exchange-reported fill quantity. It is not necessarily
+/// the same as the effective quantity applied to the rebuilt position after fee
+/// handling (for example, when BUY commission is charged in the base asset).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FillDetail {
+    pub fill_id: i64,
+    pub side:    String,
+    /// Raw exchange-reported fill quantity, before any fee-based position adjustment.
+    pub qty:     f64,
+    pub price:   f64,
+}
+
+/// Emitted when one or more new fills were applied to the position during reconciliation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconcileAppliedPayload {
+    /// Reconciliation cycle number.
+    pub cycle:       u64,
+    /// Number of new fills processed.
+    pub fills_count: usize,
+    /// Per-fill summary (side, raw exchange qty, price) for each new fill discovered.
+    pub fills:       Vec<FillDetail>,
+}
+
+/// Emitted when account balances change during a reconciliation cycle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BalanceUpdatedPayload {
+    /// Estimated total account value in USD.
+    pub total_balance_usd: f64,
+    /// Free quote-asset available for BUY orders.
+    pub buy_power:         f64,
+    /// Free base-asset available for SELL orders.
+    pub sell_inventory:    f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
