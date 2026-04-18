@@ -597,6 +597,14 @@ struct NpcRuntimeState {
     compound_last_position_btc: f64,
     /// Last observed total account balance in USD (updated each run_cycle call).
     compound_last_balance_usd: f64,
+    /// Raw position notional (USD) before min-notional adjustments.
+    sizing_raw_position_size_usd: f64,
+    /// Final position notional (USD) after all sizing adjustments and caps.
+    sizing_adjusted_position_size_usd: f64,
+    /// Min notional used by the current sizing cycle.
+    sizing_min_notional_usd: f64,
+    /// Reason for last sizing adjustment (e.g., MIN_NOTIONAL_BUMP).
+    sizing_adjustment_reason: String,
     // ── FLIP_HYPER capital-rotation tracking ──────────────────────────────────
     /// Current phase of the FLIP_HYPER buy→sell cycle.
     flip_cycle_phase: FlipCyclePhase,
@@ -669,6 +677,10 @@ impl Default for NpcRuntimeState {
             compound_loss_pause_until: None,
             compound_last_position_btc: 0.0,
             compound_last_balance_usd: 0.0,
+            sizing_raw_position_size_usd: 0.0,
+            sizing_adjusted_position_size_usd: 0.0,
+            sizing_min_notional_usd: 0.0,
+            sizing_adjustment_reason: "NONE".to_string(),
             // FLIP_HYPER state
             flip_cycle_phase: FlipCyclePhase::default(),
             flip_last_completed: None,
@@ -793,6 +805,14 @@ pub struct NpcLoopSnapshot {
     pub compound_size_scalar: f64,
     /// True when a compound-loss cooldown is currently active (no new BUYs).
     pub compound_loss_pause_active: bool,
+    /// Position notional before min-notional adjustments.
+    pub raw_position_size_usd: f64,
+    /// Position notional after min-notional and risk-cap adjustments.
+    pub adjusted_position_size_usd: f64,
+    /// Min notional threshold used by the allocator.
+    pub min_notional: f64,
+    /// Explicit reason describing sizing adjustment.
+    pub sizing_adjustment_reason: String,
     // ── FLIP_HYPER capital-rotation telemetry ─────────────────────────────────
     /// Current FLIP_HYPER cycle phase (e.g. "SEEK_ENTRY", "SEEK_EXIT").
     pub flip_cycle_phase: String,
@@ -1087,7 +1107,7 @@ impl NpcAutonomousController {
                 pending_order_ids,
             )
         };
-        let (current_equity, peak_equity, drawdown_pct, compound, flip, contract, rebalance, contract_last_no_open_reason, slot_usage) = {
+        let (current_equity, peak_equity, drawdown_pct, compound, sizing, flip, contract, rebalance, contract_last_no_open_reason, slot_usage) = {
             // Compute current equity and drawdown from runtime state (same formula as evaluate_portfolio_controls).
             let rt = self.runtime.lock().await;
             let aggregate_pnl: f64 = rt.perf.values().map(|p| p.gross_pnl).sum();
@@ -1112,6 +1132,12 @@ impl NpcAutonomousController {
                 rt.compound_consecutive_losses,
                 rt.compound_size_scalar,
                 rt.compound_loss_pause_until.map(|t| t > std::time::Instant::now()).unwrap_or(false),
+            );
+            let sizing = (
+                rt.sizing_raw_position_size_usd,
+                rt.sizing_adjusted_position_size_usd,
+                rt.sizing_min_notional_usd,
+                rt.sizing_adjustment_reason.clone(),
             );
             let (flip_last_exit_price, flip_last_pnl_usd, flip_last_pnl_pct) = rt
                 .flip_last_completed
@@ -1207,7 +1233,7 @@ impl NpcAutonomousController {
                 truth_pending_order_slots,
                 &truth_pending_order_ids,
             );
-            (equity, peak, dd, c, f, k, reb, rt.contract_last_no_open_reason.clone(), slot_usage)
+            (equity, peak, dd, c, sizing, f, k, reb, rt.contract_last_no_open_reason.clone(), slot_usage)
         };
         let (
             compound_pos_btc, compound_pos_usd,
@@ -1216,6 +1242,7 @@ impl NpcAutonomousController {
             compound_consec_losses, compound_sz_scalar,
             compound_paused,
         ) = compound;
+        let (raw_position_size_usd, adjusted_position_size_usd, min_notional, sizing_adjustment_reason) = sizing;
         let (
             flip_cycle_phase,
             flip_session_pnl,
@@ -1304,6 +1331,10 @@ impl NpcAutonomousController {
             compound_consecutive_losses: compound_consec_losses,
             compound_size_scalar: compound_sz_scalar,
             compound_loss_pause_active: compound_paused,
+            raw_position_size_usd,
+            adjusted_position_size_usd,
+            min_notional,
+            sizing_adjustment_reason,
             flip_cycle_phase,
             flip_session_pnl,
             flip_rotation_count,
@@ -1518,6 +1549,7 @@ struct NpcCycleReport {
 
 const MICRO_BALANCE_USD: f64        = 50.0;   // below this: micro tier (< $50)
 const MICRO_BALANCE_MID_USD: f64    = 100.0;  // below this: mid tier ($50–$99.99)
+const MICRO_ACCOUNT_MODE_BALANCE_USD: f64 = 250.0;
 const THRESHOLD_MICRO_SMALL: f64    = 0.11;   // signal threshold for micro accounts (balance < $50)
 const THRESHOLD_MICRO: f64          = 0.14;   // signal threshold for mid accounts ($50–$99.99)
 const THRESHOLD_BASE: f64           = 0.18;   // signal threshold for normal accounts (balance ≥ $100)
@@ -1579,8 +1611,9 @@ const COMPOUND_NORMALIZED_SCORE_MIN: f64 = 1.2;
 const COMPOUND_BASE_EQUITY_PCT: f64 = 0.15;
 /// Maximum position size as a fraction of total account balance (30%).
 const COMPOUND_MAX_EQUITY_PCT: f64 = 0.30;
-/// Minimum trade notional in USD (floor, never go below $5).
-const COMPOUND_MIN_NOTIONAL_USD: f64 = 5.0;
+/// Minimum trade notional in USD (floor, never go below exchange minimum).
+const MIN_TRADE_NOTIONAL_USD: f64 = 3.0;
+const COMPOUND_MIN_NOTIONAL_USD: f64 = MIN_TRADE_NOTIONAL_USD;
 /// After this many consecutive losses, reduce position size by COMPOUND_LOSS_SIZE_FACTOR.
 const COMPOUND_LOSS_SIZE_REDUCE_THRESHOLD: u32 = 2;
 /// After this many consecutive losses, pause new BUY entries for a cooldown window.
@@ -1646,6 +1679,17 @@ fn adaptive_signal_threshold_with_trading_mode(
     } else {
         adaptive_signal_threshold(total_balance_usd)
     }
+}
+
+fn micro_account_min_risk_fraction(total_balance_usd: f64) -> f64 {
+    if total_balance_usd <= 0.0 || total_balance_usd >= MICRO_ACCOUNT_MODE_BALANCE_USD {
+        return 0.0;
+    }
+    // Balance-adaptive 5–20% range:
+    //   <= $50 => 20%
+    //   $250   => 5%
+    let progress = ((total_balance_usd - 50.0) / (MICRO_ACCOUNT_MODE_BALANCE_USD - 50.0)).clamp(0.0, 1.0);
+    (0.20 - progress * 0.15).clamp(0.05, 0.20)
 }
 
 fn profile_threshold(
@@ -2871,6 +2915,10 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             recent_performance: 0.0,
             symbol_concentration: 0.0,
             drawdown: 0.0,
+            raw_position_size_usd: plan.value_usd,
+            adjusted_position_size_usd: plan.value_usd,
+            min_notional: cfg.rebalance_min_notional_usd.max(MIN_TRADE_NOTIONAL_USD),
+            sizing_adjustment_reason: "NONE".to_string(),
         });
     } else {
         rt.rebalance_status = "REBALANCE_COMPLETE".to_string();
@@ -2887,6 +2935,11 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
     let allocation = forced_allocation.unwrap_or_else(|| {
         allocate_capital(&effective_cfg, &rt, &chosen, position_size, exposure_notional, buy_power, sell_inventory, metrics.mid, total_balance_usd, is_micro_active)
     });
+    rt.sizing_raw_position_size_usd = allocation.raw_position_size_usd;
+    rt.sizing_adjusted_position_size_usd = allocation.adjusted_position_size_usd;
+    rt.sizing_min_notional_usd = allocation.min_notional;
+    rt.sizing_adjustment_reason = allocation.sizing_adjustment_reason.clone();
+
     if allocation.qty <= 0.0 {
         lifecycle(
             &*state.store,
@@ -3174,8 +3227,15 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         &chosen.action_id,
         NpcLifecycleState::Authorized,
         &format!(
-            "rank=1 score={:.4} raw_score={:.4} allocation_qty={:.8} allocation_reason={}",
-            chosen.score, chosen.raw_score, allocation.qty, allocation.reason
+            "rank=1 score={:.4} raw_score={:.4} allocation_qty={:.8} allocation_reason={} raw_usd={:.4} adjusted_usd={:.4} min_notional={:.2} sizing_adjustment_reason={}",
+            chosen.score,
+            chosen.raw_score,
+            allocation.qty,
+            allocation.reason,
+            allocation.raw_position_size_usd,
+            allocation.adjusted_position_size_usd,
+            allocation.min_notional,
+            allocation.sizing_adjustment_reason
         ),
     );
 
@@ -3871,11 +3931,11 @@ fn evaluate_guards(
         reasons.push("KILL_SWITCH_ACTIVE".to_string());
     }
 
-    // Detect small account mode: total balance below $100.
+    // Detect small account mode: total balance below $250.
     // In small account mode, relax strict liquidity depth checks for SELL
     // orders when inventory is available and the order has positive notional.
     let is_sell = side.eq_ignore_ascii_case("SELL");
-    let small_account = total_balance_usd < 100.0 && total_balance_usd > 0.0;
+    let small_account = total_balance_usd < MICRO_ACCOUNT_MODE_BALANCE_USD && total_balance_usd > 0.0;
     let relax_liquidity_guards = small_account && is_sell && sell_inventory > 0.0 && order_notional > 0.0;
 
     if relax_liquidity_guards {
@@ -3908,10 +3968,15 @@ fn evaluate_guards(
             expected_slippage_bps, cfg.guards.max_slippage_bps
         ));
     }
-    if side.eq_ignore_ascii_case("BUY") && position_size + cfg.trade_size > cfg.guards.max_position_qty {
+    let proposed_order_qty = if metrics.mid > 0.0 {
+        order_notional / metrics.mid
+    } else {
+        0.0
+    };
+    if side.eq_ignore_ascii_case("BUY") && position_size + proposed_order_qty > cfg.guards.max_position_qty {
         reasons.push(format!(
             "POSITION_LIMIT_EXCEEDED:{:.8}>{:.8}",
-            position_size + cfg.trade_size,
+            position_size + proposed_order_qty,
             cfg.guards.max_position_qty
         ));
     }
@@ -4185,13 +4250,17 @@ struct AllocationDecision {
     recent_performance: f64,
     symbol_concentration: f64,
     drawdown: f64,
+    raw_position_size_usd: f64,
+    adjusted_position_size_usd: f64,
+    min_notional: f64,
+    sizing_adjustment_reason: String,
 }
 
 fn allocate_capital(
     cfg: &NpcConfig,
     rt: &NpcRuntimeState,
     chosen: &WorkerProposal,
-    _position_size: f64,
+    position_size: f64,
     exposure_notional: f64,
     buy_power: f64,
     sell_inventory: f64,
@@ -4212,8 +4281,14 @@ fn allocate_capital(
     let peak = rt.peak_equity.max(1.0);
     let drawdown = ((peak - (peak + total_pnl)) / peak).max(0.0);
 
-    let agent_budget = cfg.alpha.per_agent_budget_pct.get(&chosen.role).copied().unwrap_or(0.05).clamp(0.01, 0.80);
+    let mut agent_budget = cfg.alpha.per_agent_budget_pct.get(&chosen.role).copied().unwrap_or(0.05).clamp(0.01, 0.80);
+    let min_risk_fraction = micro_account_min_risk_fraction(total_balance_usd);
+    if min_risk_fraction > 0.0 {
+        agent_budget = agent_budget.max(min_risk_fraction);
+    }
     let dd_factor = if drawdown >= cfg.alpha.drawdown_derisk_trigger_pct { 0.35 } else { 1.0 };
+    let min_notional = MIN_TRADE_NOTIONAL_USD;
+    let mut sizing_adjustment_reason = "NONE".to_string();
 
     // ── COMPOUND_EXECUTION: dynamic equity-based sizing ───────────────────────
     // In MICRO_ACTIVE mode, replace flat trade_size with a % of account equity.
@@ -4241,6 +4316,16 @@ fn allocate_capital(
         cfg.trade_size * agent_budget * size_multiplier
     };
 
+    // For balances under $250, prioritize executable notional over ultra-precise tiny sizing.
+    if !is_micro_active && total_balance_usd > 0.0 && total_balance_usd < MICRO_ACCOUNT_MODE_BALANCE_USD && mid > 0.0 {
+        let micro_notional_floor = (total_balance_usd * min_risk_fraction.max(0.05)).max(min_notional);
+        let micro_floor_qty = micro_notional_floor / mid;
+        if qty < micro_floor_qty {
+            qty = micro_floor_qty;
+            sizing_adjustment_reason = "MICRO_ACCOUNT_MIN_RISK_FRACTION".to_string();
+        }
+    }
+
     // Cap quantity by the available balance for this side:
     // SELL orders are limited by base-asset inventory; BUY orders by quote buying power.
     let max_qty = if chosen.side.eq_ignore_ascii_case("SELL") {
@@ -4261,10 +4346,14 @@ fn allocate_capital(
             recent_performance,
             symbol_concentration,
             drawdown,
+            raw_position_size_usd: 0.0,
+            adjusted_position_size_usd: 0.0,
+            min_notional,
+            sizing_adjustment_reason,
         };
     }
 
-    if qty < 0.000_000_01 {
+    if qty < 0.000_000_01 || mid <= 0.0 {
         return AllocationDecision {
             qty: 0.0,
             reason: "ALLOCATION_BELOW_MIN_SIZE".to_string(),
@@ -4272,27 +4361,52 @@ fn allocate_capital(
             recent_performance,
             symbol_concentration,
             drawdown,
+            raw_position_size_usd: 0.0,
+            adjusted_position_size_usd: 0.0,
+            min_notional,
+            sizing_adjustment_reason,
         };
     }
 
-    // ── Minimum notional floor ────────────────────────────────────────────────
-    // Ensure fills are visible: if the computed qty would produce a notional value
-    // below the floor, bump it up so the fill registers on the exchange. The bump
-    // is capped by max_qty (already guaranteed ≥ 0) so it never exceeds the
-    // available balance or inventory.
-    // COMPOUND_EXECUTION uses COMPOUND_MIN_NOTIONAL_USD; standard path uses $5.
-    let min_notional = if is_micro_active { COMPOUND_MIN_NOTIONAL_USD } else { 5.0 };
-    if mid > 0.0 {
-        let min_qty_for_notional = min_notional / mid;
-        if qty < min_qty_for_notional {
-            // max_qty is non-negative by construction (sell_inventory.max(0) or
-            // buy_power/mid with mid > 0), so no extra clamp is needed.
-            qty = min_qty_for_notional.min(max_qty);
-        }
+    let raw_position_size_usd = qty * mid;
+    let mut adjusted_position_size_usd = raw_position_size_usd;
+    if adjusted_position_size_usd < min_notional {
+        adjusted_position_size_usd = min_notional;
+        sizing_adjustment_reason = "MIN_NOTIONAL_BUMP".to_string();
+    }
+    qty = (adjusted_position_size_usd / mid).min(max_qty.max(0.0));
+
+    // Safety caps AFTER min-notional bump.
+    // 1) max_position_size
+    let max_position_room_qty = if chosen.side.eq_ignore_ascii_case("BUY") {
+        (cfg.guards.max_position_qty - position_size.max(0.0)).max(0.0)
+    } else {
+        cfg.guards.max_position_qty
+    };
+    // 2) max_portfolio_exposure (symbol + total at risk caps)
+    let symbol_notional_room = (cfg.alpha.max_symbol_exposure_notional - exposure_notional.max(0.0)).max(0.0);
+    let capital_at_risk_room = (cfg.alpha.max_capital_at_risk_notional - (rt.cycle_open_notional + exposure_notional).max(0.0)).max(0.0);
+    let notional_cap_room = symbol_notional_room.min(capital_at_risk_room);
+    let max_qty_from_notional_caps = if mid > 0.0 { notional_cap_room / mid } else { 0.0 };
+    let safety_cap_qty = max_qty
+        .max(0.0)
+        .min(max_position_room_qty.max(0.0))
+        .min(max_qty_from_notional_caps.max(0.0));
+    qty = qty.min(safety_cap_qty);
+    adjusted_position_size_usd = qty * mid;
+
+    // Single in-function retry pass: if we bumped for min-notional but caps clipped us
+    // and there is still room, reattempt once at exact min_notional target.
+    if sizing_adjustment_reason == "MIN_NOTIONAL_BUMP"
+        && adjusted_position_size_usd < min_notional
+        && safety_cap_qty > 0.0
+    {
+        let retry_qty = (min_notional / mid).min(safety_cap_qty);
+        qty = retry_qty;
+        adjusted_position_size_usd = qty * mid;
     }
 
-    // Re-check after the notional floor bump in case max_qty was too small.
-    if qty < 0.000_000_01 {
+    if adjusted_position_size_usd < min_notional {
         return AllocationDecision {
             qty: 0.0,
             reason: "ALLOCATION_BELOW_MIN_NOTIONAL".to_string(),
@@ -4300,6 +4414,10 @@ fn allocate_capital(
             recent_performance,
             symbol_concentration,
             drawdown,
+            raw_position_size_usd,
+            adjusted_position_size_usd,
+            min_notional,
+            sizing_adjustment_reason,
         };
     }
 
@@ -4310,6 +4428,10 @@ fn allocate_capital(
         recent_performance,
         symbol_concentration,
         drawdown,
+        raw_position_size_usd,
+        adjusted_position_size_usd,
+        min_notional,
+        sizing_adjustment_reason,
     }
 }
 
@@ -4677,6 +4799,23 @@ mod tests {
         }
     }
 
+    fn buy_proposal_for_test() -> WorkerProposal {
+        WorkerProposal {
+            action_id: "test-action".to_string(),
+            role: NpcRole::Scout,
+            side: "BUY".to_string(),
+            score: 0.5,
+            raw_score: 0.5,
+            reason: "test".to_string(),
+            expected_slippage_bps: 1.0,
+            regime_eligible: true,
+            regime_block_reason: None,
+            risk_override: false,
+            score_parts: ScoreBreakdown::default(),
+            expected_hold_secs: 5.0,
+        }
+    }
+
     // ── evaluate_guards: small account SELL bypass ─────────────────────────────
 
     #[test]
@@ -4708,6 +4847,114 @@ mod tests {
             !reasons.iter().any(|r| r.starts_with("SLIPPAGE_CEILING_EXCEEDED")),
             "SLIPPAGE_CEILING_EXCEEDED must be bypassed in small account mode, got: {:?}", reasons
         );
+    }
+
+    #[test]
+    fn micro_account_sell_under_250_bypasses_liquidity_depth_checks() {
+        let cfg = test_cfg();
+        let rt = NpcRuntimeState::default();
+        let metrics = low_liquidity_metrics();
+
+        let (reasons, _, _) = evaluate_guards(
+            &cfg, &rt, NpcRole::InventoryManager, "SELL",
+            0.0, &metrics, 20.0,
+            /* total_balance_usd */ 150.0,
+            /* sell_inventory    */ 0.001,
+            /* order_notional    */ 20.0,
+            /* is_micro_active   */ false,
+        );
+
+        assert!(
+            !reasons.iter().any(|r| r.starts_with("LIQUIDITY_TOO_LOW")),
+            "LIQUIDITY_TOO_LOW must be bypassed for sub-$250 SELL path, got: {:?}", reasons
+        );
+    }
+
+    #[test]
+    fn small_balance_buy_is_bumped_to_min_notional() {
+        let mut cfg = test_cfg();
+        cfg.trade_size = 0.000_001;
+        cfg.guards.max_position_qty = 10.0;
+        cfg.alpha.max_symbol_exposure_notional = 10_000.0;
+        cfg.alpha.max_capital_at_risk_notional = 10_000.0;
+        let rt = NpcRuntimeState::default();
+        let chosen = buy_proposal_for_test();
+        let allocation = allocate_capital(
+            &cfg,
+            &rt,
+            &chosen,
+            0.0,
+            0.0,
+            120.0,
+            0.0,
+            50_000.0,
+            120.0,
+            false,
+        );
+
+        assert!(allocation.qty > 0.0, "allocation must be executable for small balance");
+        assert!(
+            allocation.adjusted_position_size_usd >= MIN_TRADE_NOTIONAL_USD,
+            "adjusted notional must be >= min notional; got {:.6}",
+            allocation.adjusted_position_size_usd
+        );
+        assert_eq!(allocation.min_notional, MIN_TRADE_NOTIONAL_USD);
+    }
+
+    #[test]
+    fn no_trade_is_emitted_when_min_notional_cannot_be_met() {
+        let mut cfg = test_cfg();
+        cfg.trade_size = 0.000_001;
+        cfg.guards.max_position_qty = 10.0;
+        cfg.alpha.max_symbol_exposure_notional = 10_000.0;
+        cfg.alpha.max_capital_at_risk_notional = 10_000.0;
+        let rt = NpcRuntimeState::default();
+        let chosen = buy_proposal_for_test();
+        let allocation = allocate_capital(
+            &cfg,
+            &rt,
+            &chosen,
+            0.0,
+            0.0,
+            2.0, // cannot meet $3.00 min notional
+            0.0,
+            50_000.0,
+            2.0,
+            false,
+        );
+
+        assert_eq!(allocation.qty, 0.0);
+        assert_eq!(allocation.reason, "ALLOCATION_BELOW_MIN_NOTIONAL");
+        assert!(
+            allocation.adjusted_position_size_usd < MIN_TRADE_NOTIONAL_USD,
+            "unfillable orders must stay below min notional and be blocked"
+        );
+    }
+
+    #[test]
+    fn risk_caps_still_enforced_after_min_notional_bump() {
+        let mut cfg = test_cfg();
+        cfg.trade_size = 0.000_001;
+        cfg.guards.max_position_qty = 0.000_01; // very tight cap
+        cfg.alpha.max_symbol_exposure_notional = 0.20;
+        cfg.alpha.max_capital_at_risk_notional = 0.20;
+        let rt = NpcRuntimeState::default();
+        let chosen = buy_proposal_for_test();
+        let allocation = allocate_capital(
+            &cfg,
+            &rt,
+            &chosen,
+            0.0,
+            0.0,
+            100.0,
+            0.0,
+            50_000.0,
+            100.0,
+            false,
+        );
+
+        assert_eq!(allocation.qty, 0.0, "risk caps must block unsafe post-bump sizing");
+        assert_eq!(allocation.reason, "ALLOCATION_BELOW_MIN_NOTIONAL");
     }
 
     #[test]
