@@ -5504,21 +5504,6 @@ mod diagnostic_tests {
         }
     }
 
-    fn open_action_for_test(entry_mid: f64, allocated_qty: f64, opened_at: Instant, mode: NpcTradingMode) -> OpenAction {
-        OpenAction {
-            role: NpcRole::Scout,
-            side: "BUY".to_string(),
-            entry_mid,
-            opened_at,
-            entry_spread_bps: 1.0,
-            expected_edge: 0.1,
-            regime: MarketRegime::TrendingUp,
-            allocated_qty,
-            cycle_id: 1,
-            execution_mode: mode,
-        }
-    }
-
     #[tokio::test]
     async fn profile_switch_does_not_preserve_stale_slot_runtime_state() {
         let store: Arc<dyn crate::store::EventStore> = InMemoryEventStore::new();
@@ -5530,7 +5515,18 @@ mod diagnostic_tests {
             let mut rt = npc.runtime.lock().await;
             rt.open_actions.insert(
                 "stale-slot".to_string(),
-                open_action_for_test(50_000.0, 0.001, Instant::now(), NpcTradingMode::Paper),
+                OpenAction {
+                    role: NpcRole::Scout,
+                    side: "BUY".to_string(),
+                    entry_mid: 50_000.0,
+                    opened_at: Instant::now(),
+                    entry_spread_bps: 1.0,
+                    expected_edge: 0.1,
+                    regime: MarketRegime::TrendingUp,
+                    allocated_qty: 0.001,
+                    cycle_id: 1,
+                    execution_mode: NpcTradingMode::Paper,
+                },
             );
             rt.cycle_open_notional = 50.0;
             rt.rebalance_reason = "stale".to_string();
