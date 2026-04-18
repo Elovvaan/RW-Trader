@@ -11,9 +11,11 @@ use crate::agent::{AgentState, TradeAgentConfig};
 use crate::authority::AuthorityMode;
 use crate::events::{OperatorActionPayload, StoredEvent, TradingEvent};
 use crate::executor::ExecutionState;
+use crate::profile::RuntimeProfile;
 use crate::store::EventStore;
 
 const NPC_STATUS_SCANNING: &str = "scanning market";
+const DEFAULT_ACTIVE_PROFILE: &str = "ACTIVE";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum NpcRole {
@@ -251,6 +253,12 @@ pub struct NpcConfig {
     /// Behavior profile name (uppercase).  "FLIP_HYPER" activates the
     /// capital-rotation state machine.  Set via `RUNTIME_PROFILE` env var.
     pub behavior_profile: String,
+    pub target_usdt_ratio: f64,
+    pub target_btc_ratio: f64,
+    pub rebalance_min_notional_usd: f64,
+    pub rebalance_cooldown_secs: u64,
+    pub disable_no_trade_idle: bool,
+    pub min_conviction_threshold: f64,
 }
 
 impl NpcConfig {
@@ -273,9 +281,15 @@ impl NpcConfig {
             dip_trigger_pct: env_f64("NPC_DIP_TRIGGER_PCT", 0.003),
             mode: NpcTradingMode::from_env(),
             behavior_profile: std::env::var("RUNTIME_PROFILE")
-                .unwrap_or_default()
+                .unwrap_or_else(|_| DEFAULT_ACTIVE_PROFILE.to_string())
                 .trim()
                 .to_ascii_uppercase(),
+            target_usdt_ratio: env_f64("NPC_TARGET_USDT_RATIO", 0.35).clamp(0.05, 0.95),
+            target_btc_ratio: env_f64("NPC_TARGET_BTC_RATIO", 0.65).clamp(0.05, 0.95),
+            rebalance_min_notional_usd: env_f64("NPC_REBALANCE_MIN_NOTIONAL_USD", 5.0).max(1.0),
+            rebalance_cooldown_secs: env_u64("NPC_REBALANCE_COOLDOWN_SECS", 30).max(1),
+            disable_no_trade_idle: env_bool("NPC_DISABLE_NO_TRADE_IDLE", true),
+            min_conviction_threshold: env_f64("NPC_MIN_CONVICTION_THRESHOLD", 0.60).clamp(0.05, 0.95),
             guards: NpcGuardConfig {
                 max_spread_bps: env_f64("NPC_MAX_SPREAD_BPS", cfg.max_spread_bps),
                 min_liquidity_score: env_f64("NPC_MIN_LIQUIDITY_SCORE", 3.0),
@@ -602,6 +616,17 @@ struct NpcRuntimeState {
     contract_last_trade: Option<CompletedContractTrade>,
     contract_last_exit_reason: String,
     contract_last_no_open_reason: String,
+    rebalance_status: String,
+    rebalance_triggered: bool,
+    rebalance_reason: String,
+    rebalance_side: String,
+    rebalance_qty: f64,
+    rebalance_value_usd: f64,
+    free_usdt_before: f64,
+    free_usdt_after: f64,
+    btc_before: f64,
+    btc_after: f64,
+    rebalance_cooldown_until: Option<Instant>,
 }
 
 impl Default for NpcRuntimeState {
@@ -653,6 +678,17 @@ impl Default for NpcRuntimeState {
             contract_last_trade: None,
             contract_last_exit_reason: String::new(),
             contract_last_no_open_reason: String::new(),
+            rebalance_status: "REBALANCE_COMPLETE".to_string(),
+            rebalance_triggered: false,
+            rebalance_reason: String::new(),
+            rebalance_side: String::new(),
+            rebalance_qty: 0.0,
+            rebalance_value_usd: 0.0,
+            free_usdt_before: 0.0,
+            free_usdt_after: 0.0,
+            btc_before: 0.0,
+            btc_after: 0.0,
+            rebalance_cooldown_until: None,
         }
     }
 }
@@ -688,6 +724,9 @@ pub struct NpcLoopSnapshot {
     pub execution_block_reason: String,
     /// True when SWING profile is active and regime mismatch is informational.
     pub risk_override: bool,
+    pub active_profile: String,
+    pub active_profile_label: String,
+    pub profile_lock: String,
     // ── Drawdown diagnostics ──────────────────────────────────────────────────
     /// Current equity estimate used in drawdown calculation (position value + aggregate PnL).
     pub current_equity: f64,
@@ -768,6 +807,17 @@ pub struct NpcLoopSnapshot {
     pub contract_exit_reason: String,
     pub contract_last_trade_result: f64,
     pub contract_paper_mode: bool,
+    pub contract_last_no_open_reason: String,
+    pub rebalance_status: String,
+    pub rebalance_triggered: bool,
+    pub rebalance_reason: String,
+    pub rebalance_side: String,
+    pub rebalance_qty: f64,
+    pub rebalance_value_usd: f64,
+    pub free_usdt_before: f64,
+    pub free_usdt_after: f64,
+    pub btc_before: f64,
+    pub btc_after: f64,
 }
 
 #[derive(Default)]
@@ -832,7 +882,7 @@ impl NpcLoopControl {
 
 #[derive(Clone)]
 pub struct NpcAutonomousController {
-    cfg: NpcConfig,
+    cfg: Arc<Mutex<NpcConfig>>,
     state: AgentState,
     runtime: Arc<Mutex<NpcRuntimeState>>,
     telemetry: Arc<Mutex<NpcLoopTelemetry>>,
@@ -844,7 +894,7 @@ impl NpcAutonomousController {
         let interval_ms = cfg.cycle_interval.as_millis().clamp(500, 2000) as u64;
         let mode = if cfg.enabled { AgentMode::Auto } else { AgentMode::Off };
         Self {
-            cfg,
+            cfg: Arc::new(Mutex::new(cfg)),
             state,
             runtime: Arc::new(Mutex::new(NpcRuntimeState::default())),
             telemetry: Arc::new(Mutex::new(NpcLoopTelemetry {
@@ -862,6 +912,53 @@ impl NpcAutonomousController {
                 ..NpcLoopTelemetry::default()
             })),
             control: Arc::new(Mutex::new(NpcLoopControl::new(interval_ms, mode))),
+        }
+    }
+
+    pub async fn set_active_profile(&self, profile: RuntimeProfile) {
+        {
+            let mut cfg = self.cfg.lock().await;
+            cfg.behavior_profile = profile.as_str().to_string();
+        }
+        {
+            let mut rt = self.runtime.lock().await;
+            rt.flip_cycle_phase = FlipCyclePhase::SeekEntry;
+            rt.flip_last_completed = None;
+            rt.flip_session_pnl = 0.0;
+            rt.flip_rotation_count = 0;
+            rt.flip_last_entry_price = 0.0;
+            rt.flip_last_entry_qty = 0.0;
+            rt.flip_last_active = None;
+            rt.flip_blocker.clear();
+            rt.swing_entry_price = 0.0;
+            rt.swing_entry_started_at = None;
+            rt.swing_peak_price = 0.0;
+            rt.swing_peak_unrealized_pct = 0.0;
+            rt.swing_last_exit_reason.clear();
+            rt.swing_last_hold_duration_secs = 0.0;
+            rt.swing_cooldown_until = None;
+            rt.rebalance_status = "REBALANCE_COMPLETE".to_string();
+            rt.rebalance_triggered = false;
+            rt.rebalance_reason.clear();
+            rt.rebalance_side.clear();
+            rt.rebalance_qty = 0.0;
+            rt.rebalance_value_usd = 0.0;
+            rt.free_usdt_before = 0.0;
+            rt.free_usdt_after = 0.0;
+            rt.btc_before = 0.0;
+            rt.btc_after = 0.0;
+            rt.rebalance_cooldown_until = None;
+        }
+        {
+            let mut t = self.telemetry.lock().await;
+            t.threshold_mode = profile.as_str().to_ascii_lowercase();
+            t.cooldown_active = false;
+            t.cooldown_remaining_ms = 0;
+            t.last_no_trade_reason.clear();
+            t.balance_block_reason.clear();
+            t.risk_block_reason.clear();
+            t.execution_block_reason.clear();
+            t.top_score_penalties.clear();
         }
     }
 
@@ -944,8 +1041,9 @@ impl NpcAutonomousController {
     pub async fn snapshot(&self) -> NpcLoopSnapshot {
         let telemetry = self.telemetry.lock().await;
         let control = self.control.lock().await;
+        let cfg = self.cfg.lock().await.clone();
         let agent_mode = control.mode;
-        let (current_equity, peak_equity, drawdown_pct, compound, flip, contract) = {
+        let (current_equity, peak_equity, drawdown_pct, compound, flip, contract, rebalance, contract_last_no_open_reason) = {
             // Compute current equity and drawdown from runtime state (same formula as evaluate_portfolio_controls).
             let rt = self.runtime.lock().await;
             let aggregate_pnl: f64 = rt.perf.values().map(|p| p.gross_pnl).sum();
@@ -1045,7 +1143,19 @@ impl NpcAutonomousController {
                 last_result,
                 rt.contract_paper_mode,
             );
-            (equity, peak, dd, c, f, k)
+            let reb = (
+                rt.rebalance_status.clone(),
+                rt.rebalance_triggered,
+                rt.rebalance_reason.clone(),
+                rt.rebalance_side.clone(),
+                rt.rebalance_qty,
+                rt.rebalance_value_usd,
+                rt.free_usdt_before,
+                rt.free_usdt_after,
+                rt.btc_before,
+                rt.btc_after,
+            );
+            (equity, peak, dd, c, f, k, reb, rt.contract_last_no_open_reason.clone())
         };
         let (
             compound_pos_btc, compound_pos_usd,
@@ -1065,6 +1175,18 @@ impl NpcAutonomousController {
             flip_blocker,
         ) = flip;
         let (
+            rebalance_status,
+            rebalance_triggered,
+            rebalance_reason,
+            rebalance_side,
+            rebalance_qty,
+            rebalance_value_usd,
+            free_usdt_before,
+            free_usdt_after,
+            btc_before,
+            btc_after,
+        ) = rebalance;
+        let (
             contract_side,
             contract_leverage,
             contract_entry_price,
@@ -1081,6 +1203,7 @@ impl NpcAutonomousController {
             contract_last_trade_result,
             contract_paper_mode,
         ) = contract;
+        let active_profile = RuntimeProfile::from_str(&cfg.behavior_profile);
         NpcLoopSnapshot {
             agent_mode,
             autonomous_mode: agent_mode != AgentMode::Off,
@@ -1099,11 +1222,14 @@ impl NpcAutonomousController {
             balance_block_reason: telemetry.balance_block_reason.clone(),
             risk_block_reason: telemetry.risk_block_reason.clone(),
             execution_block_reason: telemetry.execution_block_reason.clone(),
-            risk_override: self.cfg.behavior_profile.eq_ignore_ascii_case("SWING"),
+            risk_override: cfg.behavior_profile.eq_ignore_ascii_case("SWING"),
+            active_profile: active_profile.as_str().to_string(),
+            active_profile_label: active_profile.label().to_string(),
+            profile_lock: active_profile.as_str().to_string(),
             current_equity,
             peak_equity,
             drawdown_pct,
-            drawdown_limit: self.cfg.alpha.max_drawdown_pct,
+            drawdown_limit: cfg.alpha.max_drawdown_pct,
             cooldown_active: telemetry.cooldown_active,
             cooldown_remaining_ms: telemetry.cooldown_remaining_ms,
             effective_threshold: telemetry.effective_threshold,
@@ -1144,6 +1270,17 @@ impl NpcAutonomousController {
             contract_exit_reason,
             contract_last_trade_result,
             contract_paper_mode,
+            contract_last_no_open_reason,
+            rebalance_status,
+            rebalance_triggered,
+            rebalance_reason,
+            rebalance_side,
+            rebalance_qty,
+            rebalance_value_usd,
+            free_usdt_before,
+            free_usdt_after,
+            btc_before,
+            btc_after,
         }
     }
 
@@ -1160,11 +1297,12 @@ impl NpcAutonomousController {
         let interval_ms = control.interval_ms;
         control.stop_tx = Some(stop_tx);
         control.pause_tx = Some(pause_tx);
-        let cfg = self.cfg.clone();
+        let cfg = Arc::clone(&self.cfg);
         let state = self.state.clone();
         let runtime = Arc::clone(&self.runtime);
         let telemetry = Arc::clone(&self.telemetry);
         control.handle = Some(tokio::spawn(async move {
+            let cfg_initial = cfg.lock().await.clone();
             {
                 let mut t = telemetry.lock().await;
                 t.running = true;
@@ -1175,15 +1313,13 @@ impl NpcAutonomousController {
                 "layer_started",
                 &format!(
                     "mode={} interval_ms={} trade_size={:.8}",
-                    cfg.mode.as_str(),
+                    cfg_initial.mode.as_str(),
                     interval_ms,
-                    cfg.trade_size
+                    cfg_initial.trade_size
                 ),
             );
 
-            let mut loop_cfg = cfg.clone();
-            loop_cfg.cycle_interval = Duration::from_millis(interval_ms);
-            let mut interval = tokio::time::interval(loop_cfg.cycle_interval);
+            let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
@@ -1196,6 +1332,8 @@ impl NpcAutonomousController {
                             t.timestamp = Utc::now().to_rfc3339();
                             continue;
                         }
+                        let mut loop_cfg = cfg.lock().await.clone();
+                        loop_cfg.cycle_interval = Duration::from_millis(interval_ms);
                         let report = run_cycle(&loop_cfg, &state, Arc::clone(&runtime)).await;
                         let mut t = telemetry.lock().await;
                         t.cycle_count = t.cycle_count.saturating_add(1);
@@ -1362,7 +1500,10 @@ const SWING_TARGET_MIN_PCT: f64 = 0.003; // 0.3%
 const SWING_TARGET_MAX_PCT: f64 = 0.012; // 1.2%
 const SWING_COOLDOWN_MIN_SECS: u64 = 30;
 const SWING_COOLDOWN_MAX_SECS: u64 = 120;
-const SWING_RISK_OVERRIDE_MIN_CONVICTION: f64 = 0.70;
+const REBALANCE_DUST_QTY: f64 = 0.000_000_01;
+const REBALANCE_MAX_INVENTORY_SELL_PCT: f64 = 0.80;
+const REBALANCE_FALLBACK_SELL_PCT: f64 = 0.25;
+const REBALANCE_MAX_USDT_BUY_PCT: f64 = 0.30;
 const CONTRACT_LEVERAGE_MIN: f64 = 3.0;
 const CONTRACT_LEVERAGE_MAX: f64 = 5.0;
 const CONTRACT_DEFAULT_LEVERAGE: f64 = 3.0;
@@ -1446,6 +1587,29 @@ fn adaptive_signal_threshold_with_trading_mode(
         }
     } else {
         adaptive_signal_threshold(total_balance_usd)
+    }
+}
+
+fn profile_threshold(
+    profile: RuntimeProfile,
+    total_balance_usd: f64,
+    mode: NpcTradingMode,
+) -> (f64, &'static str) {
+    match profile {
+        RuntimeProfile::Conservative => (THRESHOLD_BASE, "conservative"),
+        RuntimeProfile::Active => (THRESHOLD_BASE, "active"),
+        RuntimeProfile::MicroTest => adaptive_signal_threshold(total_balance_usd),
+        RuntimeProfile::MicroActive => adaptive_signal_threshold_with_trading_mode(total_balance_usd, mode),
+        RuntimeProfile::FlipHyper => {
+            if total_balance_usd > 0.0 && total_balance_usd < MICRO_BALANCE_USD {
+                (THRESHOLD_FLIP_HYPER_SMALL, "flip_hyper")
+            } else if total_balance_usd > 0.0 && total_balance_usd < MICRO_BALANCE_MID_USD {
+                (THRESHOLD_FLIP_HYPER_MID, "flip_hyper")
+            } else {
+                (THRESHOLD_BASE, "flip_hyper")
+            }
+        }
+        RuntimeProfile::Swing => (THRESHOLD_BASE, "swing"),
     }
 }
 
@@ -1702,6 +1866,108 @@ fn update_contract_executor(
     }
 }
 
+#[derive(Clone, Debug)]
+struct RebalancePlan {
+    status: &'static str,
+    reason: String,
+    side: &'static str,
+    qty: f64,
+    value_usd: f64,
+    free_usdt_before: f64,
+    free_usdt_after: f64,
+    btc_before: f64,
+    btc_after: f64,
+}
+
+fn maybe_rebalance(
+    cfg: &NpcConfig,
+    rt: &NpcRuntimeState,
+    side: &str,
+    buy_power: f64,
+    sell_inventory: f64,
+    mid: f64,
+    total_balance_usd: f64,
+    required_trade_capital: f64,
+) -> Option<RebalancePlan> {
+    if !cfg.disable_no_trade_idle || !mid.is_finite() || mid <= 0.0 {
+        return None;
+    }
+    if let Some(until) = rt.rebalance_cooldown_until {
+        if until > Instant::now() {
+            return None;
+        }
+    }
+
+    let buy_power = buy_power.max(0.0);
+    let sell_inventory = sell_inventory.max(0.0);
+    let btc_inventory_usd = sell_inventory * mid;
+    let target_usdt_usd = total_balance_usd * cfg.target_usdt_ratio.clamp(0.05, 0.95);
+    let target_btc_usd = total_balance_usd * cfg.target_btc_ratio.clamp(0.05, 0.95);
+    let min_notional = cfg.rebalance_min_notional_usd.max(1.0);
+
+    if side.eq_ignore_ascii_case("BUY")
+        && buy_power < required_trade_capital
+        && btc_inventory_usd > required_trade_capital
+        && total_balance_usd > required_trade_capital
+    {
+        let need_usdt = (target_usdt_usd - buy_power).max(required_trade_capital - buy_power).max(0.0);
+        let max_sell_value_for_target = (btc_inventory_usd - target_btc_usd).max(0.0);
+        let sell_value = need_usdt
+            .max(required_trade_capital)
+            .min(btc_inventory_usd * REBALANCE_MAX_INVENTORY_SELL_PCT)
+            .min(if max_sell_value_for_target > 0.0 {
+                max_sell_value_for_target
+            } else {
+                btc_inventory_usd * REBALANCE_FALLBACK_SELL_PCT
+            });
+        let qty = sell_value / mid;
+        if sell_value >= min_notional && qty > REBALANCE_DUST_QTY {
+            return Some(RebalancePlan {
+                status: "REBALANCE_TO_USDT",
+                reason: format!(
+                    "BUY_CAPITAL_SHORTAGE: free_usdt={:.2}<required={:.2} btc_inventory_usd={:.2}",
+                    buy_power, required_trade_capital, btc_inventory_usd
+                ),
+                side: "SELL",
+                qty,
+                value_usd: sell_value,
+                free_usdt_before: buy_power,
+                free_usdt_after: buy_power + sell_value,
+                btc_before: sell_inventory,
+                btc_after: (sell_inventory - qty).max(0.0),
+            });
+        }
+    }
+
+    if side.eq_ignore_ascii_case("SELL")
+        && sell_inventory <= REBALANCE_DUST_QTY
+        && buy_power > min_notional
+        && total_balance_usd > min_notional
+    {
+        let excess_usdt = (buy_power - target_usdt_usd).max(0.0);
+        let buy_value = excess_usdt.min(buy_power * REBALANCE_MAX_USDT_BUY_PCT);
+        let qty = buy_value / mid;
+        if buy_value >= min_notional && qty > REBALANCE_DUST_QTY {
+            return Some(RebalancePlan {
+                status: "REBALANCE_TO_BTC",
+                reason: format!(
+                    "SELL_INVENTORY_SHORTAGE: free_btc={:.8} free_usdt={:.2}",
+                    sell_inventory, buy_power
+                ),
+                side: "BUY",
+                qty,
+                value_usd: buy_value,
+                free_usdt_before: buy_power,
+                free_usdt_after: (buy_power - buy_value).max(0.0),
+                btc_before: sell_inventory,
+                btc_after: sell_inventory + qty,
+            });
+        }
+    }
+
+    None
+}
+
 async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRuntimeState>>) -> NpcCycleReport {
     let mode = state.authority.mode().await;
     let metrics = {
@@ -1772,30 +2038,17 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
     let exec_state = state.exec.execution_state().await;
     let pending = state.authority.pending_proposals().await;
 
-    // ── Micro-account adaptive signal threshold ───────────────────────────────
-    let (base_threshold, base_threshold_mode) = adaptive_signal_threshold_with_trading_mode(total_balance_usd, cfg.mode);
-    // ── FLIP_HYPER: override thresholds when profile is FLIP_HYPER ────────────
-    let is_swing_profile = cfg.behavior_profile.eq_ignore_ascii_case("SWING");
-    let (effective_threshold, threshold_mode) = if is_swing_profile {
-        (THRESHOLD_BASE, "swing")
-    } else if cfg.behavior_profile == "FLIP_HYPER"
-        && cfg.mode == NpcTradingMode::Live
-        && total_balance_usd > 0.0
-        && total_balance_usd < MICRO_BALANCE_MID_USD
-    {
-        if total_balance_usd < MICRO_BALANCE_USD {
-            (THRESHOLD_FLIP_HYPER_SMALL, "flip_hyper")
-        } else {
-            (THRESHOLD_FLIP_HYPER_MID, "flip_hyper")
-        }
-    } else {
-        (base_threshold, base_threshold_mode)
-    };
-    // FLIP_HYPER inherits micro_active penalty dampening and sizing behavior.
-    let is_flip_hyper = threshold_mode == "flip_hyper";
-    // MICRO_ACTIVE is active whenever the balance-tier and trading mode qualify,
-    // OR when FLIP_HYPER is active (inherits all micro_active behaviors).
-    let is_micro_active = (threshold_mode == "micro_active" || is_flip_hyper) && !is_swing_profile;
+    let active_profile = RuntimeProfile::from_str(&cfg.behavior_profile);
+    let (effective_threshold, threshold_mode) =
+        profile_threshold(active_profile, total_balance_usd, cfg.mode);
+    let is_swing_profile = active_profile == RuntimeProfile::Swing;
+    let is_flip_hyper = active_profile == RuntimeProfile::FlipHyper;
+    let is_micro_active = matches!(active_profile, RuntimeProfile::MicroActive | RuntimeProfile::FlipHyper);
+    log_npc_event(
+        &*state.store,
+        "profile_lock",
+        &format!("PROFILE_LOCK={}", active_profile.as_str()),
+    );
 
     let mut rt = runtime.lock().await;
     rt.cycle_seq = rt.cycle_seq.saturating_add(1);
@@ -2107,7 +2360,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
     let metrics_line = format_cycle_metrics(cycle_id, regime, &candidates, effective_cutoff, &portfolio_controls);
     log_npc_event(&*state.store, "alpha_cycle", &metrics_line);
 
-    let Some(chosen) = candidates.first().cloned() else {
+    let Some(mut chosen) = candidates.first().cloned() else {
         log_npc_event(&*state.store, "no_action", &format!("cycle={} reason=NO_CANDIDATES", cycle_id));
         observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
         return no_action(cycle_id, "NO_CANDIDATES".to_string(), "running".to_string());
@@ -2287,10 +2540,10 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         }
     }
 
-    if allow_despite_regime_mismatch && chosen.score < SWING_RISK_OVERRIDE_MIN_CONVICTION {
+    if allow_despite_regime_mismatch && chosen.score < cfg.min_conviction_threshold {
         let reason = format!(
             "SWING_RISK_OVERRIDE_CONVICTION_BELOW_THRESHOLD:{:.4}<{:.4}",
-            chosen.score, SWING_RISK_OVERRIDE_MIN_CONVICTION
+            chosen.score, cfg.min_conviction_threshold
         );
         lifecycle(
             &*state.store,
@@ -2311,7 +2564,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                 chosen.side.to_uppercase(),
                 chosen.role.as_str(),
                 chosen.score,
-                SWING_RISK_OVERRIDE_MIN_CONVICTION
+                cfg.min_conviction_threshold
             ),
             no_trade_reason: reason.clone(),
             pipeline_state: "Scanning".to_string(),
@@ -2510,7 +2763,54 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         };
     }
 
-    let allocation = allocate_capital(&effective_cfg, &rt, &chosen, position_size, exposure_notional, buy_power, sell_inventory, metrics.mid, total_balance_usd, is_micro_active);
+    let required_trade_capital = (cfg.trade_size.max(0.0) * metrics.mid.max(0.0)).max(cfg.rebalance_min_notional_usd);
+    let mut forced_allocation: Option<AllocationDecision> = None;
+    if let Some(plan) = maybe_rebalance(
+        cfg,
+        &rt,
+        &chosen.side,
+        buy_power,
+        sell_inventory,
+        metrics.mid,
+        total_balance_usd,
+        required_trade_capital,
+    ) {
+        chosen.side = plan.side.to_string();
+        chosen.reason = format!("{} | {}", chosen.reason, plan.reason);
+        rt.rebalance_status = plan.status.to_string();
+        rt.rebalance_triggered = true;
+        rt.rebalance_reason = plan.reason;
+        rt.rebalance_side = plan.side.to_string();
+        rt.rebalance_qty = plan.qty;
+        rt.rebalance_value_usd = plan.value_usd;
+        rt.free_usdt_before = plan.free_usdt_before;
+        rt.free_usdt_after = plan.free_usdt_after;
+        rt.btc_before = plan.btc_before;
+        rt.btc_after = plan.btc_after;
+        rt.rebalance_cooldown_until = Some(Instant::now() + Duration::from_secs(cfg.rebalance_cooldown_secs));
+        forced_allocation = Some(AllocationDecision {
+            qty: plan.qty,
+            reason: format!("{}:{}", plan.status, rt.rebalance_reason),
+            quality: 1.0,
+            recent_performance: 0.0,
+            symbol_concentration: 0.0,
+            drawdown: 0.0,
+        });
+    } else {
+        rt.rebalance_status = "REBALANCE_COMPLETE".to_string();
+        rt.rebalance_triggered = false;
+        rt.rebalance_reason.clear();
+        rt.rebalance_side.clear();
+        rt.rebalance_qty = 0.0;
+        rt.rebalance_value_usd = 0.0;
+        rt.free_usdt_before = buy_power;
+        rt.free_usdt_after = buy_power;
+        rt.btc_before = sell_inventory;
+        rt.btc_after = sell_inventory;
+    }
+    let allocation = forced_allocation.unwrap_or_else(|| {
+        allocate_capital(&effective_cfg, &rt, &chosen, position_size, exposure_notional, buy_power, sell_inventory, metrics.mid, total_balance_usd, is_micro_active)
+    });
     if allocation.qty <= 0.0 {
         lifecycle(
             &*state.store,
@@ -4466,6 +4766,44 @@ mod tests {
             candidates.iter().filter(|c| c.role != NpcRole::RiskManager).all(|c| !c.risk_override),
             "only risk_manager should carry risk_override"
         );
+    }
+
+    #[test]
+    fn profile_lock_swing_disables_micro_and_flip_threshold_modes() {
+        let (swing_threshold, swing_mode) =
+            profile_threshold(crate::profile::RuntimeProfile::Swing, 35.0, NpcTradingMode::Live);
+        let (micro_threshold, micro_mode) =
+            profile_threshold(crate::profile::RuntimeProfile::MicroActive, 35.0, NpcTradingMode::Live);
+        let (flip_threshold, flip_mode) =
+            profile_threshold(crate::profile::RuntimeProfile::FlipHyper, 35.0, NpcTradingMode::Live);
+        assert_eq!(swing_mode, "swing");
+        assert_ne!(swing_mode, micro_mode);
+        assert_ne!(swing_mode, flip_mode);
+        assert!(swing_threshold >= micro_threshold);
+        assert!(swing_threshold >= flip_threshold);
+    }
+
+    #[test]
+    fn rebalance_to_usdt_triggers_before_buy_capital_block() {
+        let mut cfg = test_cfg();
+        cfg.disable_no_trade_idle = true;
+        cfg.rebalance_min_notional_usd = 5.0;
+        let rt = NpcRuntimeState::default();
+        let plan = maybe_rebalance(
+            &cfg,
+            &rt,
+            "BUY",
+            /* buy_power */ 0.0,
+            /* sell_inventory */ 0.001,
+            /* mid */ 50_000.0,
+            /* total_balance_usd */ 50.0,
+            /* required_trade_capital */ 10.0,
+        )
+        .expect("rebalance plan expected");
+        assert_eq!(plan.status, "REBALANCE_TO_USDT");
+        assert_eq!(plan.side, "SELL");
+        assert!(plan.qty > 0.0);
+        assert!(plan.value_usd >= cfg.rebalance_min_notional_usd);
     }
 
     // ── AgentMode ─────────────────────────────────────────────────────────────
