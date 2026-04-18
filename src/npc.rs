@@ -3363,3 +3363,199 @@ mod diagnostic_tests {
         );
     }
 }
+
+// ── End-to-end $100 account simulation ────────────────────────────────────────
+#[cfg(test)]
+mod hundred_dollar_e2e {
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Mutex;
+
+    use super::*;
+    use crate::agent::{AgentState, TradeAgentConfig};
+    use crate::authority::AuthorityLayer;
+    use crate::client::BinanceClient;
+    use crate::executor::{CircuitBreakerConfig, Executor, WatchdogConfig};
+    use crate::feed::{FeedState, MidSample, TradeSample};
+    use crate::reconciler::TruthState;
+    use crate::signal::{SignalConfig, SignalEngine};
+    use crate::store::InMemoryEventStore;
+    use crate::withdrawal::{WithdrawalConfig, WithdrawalManager};
+
+    fn make_state(store: Arc<dyn crate::store::EventStore>, authority: Arc<AuthorityLayer>) -> AgentState {
+        AgentState {
+            store,
+            exec: Arc::new(Executor::new("BTCUSDT".into(), CircuitBreakerConfig::default(), WatchdogConfig::default())),
+            feed: Arc::new(Mutex::new(FeedState::new(Duration::from_secs(30)))),
+            signal: Arc::new(Mutex::new(SignalEngine::new(SignalConfig {
+                order_qty: 0.001,
+                momentum_threshold: 0.00005,
+                imbalance_threshold: 0.10,
+                max_entry_spread_bps: 10.0,
+                max_feed_staleness: Duration::from_secs(5),
+                stop_loss_pct: 0.002,
+                take_profit_pct: 0.004,
+                max_hold_duration: Duration::from_secs(120),
+                min_mid_samples: 1,
+                min_trade_samples: 1,
+            }))),
+            truth: Arc::new(Mutex::new(TruthState::new("BTCUSDT", 0.0))),
+            authority,
+            withdrawals: Arc::new(WithdrawalManager::new(WithdrawalConfig::default())),
+            client: Arc::new(BinanceClient::new(String::new(), String::new(), String::new())),
+            symbol: "BTCUSDT".into(),
+            web_base_url: None,
+        }
+    }
+
+    fn paper_cfg() -> NpcConfig {
+        let mut cfg = NpcConfig::from_trade_cfg(&TradeAgentConfig {
+            enabled: true,
+            trade_size: 0.001,
+            momentum_threshold: 0.00005,
+            poll_interval: Duration::from_secs(1),
+            max_spread_bps: 50.0,
+        });
+        cfg.mode = NpcTradingMode::Paper;
+        cfg
+    }
+
+    async fn seed_feed(state: &AgentState, mid: f64, n: usize) {
+        let mut feed = state.feed.lock().await;
+        let now = std::time::Instant::now();
+        feed.bid = mid * 0.9999;
+        feed.ask = mid * 1.0001;
+        feed.last_seen = Some(now);
+        for i in 0..n {
+            let ts = now - Duration::from_millis((n - i) as u64 * 50);
+            let price = mid * (1.0 + i as f64 * 0.0001);
+            feed.mid_history.push_back(MidSample { timestamp: ts, mid: price });
+            feed.trade_history.push_back(TradeSample { timestamp: ts, qty: 0.1, is_aggressor_buy: true });
+        }
+    }
+
+    async fn seed_balance(state: &AgentState, total_usd: f64) {
+        let mut truth = state.truth.lock().await;
+        truth.total_balance_usd = total_usd;
+        truth.buy_power = total_usd;
+        truth.sell_inventory = 0.0;
+    }
+
+    fn gate_label(r: &NpcCycleReport) -> &'static str {
+        let res = r.execution_result.as_str();
+        if res.contains("AUTHORITY_MODE_OFF")     { return "GATE-1  authority OFF"; }
+        if res.contains("REGIME_MISMATCH")        { return "GATE-2  regime mismatch"; }
+        if res.contains("ALL_REGIME_BLOCKED")     { return "GATE-2  all roles regime-blocked"; }
+        if res.contains("NO_CANDIDATES")          { return "GATE-2  no candidates"; }
+        if res.contains("SCORE_BELOW_THRESHOLD")  { return "GATE-3  score below threshold"; }
+        if res.contains("ALLOCATION")             { return "GATE-5  allocation rejected"; }
+        if res.contains("LIVE_REQUIRES_PAPER")    { return "GATE-6  live cold-start"; }
+        if res.contains("WEB_UI_ADDR_MISSING")    { return "GATE-8  dispatch  ← all NPC gates passed"; }
+        if res.starts_with("HTTP_STATUS")         { return "GATE-8  dispatch  ← all NPC gates passed"; }
+        if res.starts_with("REQUEST_ERROR")       { return "GATE-8  dispatch  ← all NPC gates passed"; }
+        if res == "EXECUTED"                      { return "EXECUTE simulation fill"; }
+        "GATE-?  other guard"
+    }
+
+    #[tokio::test]
+    async fn e2e_105_usd_paper_account_gate_report() {
+        let store = InMemoryEventStore::new();
+        let authority = Arc::new(AuthorityLayer::new());
+        authority.set_mode_auto(&*store).await;
+        let state = make_state(Arc::clone(&store) as Arc<dyn crate::store::EventStore>, authority);
+        let cfg   = paper_cfg();
+        let rt    = Arc::new(Mutex::new(NpcRuntimeState::default()));
+
+        seed_feed(&state, 75_720.0, 40).await;
+        seed_balance(&state, 105.0).await;
+
+        let report = run_cycle(&cfg, &state, rt).await;
+        let gate   = gate_label(&report);
+
+        println!();
+        println!("╔══════════════════════════════════════════════════╗");
+        println!("║    $105 ACCOUNT  END-TO-END GATE REPORT           ║");
+        println!("╠══════════════════════════════════════════════════╣");
+        println!("║ Gate reached    : {:<31}║", gate);
+        println!("║ final_decision  : {:<31}║", report.final_decision);
+        println!("║ execution_result: {:<31}║", &report.execution_result[..report.execution_result.len().min(31)]);
+        println!("║ threshold_mode  : {:<31}║", report.threshold_mode);
+        println!("║ effective_cutoff: {:<31.4}║", report.effective_threshold);
+        println!("║ last_decision   : {:<31}║", &report.last_agent_decision[..report.last_agent_decision.len().min(31)]);
+        println!("║ no_trade_reason : {:<31}║", &report.no_trade_reason[..report.no_trade_reason.len().min(31)]);
+        println!("║ balance_block   : {:<31}║", if report.balance_block_reason.is_empty() { "—" } else { &report.balance_block_reason[..report.balance_block_reason.len().min(31)] });
+        println!("║ risk_block      : {:<31}║", if report.risk_block_reason.is_empty() { "—" } else { &report.risk_block_reason[..report.risk_block_reason.len().min(31)] });
+        println!("║ exec_block      : {:<31}║", if report.execution_block_reason.is_empty() { "—" } else { &report.execution_block_reason[..report.execution_block_reason.len().min(31)] });
+        println!("╚══════════════════════════════════════════════════╝");
+
+        // All NPC-internal gates must clear for a funded $105 paper account.
+        assert!(
+            report.execution_result.contains("WEB_UI_ADDR_MISSING")
+                || report.execution_result.contains("HTTP_STATUS")
+                || report.execution_result.contains("REQUEST_ERROR")
+                || report.execution_result == "EXECUTED",
+            "\n\nFAIL — $105 account blocked before dispatch gate.\
+             \nGate reached     : {}\
+             \nfinal_decision   : {}\
+             \nexecution_result : {}\
+             \nno_trade_reason  : {}\
+             \nexec_block       : {}\n",
+            gate,
+            report.final_decision,
+            report.execution_result,
+            report.no_trade_reason,
+            report.execution_block_reason,
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_105_usd_uses_normal_threshold_mode() {
+        let store = InMemoryEventStore::new();
+        let authority = Arc::new(AuthorityLayer::new());
+        authority.set_mode_auto(&*store).await;
+        let state = make_state(Arc::clone(&store) as Arc<dyn crate::store::EventStore>, authority);
+        let rt = Arc::new(Mutex::new(NpcRuntimeState::default()));
+        seed_feed(&state, 75_720.0, 40).await;
+        seed_balance(&state, 105.0).await;
+        let report = run_cycle(&paper_cfg(), &state, rt).await;
+        assert_eq!(report.threshold_mode, "normal",
+            "$105 must use normal threshold mode; got: {} effective_cutoff={:.4}",
+            report.threshold_mode, report.effective_threshold);
+    }
+
+    #[tokio::test]
+    async fn e2e_105_usd_score_gate_does_not_block() {
+        let store = InMemoryEventStore::new();
+        let authority = Arc::new(AuthorityLayer::new());
+        authority.set_mode_auto(&*store).await;
+        let state = make_state(Arc::clone(&store) as Arc<dyn crate::store::EventStore>, authority);
+        let rt = Arc::new(Mutex::new(NpcRuntimeState::default()));
+        seed_feed(&state, 75_720.0, 40).await;
+        seed_balance(&state, 105.0).await;
+        let report = run_cycle(&paper_cfg(), &state, rt).await;
+        assert_ne!(report.execution_result, "SCORE_BELOW_THRESHOLD",
+            "$105 account must not be blocked at score gate; \
+             effective_cutoff={:.4} decision={}",
+            report.effective_threshold, report.last_agent_decision);
+    }
+
+    #[tokio::test]
+    async fn e2e_105_usd_regime_gate_does_not_block_all_roles() {
+        let store = InMemoryEventStore::new();
+        let authority = Arc::new(AuthorityLayer::new());
+        authority.set_mode_auto(&*store).await;
+        let state = make_state(Arc::clone(&store) as Arc<dyn crate::store::EventStore>, authority);
+        let rt = Arc::new(Mutex::new(NpcRuntimeState::default()));
+        seed_feed(&state, 75_720.0, 40).await;
+        seed_balance(&state, 105.0).await;
+        let report = run_cycle(&paper_cfg(), &state, rt).await;
+        // A regime mismatch on a single role is OK (e.g. risk_manager in TRENDING_UP).
+        // But the system must NOT exit solely because of regime mismatch anymore.
+        assert!(
+            !report.execution_result.contains("ALL_REGIME_BLOCKED"),
+            "$105 account must not have all roles blocked by regime; \
+             execution_result={} decision={}",
+            report.execution_result, report.last_agent_decision
+        );
+    }
+}
