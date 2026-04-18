@@ -15,6 +15,7 @@ use crate::profile::RuntimeProfile;
 use crate::store::EventStore;
 
 const NPC_STATUS_SCANNING: &str = "scanning market";
+const DEFAULT_ACTIVE_PROFILE: &str = "ACTIVE";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum NpcRole {
@@ -280,7 +281,7 @@ impl NpcConfig {
             dip_trigger_pct: env_f64("NPC_DIP_TRIGGER_PCT", 0.003),
             mode: NpcTradingMode::from_env(),
             behavior_profile: std::env::var("RUNTIME_PROFILE")
-                .unwrap_or_else(|_| "ACTIVE".to_string())
+                .unwrap_or_else(|_| DEFAULT_ACTIVE_PROFILE.to_string())
                 .trim()
                 .to_ascii_uppercase(),
             target_usdt_ratio: env_f64("NPC_TARGET_USDT_RATIO", 0.35).clamp(0.05, 0.95),
@@ -1500,6 +1501,9 @@ const SWING_TARGET_MAX_PCT: f64 = 0.012; // 1.2%
 const SWING_COOLDOWN_MIN_SECS: u64 = 30;
 const SWING_COOLDOWN_MAX_SECS: u64 = 120;
 const REBALANCE_DUST_QTY: f64 = 0.000_000_01;
+const REBALANCE_MAX_INVENTORY_SELL_PCT: f64 = 0.80;
+const REBALANCE_FALLBACK_SELL_PCT: f64 = 0.25;
+const REBALANCE_MAX_USDT_BUY_PCT: f64 = 0.30;
 const CONTRACT_LEVERAGE_MIN: f64 = 3.0;
 const CONTRACT_LEVERAGE_MAX: f64 = 5.0;
 const CONTRACT_DEFAULT_LEVERAGE: f64 = 3.0;
@@ -1910,8 +1914,12 @@ fn maybe_rebalance(
         let max_sell_value_for_target = (btc_inventory_usd - target_btc_usd).max(0.0);
         let sell_value = need_usdt
             .max(required_trade_capital)
-            .min(btc_inventory_usd * 0.80)
-            .min(if max_sell_value_for_target > 0.0 { max_sell_value_for_target } else { btc_inventory_usd * 0.25 });
+            .min(btc_inventory_usd * REBALANCE_MAX_INVENTORY_SELL_PCT)
+            .min(if max_sell_value_for_target > 0.0 {
+                max_sell_value_for_target
+            } else {
+                btc_inventory_usd * REBALANCE_FALLBACK_SELL_PCT
+            });
         let qty = sell_value / mid;
         if sell_value >= min_notional && qty > REBALANCE_DUST_QTY {
             return Some(RebalancePlan {
@@ -1937,7 +1945,7 @@ fn maybe_rebalance(
         && total_balance_usd > min_notional
     {
         let excess_usdt = (buy_power - target_usdt_usd).max(0.0);
-        let buy_value = excess_usdt.min(buy_power * 0.30);
+        let buy_value = excess_usdt.min(buy_power * REBALANCE_MAX_USDT_BUY_PCT);
         let qty = buy_value / mid;
         if buy_value >= min_notional && qty > REBALANCE_DUST_QTY {
             return Some(RebalancePlan {
