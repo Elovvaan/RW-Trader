@@ -312,6 +312,7 @@ struct WorkerProposal {
     expected_slippage_bps: f64,
     regime_eligible: bool,
     regime_block_reason: Option<String>,
+    risk_override: bool,
     score_parts: ScoreBreakdown,
     expected_hold_secs: f64,
 }
@@ -685,6 +686,8 @@ pub struct NpcLoopSnapshot {
     pub risk_block_reason: String,
     /// Why a strategy/score/execution guard blocked execution (empty when not the cause).
     pub execution_block_reason: String,
+    /// True when SWING profile is active and regime mismatch is informational.
+    pub risk_override: bool,
     // ── Drawdown diagnostics ──────────────────────────────────────────────────
     /// Current equity estimate used in drawdown calculation (position value + aggregate PnL).
     pub current_equity: f64,
@@ -1096,6 +1099,7 @@ impl NpcAutonomousController {
             balance_block_reason: telemetry.balance_block_reason.clone(),
             risk_block_reason: telemetry.risk_block_reason.clone(),
             execution_block_reason: telemetry.execution_block_reason.clone(),
+            risk_override: self.cfg.behavior_profile.eq_ignore_ascii_case("SWING"),
             current_equity,
             peak_equity,
             drawdown_pct,
@@ -1358,6 +1362,7 @@ const SWING_TARGET_MIN_PCT: f64 = 0.003; // 0.3%
 const SWING_TARGET_MAX_PCT: f64 = 0.012; // 1.2%
 const SWING_COOLDOWN_MIN_SECS: u64 = 30;
 const SWING_COOLDOWN_MAX_SECS: u64 = 120;
+const SWING_RISK_OVERRIDE_MIN_CONVICTION: f64 = 0.70;
 const CONTRACT_LEVERAGE_MIN: f64 = 3.0;
 const CONTRACT_LEVERAGE_MAX: f64 = 5.0;
 const CONTRACT_DEFAULT_LEVERAGE: f64 = 3.0;
@@ -2043,6 +2048,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         regime,
         !matches!(exec_state, ExecutionState::Idle) || !pending.is_empty(),
         is_micro_active,
+        is_swing_profile,
     );
 
     let regime_cutoff = rt
@@ -2243,7 +2249,49 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         }
     }
 
+    let allow_despite_regime_mismatch = chosen.risk_override && !chosen.regime_eligible;
     if let Some(reason) = chosen.regime_block_reason.clone() {
+        if !allow_despite_regime_mismatch {
+            lifecycle(
+                &*state.store,
+                chosen.role,
+                &chosen.action_id,
+                NpcLifecycleState::Blocked,
+                &reason,
+            );
+            rt.perf.entry(chosen.role).or_default().blocked += 1;
+            observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
+            return NpcCycleReport {
+                cycle_id,
+                last_action: "NO_ACTION".to_string(),
+                execution_result: reason.clone(),
+                status: "blocked".to_string(),
+                last_agent_decision: format!(
+                    "HOLD — {} {} blocked: {}",
+                    chosen.side.to_uppercase(), chosen.role.as_str(), reason
+                ),
+                no_trade_reason: format!("Regime mismatch — {}. Try a different market condition.", reason),
+                pipeline_state: "Scanning".to_string(),
+                final_decision: "BLOCKED".to_string(),
+                balance_block_reason: String::new(),
+                risk_block_reason: String::new(),
+                execution_block_reason: reason.clone(),
+                cooldown_active: false,
+                cooldown_remaining_ms: 0,
+                effective_threshold: effective_cutoff,
+                threshold_mode: threshold_mode.to_string(),
+                raw_score: chosen.raw_score,
+                normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
+                top_score_penalties: chosen.score_parts.top_penalties_str(),
+            };
+        }
+    }
+
+    if allow_despite_regime_mismatch && chosen.score < SWING_RISK_OVERRIDE_MIN_CONVICTION {
+        let reason = format!(
+            "SWING_RISK_OVERRIDE_CONVICTION_BELOW_THRESHOLD:{:.4}<{:.4}",
+            chosen.score, SWING_RISK_OVERRIDE_MIN_CONVICTION
+        );
         lifecycle(
             &*state.store,
             chosen.role,
@@ -2256,18 +2304,21 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         return NpcCycleReport {
             cycle_id,
             last_action: "NO_ACTION".to_string(),
-            execution_result: reason.clone(),
+            execution_result: "SWING_RISK_OVERRIDE_CONVICTION_BELOW_THRESHOLD".to_string(),
             status: "blocked".to_string(),
             last_agent_decision: format!(
-                "HOLD — {} {} blocked: {}",
-                chosen.side.to_uppercase(), chosen.role.as_str(), reason
+                "HOLD — {} {} swing override conviction {:.4} below {:.4}",
+                chosen.side.to_uppercase(),
+                chosen.role.as_str(),
+                chosen.score,
+                SWING_RISK_OVERRIDE_MIN_CONVICTION
             ),
-            no_trade_reason: format!("Regime mismatch — {}. Try a different market condition.", reason),
+            no_trade_reason: reason.clone(),
             pipeline_state: "Scanning".to_string(),
             final_decision: "BLOCKED".to_string(),
             balance_block_reason: String::new(),
             risk_block_reason: String::new(),
-            execution_block_reason: reason.clone(),
+            execution_block_reason: reason,
             cooldown_active: false,
             cooldown_remaining_ms: 0,
             effective_threshold: effective_cutoff,
@@ -3042,6 +3093,28 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             rt.swing_peak_unrealized_pct = 0.0;
         }
     }
+    if allow_despite_regime_mismatch {
+        log_npc_event(
+            &*state.store,
+            "risk_override",
+            &format!(
+                "cycle={} action_id={} role={} regime={} code=TRADE_ALLOWED_DESPITE_REGIME_MISMATCH conviction={:.4}",
+                cycle_id,
+                chosen.action_id,
+                chosen.role.as_str(),
+                regime.as_str(),
+                chosen.score
+            ),
+        );
+        info!(
+            cycle_id,
+            action_id = chosen.action_id.as_str(),
+            role = chosen.role.as_str(),
+            regime = regime.as_str(),
+            conviction = chosen.score,
+            "TRADE_ALLOWED_DESPITE_REGIME_MISMATCH"
+        );
+    }
 
     log_npc_event(
         &*state.store,
@@ -3230,6 +3303,7 @@ fn build_worker_candidates(
     regime: MarketRegime,
     has_conflict: bool,
     is_micro_active: bool,
+    is_swing_profile: bool,
 ) -> Vec<WorkerProposal> {
     let mut proposals = Vec::new();
     let momentum = metrics.momentum_5s;
@@ -3239,6 +3313,7 @@ fn build_worker_candidates(
     for role in NpcRole::all() {
         let allow = regime_allowlist(role);
         let regime_eligible = allow.contains(&regime);
+        let risk_override = is_swing_profile && matches!(role, NpcRole::RiskManager);
         let regime_block_reason = if regime_eligible {
             None
         } else {
@@ -3322,6 +3397,7 @@ fn build_worker_candidates(
             expected_slippage_bps,
             regime_eligible,
             regime_block_reason,
+            risk_override,
             score_parts,
             expected_hold_secs,
         });
@@ -4343,10 +4419,53 @@ mod tests {
             MarketRegime::TrendingUp,
             false,
             /* is_micro_active */ false,
+            /* is_swing_profile */ false,
         );
 
         assert!(candidates.iter().any(|c| c.action_id == "c42-scout"));
         assert!(candidates.iter().any(|c| c.action_id == "c42-dip_buyer"));
+    }
+
+    #[test]
+    fn swing_profile_sets_risk_override_for_risk_manager_only() {
+        let cfg = NpcConfig::from_trade_cfg(&TradeAgentConfig {
+            enabled: true,
+            trade_size: 1.0,
+            momentum_threshold: 0.001,
+            poll_interval: Duration::from_secs(1),
+            max_spread_bps: 5.0,
+        });
+        let rt = NpcRuntimeState::default();
+        let metrics = crate::signal::SignalMetrics {
+            mid: 50_000.0,
+            spread_bps: 1.0,
+            trade_samples: 12,
+            ..Default::default()
+        };
+        let candidates = build_worker_candidates(
+            &cfg,
+            7,
+            &rt,
+            &metrics,
+            0.0,
+            1_000.0,
+            0.0,
+            MarketRegime::TrendingUp,
+            false,
+            false,
+            true,
+        );
+        let risk_mgr = candidates.iter().find(|c| c.role == NpcRole::RiskManager).expect("risk_manager candidate");
+        assert!(risk_mgr.risk_override, "SWING must enable risk override for risk_manager");
+        assert!(!risk_mgr.regime_eligible, "TRENDING_UP is not in risk_manager allowlist");
+        assert!(
+            risk_mgr.regime_block_reason.as_deref().unwrap_or_default().contains("REGIME_MISMATCH"),
+            "regime mismatch should remain informational text for telemetry"
+        );
+        assert!(
+            candidates.iter().filter(|c| c.role != NpcRole::RiskManager).all(|c| !c.risk_override),
+            "only risk_manager should carry risk_override"
+        );
     }
 
     // ── AgentMode ─────────────────────────────────────────────────────────────
