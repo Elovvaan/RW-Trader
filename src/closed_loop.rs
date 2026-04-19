@@ -255,10 +255,8 @@ impl GitHubAutomation {
     pub fn push_or_open_pr(&self, branch: &str) -> Result<()> {
         run_git(&self.cfg.repo_path, &["push", "-u", "origin", branch])?;
         if self.cfg.mode == GitHubMode::PullRequest {
-            let _ = run_shell(
-                &self.cfg.repo_path,
-                "gh pr create --fill || true",
-            );
+            run_shell(&self.cfg.repo_path, "gh pr create --fill")
+                .context("failed to create pull request with gh CLI")?;
         }
         Ok(())
     }
@@ -294,6 +292,7 @@ fn run_shell(repo_path: &PathBuf, command: &str) -> Result<()> {
 }
 
 fn slugify(reason: &str) -> String {
+    const BRANCH_SLUG_LIMIT: usize = 48;
     let mut out = String::new();
     for ch in reason.chars() {
         if ch.is_ascii_alphanumeric() {
@@ -304,7 +303,7 @@ fn slugify(reason: &str) -> String {
             }
         }
     }
-    out.trim_matches('-').chars().take(48).collect()
+    out.trim_matches('-').chars().take(BRANCH_SLUG_LIMIT).collect()
 }
 
 #[derive(Debug, Clone)]
@@ -394,12 +393,22 @@ impl ClosedLoopController {
                     "[CLOSED_LOOP] Detected failure, applying auto-fix plan"
                 );
                 let branch = self.github.create_branch(&plan.reason)?;
+                let mut commands_ok = true;
                 for cmd in &plan.commands {
-                    let _ = run_shell(&self.github.cfg.repo_path, cmd);
+                    if let Err(e) = run_shell(&self.github.cfg.repo_path, cmd) {
+                        commands_ok = false;
+                        warn!(command = %cmd, error = %e, "[CLOSED_LOOP] Auto-fix command failed");
+                        break;
+                    }
+                }
+                if !commands_ok {
+                    continue;
                 }
                 self.github.commit_with_reason(&plan.reason)?;
                 self.github.push_or_open_pr(&branch)?;
                 self.deployer.trigger_deploy().await?;
+            } else {
+                warn!(attempt, "[CLOSED_LOOP] Validation pending, but no classified failures found");
             }
 
             let validation = self.validate().await?;
@@ -498,7 +507,7 @@ pub fn maybe_spawn_from_env(expected_profile: String, web_base_url: Option<Strin
     let enabled = std::env::var("CLOSED_LOOP_EXECUTION_ENABLED")
         .ok()
         .map(|v| v.eq_ignore_ascii_case("true"))
-        .unwrap_or(true);
+        .unwrap_or(false);
     if !enabled {
         warn!("[CLOSED_LOOP] CLOSED_LOOP_EXECUTION_ENABLED=false, controller disabled");
         return;
