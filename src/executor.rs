@@ -547,6 +547,16 @@ impl Executor {
         // ── Mutex released ────────────────────────────────────────────────────
 
         // ── Step 2: Exchange call (no lock held) ──────────────────────────────
+        let qty = qty_str.parse::<f64>().unwrap_or(0.0);
+        let notional = {
+            let t = truth.lock().await;
+            let px = t.position.mark_price.max(0.0);
+            if px > 0.0 { qty * px } else { 0.0 }
+        };
+        info!(
+            "DISPATCH_ATTEMPT {{ side: {}, qty: {:.8}, notional: {:.8}, symbol: {}, execution_mode: LIVE_SPOT }}",
+            side, qty, notional, symbol
+        );
         info!(
             coid  = client_order_id,
             side  = side,
@@ -559,6 +569,13 @@ impl Executor {
         // ── Step 3: Post-submission state update (lock held briefly) ──────────
         match &result {
             Ok(resp) => {
+                info!(
+                    "DISPATCH_RESULT {{ ORDER_SENT_TO_BINANCE: true, exchange_response: \"status={} order_id={} executed_qty={} cumulative_quote_qty={}\", reject_reason: \"\" }}",
+                    resp.status,
+                    resp.order_id,
+                    resp.executed_qty,
+                    resp.cumulative_quote_qty
+                );
                 let status     = OrderStatus::from_str(&resp.status);
                 let exchange_id = resp.order_id;
                 let filled_qty: f64 = resp.executed_qty.parse().unwrap_or(0.0);
@@ -621,6 +638,10 @@ impl Executor {
 
             Err(e) => {
                 let msg = e.to_string();
+                info!(
+                    "DISPATCH_RESULT {{ ORDER_SENT_TO_BINANCE: false, exchange_response: \"\", reject_reason: \"{}\" }}",
+                    msg
+                );
                 warn!(error = %msg, coid = client_order_id, "[EXEC] Submission failed");
 
                 let mut g = self.inner.lock().await;

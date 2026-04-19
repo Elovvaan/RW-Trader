@@ -225,12 +225,21 @@ async fn handle_post(path: &str, _query: &str, body: &str, state: &AppState) -> 
         let form = parse_form_body(body);
         let profile_str = form.get("profile").map(|s| s.as_str()).unwrap_or("ACTIVE");
         let new_profile = RuntimeProfile::from_str(profile_str);
+        let profile_cfg = ProfileConfig::for_profile(new_profile);
         if let Err(e) = persist_active_profile(new_profile) {
             return redirect_with_err("/assistant", &format!("Failed to persist runtime profile: {}", e));
         }
         *state.profile.lock().await = new_profile;
         state.npc.set_active_profile(new_profile).await;
-        *state.strategy.lock().await = StrategyEngine::with_profile(&ProfileConfig::for_profile(new_profile));
+        state
+            .npc
+            .set_interval_ms(profile_cfg.cycle_interval.as_millis().clamp(500, 2000) as u64)
+            .await;
+        {
+            let mut risk = state.risk.lock().await;
+            risk.config.cooldown_after_loss = profile_cfg.entry_cooldown_after_exit;
+        }
+        *state.strategy.lock().await = StrategyEngine::with_profile(&profile_cfg);
         log_ui_action(
             &*state.store,
             "ui_profile_changed",
@@ -334,6 +343,12 @@ async fn handle_post(path: &str, _query: &str, body: &str, state: &AppState) -> 
         {
             let t = state.truth.lock().await;
             let side_free = t.available_balance_for_side(&side);
+            if side == "SELL" && t.position.size <= 0.0 {
+                return redirect_with_err(
+                    "/authority",
+                    "POSITION_ZERO_SELL_BLOCK: position == 0, SELL is blocked.",
+                );
+            }
             if side_free <= 0.0 {
                 let msg = if side == "BUY" {
                     "Insufficient BUY balance: quote-asset buy power is 0."
@@ -366,6 +381,19 @@ async fn handle_post(path: &str, _query: &str, body: &str, state: &AppState) -> 
         };
         let order_side = if side == "BUY" { risk::OrderSide::Buy } else { risk::OrderSide::Sell };
         let expected_price = market_snapshot.ask;
+        let min_notional = (size * expected_price.max(0.0)).max(0.0);
+        if side == "BUY" {
+            let buy_power = { state.truth.lock().await.buy_power.max(0.0) };
+            if buy_power + f64::EPSILON < min_notional {
+                return redirect_with_err(
+                    "/authority",
+                    &format!(
+                        "USDT_BELOW_MIN_NOTIONAL: available_usdt={:.8} < min_notional={:.8}",
+                        buy_power, min_notional
+                    ),
+                );
+            }
+        }
         let proposed = risk::ProposedOrder {
             symbol: symbol.clone(),
             side: order_side,
@@ -730,7 +758,7 @@ async fn agent_status_json(state: &AppState) -> String {
     let override_used = snap.last_agent_decision.contains("override_used=true")
         || snap.last_no_trade_reason.contains("override_used=true");
     let body = format!(
-        r#"{{"mode":"{mode_str}","state":"{state_label}","agent_state":"{status_str}","last_action":"{last_action}","last_reason":"{last_reason}","last_agent_decision":"{last_decision}","last_no_trade_reason":"{no_trade_reason}","pipeline_state":"{pipeline}","final_decision":"{final_decision}","balance_block_reason":"{balance_block}","risk_block_reason":"{risk_block}","execution_block_reason":"{exec_block}","max_concurrent_positions":{max_concurrent_positions},"counted_open_positions":{counted_open_positions},"counted_pending_orders":{counted_pending_orders},"counted_reserved_slots":{counted_reserved_slots},"slot_block_reason":"{slot_block_reason}","slot_source_ids":"{slot_source_ids}","risk_override":{risk_override},"regime_override":{regime_override},"active_profile":"{active_profile}","active_profile_label":"{active_profile_label}","profile_source":"{profile_source}","strategy_profile_bound":"{strategy_profile_bound}","PROFILE_LOCK":"{profile_lock}","execution_mode":"{execution_mode}","paper_mode_enabled":{paper_mode_enabled},"contract_executor_enabled":{contract_executor_enabled},"live_ready":{live_ready},"feed_warmed_up":{feed_warmed_up},"exchange_ready":{exchange_ready},"sizing_ready":{sizing_ready},"final_live_blocker_reason":"{final_live_blocker_reason}","ORDER_SENT_TO_BINANCE":{order_sent_to_binance},"last_live_order_result":"{last_live_order_result}","current_equity":{current_equity},"peak_equity":{peak_equity},"drawdown_pct":{drawdown_pct},"drawdown_limit":{drawdown_limit},"cycle_count":{cycle_count},"running":{running},"cooldown_active":{cooldown_active},"cooldown_remaining_ms":{cooldown_remaining_ms},"effective_threshold":{effective_threshold},"threshold_mode":"{threshold_mode}","raw_score":{raw_score},"adjusted_score":{adjusted_score},"threshold_used":{threshold_used},"penalty_clamped":{penalty_clamped},"override_used":{override_used},"compound_position_size_usd":{compound_pos_usd},"compound_position_size_btc":{compound_pos_btc},"compound_last_trade_pnl":{compound_last_pnl},"compound_session_pnl":{compound_sess_pnl},"compound_peak_balance":{compound_peak_bal},"compound_current_balance":{compound_cur_bal},"compound_consecutive_losses":{compound_consec},"compound_size_scalar":{compound_scalar},"compound_loss_pause_active":{compound_paused},"raw_position_size_usd":{raw_position_size_usd},"adjusted_position_size_usd":{adjusted_position_size_usd},"min_notional":{min_notional},"sizing_adjustment_reason":"{sizing_adjustment_reason}","sizing_bumped":{sizing_bumped},"flip_cycle_phase":"{flip_cycle_phase}","flip_session_pnl":{flip_session_pnl},"flip_rotation_count":{flip_rotation_count},"flip_last_entry_price":{flip_last_entry_price},"flip_last_exit_price":{flip_last_exit_price},"flip_last_pnl_usd":{flip_last_pnl_usd},"flip_last_pnl_pct":{flip_last_pnl_pct},"flip_min_profit_floor":{flip_min_profit_floor},"flip_blocker":"{flip_blocker}","contract_side":"{contract_side}","contract_leverage":{contract_leverage},"contract_entry_price":{contract_entry_price},"contract_mark_price":{contract_mark_price},"contract_notional_usd":{contract_notional_usd},"contract_unrealized_pnl":{contract_unrealized_pnl},"contract_realized_pnl_session":{contract_realized_pnl_session},"contract_liquidation_price":{contract_liquidation_price},"contract_stop_loss":{contract_stop_loss},"contract_take_profit":{contract_take_profit},"contract_liquidation_buffer_pct":{contract_liquidation_buffer_pct},"contract_duration_secs":{contract_duration_secs},"contract_exit_reason":"{contract_exit_reason}","contract_last_trade_result":{contract_last_trade_result},"contract_paper_mode":{contract_paper_mode},"contract_last_no_open_reason":"{contract_last_no_open_reason}","rebalance_status":"{rebalance_status}","rebalance_triggered":{rebalance_triggered},"rebalance_reason":"{rebalance_reason}","rebalance_side":"{rebalance_side}","rebalance_qty":{rebalance_qty},"rebalance_value_usd":{rebalance_value_usd},"free_usdt_before":{free_usdt_before},"free_usdt_after":{free_usdt_after},"btc_before":{btc_before},"btc_after":{btc_after},"final_blocker_reason":"{final_blocker_reason}"}}"#,
+        r#"{{"mode":"{mode_str}","state":"{state_label}","agent_state":"{status_str}","last_action":"{last_action}","last_reason":"{last_reason}","last_agent_decision":"{last_decision}","last_no_trade_reason":"{no_trade_reason}","pipeline_state":"{pipeline}","final_decision":"{final_decision}","balance_block_reason":"{balance_block}","risk_block_reason":"{risk_block}","execution_block_reason":"{exec_block}","max_concurrent_positions":{max_concurrent_positions},"counted_open_positions":{counted_open_positions},"counted_pending_orders":{counted_pending_orders},"counted_reserved_slots":{counted_reserved_slots},"slot_block_reason":"{slot_block_reason}","slot_source_ids":"{slot_source_ids}","risk_override":{risk_override},"regime_override":{regime_override},"active_profile":"{active_profile}","active_profile_label":"{active_profile_label}","profile_source":"{profile_source}","strategy_profile_bound":"{strategy_profile_bound}","PROFILE_LOCK":"{profile_lock}","execution_mode":"{execution_mode}","paper_mode_enabled":{paper_mode_enabled},"contract_executor_enabled":{contract_executor_enabled},"live_ready":{live_ready},"feed_warmed_up":{feed_warmed_up},"exchange_ready":{exchange_ready},"sizing_ready":{sizing_ready},"final_live_blocker_reason":"{final_live_blocker_reason}","ORDER_SENT_TO_BINANCE":{order_sent_to_binance},"last_live_order_result":"{last_live_order_result}","last_reject_reason":"{last_reject_reason}","current_equity":{current_equity},"peak_equity":{peak_equity},"drawdown_pct":{drawdown_pct},"drawdown_limit":{drawdown_limit},"cycle_count":{cycle_count},"running":{running},"cooldown_active":{cooldown_active},"cooldown_remaining_ms":{cooldown_remaining_ms},"effective_threshold":{effective_threshold},"threshold_mode":"{threshold_mode}","raw_score":{raw_score},"adjusted_score":{adjusted_score},"threshold_used":{threshold_used},"penalty_clamped":{penalty_clamped},"override_used":{override_used},"compound_position_size_usd":{compound_pos_usd},"compound_position_size_btc":{compound_pos_btc},"compound_last_trade_pnl":{compound_last_pnl},"compound_session_pnl":{compound_sess_pnl},"compound_peak_balance":{compound_peak_bal},"compound_current_balance":{compound_cur_bal},"compound_consecutive_losses":{compound_consec},"compound_size_scalar":{compound_scalar},"compound_loss_pause_active":{compound_paused},"raw_position_size_usd":{raw_position_size_usd},"adjusted_position_size_usd":{adjusted_position_size_usd},"min_notional":{min_notional},"sizing_adjustment_reason":"{sizing_adjustment_reason}","sizing_bumped":{sizing_bumped},"flip_cycle_phase":"{flip_cycle_phase}","flip_session_pnl":{flip_session_pnl},"flip_rotation_count":{flip_rotation_count},"flip_last_entry_price":{flip_last_entry_price},"flip_last_exit_price":{flip_last_exit_price},"flip_last_pnl_usd":{flip_last_pnl_usd},"flip_last_pnl_pct":{flip_last_pnl_pct},"flip_min_profit_floor":{flip_min_profit_floor},"flip_blocker":"{flip_blocker}","contract_side":"{contract_side}","contract_leverage":{contract_leverage},"contract_entry_price":{contract_entry_price},"contract_mark_price":{contract_mark_price},"contract_notional_usd":{contract_notional_usd},"contract_unrealized_pnl":{contract_unrealized_pnl},"contract_realized_pnl_session":{contract_realized_pnl_session},"contract_liquidation_price":{contract_liquidation_price},"contract_stop_loss":{contract_stop_loss},"contract_take_profit":{contract_take_profit},"contract_liquidation_buffer_pct":{contract_liquidation_buffer_pct},"contract_duration_secs":{contract_duration_secs},"contract_exit_reason":"{contract_exit_reason}","contract_last_trade_result":{contract_last_trade_result},"contract_paper_mode":{contract_paper_mode},"contract_last_no_open_reason":"{contract_last_no_open_reason}","rebalance_status":"{rebalance_status}","rebalance_triggered":{rebalance_triggered},"rebalance_reason":"{rebalance_reason}","rebalance_side":"{rebalance_side}","rebalance_qty":{rebalance_qty},"rebalance_value_usd":{rebalance_value_usd},"free_usdt_before":{free_usdt_before},"free_usdt_after":{free_usdt_after},"btc_before":{btc_before},"btc_after":{btc_after},"final_blocker_reason":"{final_blocker_reason}"}}"#,
         current_equity  = snap.current_equity,
         peak_equity     = snap.peak_equity,
         drawdown_pct    = snap.drawdown_pct,
@@ -768,6 +796,7 @@ async fn agent_status_json(state: &AppState) -> String {
         final_live_blocker_reason = snap.final_live_blocker_reason.replace('"', "\\\""),
         order_sent_to_binance = snap.order_sent_to_binance,
         last_live_order_result = snap.last_live_order_result.replace('"', "\\\""),
+        last_reject_reason = snap.last_reject_reason.replace('"', "\\\""),
         compound_pos_usd   = snap.compound_position_size_usd,
         compound_pos_btc   = snap.compound_position_size_btc,
         compound_last_pnl  = snap.compound_last_trade_pnl,
@@ -1250,7 +1279,7 @@ async fn page_events(state: &AppState, query: &str) -> String {
           <div class='sum'>active_profile={} • active_profile_label={} • profile_source={} • strategy_profile_bound={}</div>\
           <div class='sum'>execution_mode={} • paper_mode_enabled={} • contract_executor_enabled={}</div>\
           <div class='sum'>live_ready={} • feed_warmed_up={} • exchange_ready={} • sizing_ready={}</div>\
-          <div class='sum'>final_live_blocker_reason={} • ORDER_SENT_TO_BINANCE={} • last_live_order_result={}</div>\
+          <div class='sum'>final_live_blocker_reason={} • ORDER_SENT_TO_BINANCE={} • last_live_order_result={} • last_reject_reason={}</div>\
         </div>\
         <div class='sr-only'>SELL READY BUY READY BUY DISABLED (NO USDT) Latest recommendation summary Recent event context</div>",
         format_usd(total_balance_usd),
@@ -1282,7 +1311,8 @@ async fn page_events(state: &AppState, query: &str) -> String {
         npc_loop.sizing_ready,
         esc(&npc_loop.final_live_blocker_reason),
         npc_loop.order_sent_to_binance,
-        esc(&npc_loop.last_live_order_result)
+        esc(&npc_loop.last_live_order_result),
+        esc(&npc_loop.last_reject_reason)
     );
 
     let buy_btn_attrs = if buy_btn_enabled {
@@ -3606,6 +3636,7 @@ mod tests {
         assert!(r.contains("\"final_live_blocker_reason\""), "JSON must contain final_live_blocker_reason");
         assert!(r.contains("\"ORDER_SENT_TO_BINANCE\""), "JSON must contain ORDER_SENT_TO_BINANCE");
         assert!(r.contains("\"last_live_order_result\""), "JSON must contain last_live_order_result");
+        assert!(r.contains("\"last_reject_reason\""), "JSON must contain last_reject_reason");
         assert!(r.contains("\"max_concurrent_positions\""), "JSON must contain max_concurrent_positions");
         assert!(r.contains("\"counted_open_positions\""), "JSON must contain counted_open_positions");
         assert!(r.contains("\"counted_pending_orders\""), "JSON must contain counted_pending_orders");
@@ -3803,6 +3834,61 @@ mod tests {
         assert!(
             !resp.contains("executor%20is%20busy") && !resp.contains("executor is busy"),
             "Must not return idempotency-guard error (executor is Idle)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trade_request_sell_blocked_when_position_zero() {
+        let state = make_state_gates_clear_failing_client();
+        state.exec.set_mode_reconciling().await;
+        state.exec.set_mode_ready().await;
+        state.authority.set_mode_auto(&*state.store).await;
+        {
+            let mut truth = state.truth.lock().await;
+            truth.sell_inventory = 0.001;
+            truth.position.size = 0.0;
+            truth.state_dirty = false;
+            truth.last_reconciled_at = Some(std::time::Instant::now());
+            truth.position.mark_price = 50_000.0;
+        }
+        let resp = handle_post(
+            "/trade/request",
+            "",
+            "symbol=BTCUSDT&side=SELL&size=0.001&reason=diagnostic_test",
+            &state,
+        )
+        .await;
+        assert!(
+            resp.contains("POSITION_ZERO_SELL_BLOCK"),
+            "SELL with position==0 must be explicitly rejected; got: {}",
+            &resp[..resp.len().min(300)]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trade_request_buy_blocked_when_usdt_below_min_notional() {
+        let state = make_state_gates_clear_failing_client();
+        state.exec.set_mode_reconciling().await;
+        state.exec.set_mode_ready().await;
+        state.authority.set_mode_auto(&*state.store).await;
+        {
+            let mut truth = state.truth.lock().await;
+            truth.buy_power = 10.0;
+            truth.state_dirty = false;
+            truth.last_reconciled_at = Some(std::time::Instant::now());
+            truth.position.mark_price = 50_000.0;
+        }
+        let resp = handle_post(
+            "/trade/request",
+            "",
+            "symbol=BTCUSDT&side=BUY&size=0.001&reason=diagnostic_test",
+            &state,
+        )
+        .await;
+        assert!(
+            resp.contains("USDT_BELOW_MIN_NOTIONAL"),
+            "BUY with insufficient USDT must be explicitly rejected; got: {}",
+            &resp[..resp.len().min(300)]
         );
     }
 

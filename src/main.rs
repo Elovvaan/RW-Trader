@@ -479,6 +479,12 @@ async fn main() -> Result<()> {
     let mut npc_cfg = npc::NpcConfig::from_trade_cfg(&trade_cfg);
     npc_cfg.behavior_profile = runtime_profile.as_str().to_string();
     npc_cfg.profile_source = profile_source;
+    if npc_cfg.mode != npc::NpcTradingMode::Live {
+        anyhow::bail!(
+            "Startup blocked: NPC_TRADING_MODE='{}' is non-live. Only LIVE_SPOT execution is allowed.",
+            npc_cfg.mode.as_str()
+        );
+    }
     let npc_controller = Arc::new(npc::NpcAutonomousController::new(
         npc_cfg,
         agent::AgentState {
