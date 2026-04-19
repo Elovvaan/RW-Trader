@@ -88,6 +88,11 @@ impl RuntimeProfile {
         Self::parse_known(s).unwrap_or_default()
     }
 
+    /// Strict parse that never falls back to a default profile.
+    pub fn parse_strict(s: &str) -> Option<Self> {
+        Self::parse_known(s)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Conservative => "CONSERVATIVE",

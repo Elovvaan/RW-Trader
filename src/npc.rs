@@ -134,7 +134,7 @@ pub enum NpcTradingMode {
 
 impl NpcTradingMode {
     fn from_env() -> Self {
-        let mode = std::env::var("NPC_TRADING_MODE").unwrap_or_else(|_| "paper".to_string());
+        let mode = std::env::var("NPC_TRADING_MODE").unwrap_or_else(|_| "live".to_string());
         match mode.to_ascii_lowercase().as_str() {
             "simulation" | "sim" => Self::Simulation,
             "live" => Self::Live,
@@ -142,7 +142,7 @@ impl NpcTradingMode {
         }
     }
 
-    fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::Simulation => "simulation",
             Self::Paper => "paper",
@@ -678,6 +678,7 @@ struct NpcRuntimeState {
     rebalance_cooldown_until: Option<Instant>,
     order_sent_to_binance: bool,
     last_live_order_result: String,
+    last_reject_reason: String,
 }
 
 impl Default for NpcRuntimeState {
@@ -746,6 +747,7 @@ impl Default for NpcRuntimeState {
             rebalance_cooldown_until: None,
             order_sent_to_binance: false,
             last_live_order_result: String::new(),
+            last_reject_reason: String::new(),
         }
     }
 }
@@ -799,6 +801,7 @@ pub struct NpcLoopSnapshot {
     pub contract_executor_enabled: bool,
     pub order_sent_to_binance: bool,
     pub last_live_order_result: String,
+    pub last_reject_reason: String,
     pub max_concurrent_positions: usize,
     pub counted_open_positions: usize,
     pub counted_pending_orders: usize,
@@ -1053,6 +1056,7 @@ impl NpcAutonomousController {
             rt.rebalance_cooldown_until = None;
             rt.order_sent_to_binance = false;
             rt.last_live_order_result.clear();
+            rt.last_reject_reason.clear();
         }
         {
             let mut t = self.telemetry.lock().await;
@@ -1184,7 +1188,7 @@ impl NpcAutonomousController {
                 && feed.mid_history.len() >= signal.config.min_mid_samples
                 && feed.trade_history.len() >= signal.config.min_trade_samples
         };
-        let (current_equity, peak_equity, drawdown_pct, compound, sizing, flip, contract, rebalance, contract_last_no_open_reason, slot_usage, order_sent_to_binance, last_live_order_result) = {
+        let (current_equity, peak_equity, drawdown_pct, compound, sizing, flip, contract, rebalance, contract_last_no_open_reason, slot_usage, order_sent_to_binance, last_live_order_result, last_reject_reason) = {
             // Compute current equity and drawdown from runtime state (same formula as evaluate_portfolio_controls).
             let rt = self.runtime.lock().await;
             let aggregate_pnl: f64 = rt.perf.values().map(|p| p.gross_pnl).sum();
@@ -1323,6 +1327,7 @@ impl NpcAutonomousController {
                 slot_usage,
                 rt.order_sent_to_binance,
                 rt.last_live_order_result.clone(),
+                rt.last_reject_reason.clone(),
             )
         };
         let (
@@ -1372,10 +1377,17 @@ impl NpcAutonomousController {
             contract_last_trade_result,
             contract_paper_mode,
         ) = contract;
-        let active_profile = RuntimeProfile::from_str(&cfg.behavior_profile);
+        let parsed_behavior_profile = RuntimeProfile::parse_strict(&cfg.behavior_profile);
+        let active_profile = parsed_behavior_profile.unwrap_or_default();
+        let active_profile_display = parsed_behavior_profile
+            .map(|profile| profile.to_string())
+            .unwrap_or_else(|| format!("INVALID_PROFILE:{}", cfg.behavior_profile));
+        let invalid_behavior_profile = parsed_behavior_profile.is_none();
         let execution_mode = ExecutionMode::from_trading_mode(cfg.mode);
         let paper_mode_enabled = execution_mode == ExecutionMode::Paper;
-        let contract_executor_enabled = paper_mode_enabled && active_profile == RuntimeProfile::Swing;
+        let contract_executor_enabled = paper_mode_enabled
+            && !invalid_behavior_profile
+            && active_profile == RuntimeProfile::Swing;
         let exchange_ready = exec_system_mode.can_trade() && matches!(exec_state, ExecutionState::Idle);
         let balance_ready = truth_can_place_order
             && truth_total_balance_usd.is_finite()
@@ -1446,6 +1458,7 @@ impl NpcAutonomousController {
             contract_executor_enabled,
             order_sent_to_binance,
             last_live_order_result,
+            last_reject_reason,
             max_concurrent_positions: slot_usage.max_concurrent_positions,
             counted_open_positions: slot_usage.counted_open_positions,
             counted_pending_orders: slot_usage.counted_pending_orders,
@@ -2336,7 +2349,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             cooldown_active: false,
             cooldown_remaining_ms: 0,
             effective_threshold,
-            threshold_mode: threshold_mode.to_string(),
+            threshold_mode: "non_live".to_string(),
             raw_score: 0.0,
             normalized_score: 0.0,
             top_score_penalties: String::new(),
@@ -2350,8 +2363,72 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
     let exec_system_mode = state.exec.system_mode().await;
     let pending = state.authority.pending_proposals().await;
 
-    let active_profile = RuntimeProfile::from_str(&cfg.behavior_profile);
+    let Some(active_profile) = RuntimeProfile::parse_strict(&cfg.behavior_profile) else {
+        let reason = format!("INVALID_PROFILE:{}", cfg.behavior_profile);
+        log_npc_event(
+            &*state.store,
+            "profile_lock",
+            &reason,
+        );
+        return NpcCycleReport {
+            cycle_id: 0,
+            last_action: "NO_ACTION".to_string(),
+            execution_result: reason.clone(),
+            status: "blocked".to_string(),
+            last_agent_decision: "BLOCKED — invalid runtime profile binding".to_string(),
+            no_trade_reason: format!(
+                "Runtime profile '{}' is invalid. Refusing to fallback silently.",
+                cfg.behavior_profile
+            ),
+            pipeline_state: "Blocked — Invalid Profile".to_string(),
+            final_decision: "BLOCKED".to_string(),
+            balance_block_reason: String::new(),
+            risk_block_reason: String::new(),
+            execution_block_reason: reason.clone(),
+            cooldown_active: false,
+            cooldown_remaining_ms: 0,
+            effective_threshold: THRESHOLD_BASE,
+            threshold_mode: "invalid_profile".to_string(),
+            raw_score: 0.0,
+            normalized_score: 0.0,
+            top_score_penalties: String::new(),
+            regime_override: false,
+            final_blocker_reason: reason,
+            sizing_bumped: false,
+        };
+    };
     let execution_mode = ExecutionMode::from_trading_mode(cfg.mode);
+    if execution_mode != ExecutionMode::LiveSpot {
+        let reason = format!("NON_LIVE_PATH_DETECTED:{}", execution_mode.as_str());
+        log_npc_event(
+            &*state.store,
+            "live_order_dispatch",
+            &format!("DISPATCH_RESULT {{ ORDER_SENT_TO_BINANCE: false, exchange_response: \"\", reject_reason: \"{}\" }}", reason),
+        );
+        return NpcCycleReport {
+            cycle_id: 0,
+            last_action: "NO_ACTION".to_string(),
+            execution_result: reason.clone(),
+            status: "blocked".to_string(),
+            last_agent_decision: "BLOCKED — non-live execution path detected".to_string(),
+            no_trade_reason: "Only LIVE_SPOT execution mode is allowed.".to_string(),
+            pipeline_state: "Blocked — Non-live path".to_string(),
+            final_decision: "BLOCKED".to_string(),
+            balance_block_reason: String::new(),
+            risk_block_reason: String::new(),
+            execution_block_reason: reason.clone(),
+            cooldown_active: false,
+            cooldown_remaining_ms: 0,
+            effective_threshold: THRESHOLD_BASE,
+            threshold_mode: threshold_mode.to_string(),
+            raw_score: 0.0,
+            normalized_score: 0.0,
+            top_score_penalties: String::new(),
+            regime_override: false,
+            final_blocker_reason: reason,
+            sizing_bumped: false,
+        };
+    }
     let (effective_threshold, threshold_mode) =
         profile_threshold(active_profile, total_balance_usd, cfg.mode);
     let is_micro_safe_execution = active_profile == RuntimeProfile::MicroSafeExecution;
@@ -2366,6 +2443,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
 
     let mut rt = runtime.lock().await;
     rt.order_sent_to_binance = false;
+    rt.last_reject_reason.clear();
     rt.cycle_seq = rt.cycle_seq.saturating_add(1);
     let cycle_id = rt.cycle_seq;
     if metrics.mid.is_finite() && metrics.mid > 0.0 {
@@ -3383,6 +3461,10 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             allocation.reason, SWING_WEAK_SIGNAL_SIZE_SCALE, weak_signal_fallback_reason
         );
     }
+    let bootstrap_rebalance_sell = rt.rebalance_triggered
+        && rt.rebalance_side.eq_ignore_ascii_case("SELL")
+        && buy_power < required_trade_capital
+        && sell_inventory > REBALANCE_DUST_QTY;
     rt.sizing_raw_position_size_usd = allocation.raw_position_size_usd;
     rt.sizing_adjusted_position_size_usd = allocation.adjusted_position_size_usd;
     rt.sizing_min_notional_usd = allocation.min_notional;
@@ -3558,6 +3640,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         sell_inventory,
         order_notional,
         is_micro_active,
+        bootstrap_rebalance_sell,
     );
     if !guard_reasons.is_empty() {
         lifecycle(
@@ -3781,144 +3864,136 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         ),
     );
 
-    if effective_cfg.mode == NpcTradingMode::Live {
-        let signal_cfg = { state.signal.lock().await.config.clone() };
-        let feed_warmed_up = {
-            let feed = state.feed.lock().await;
-            feed.last_seen.is_some()
-                && feed.is_fresh(signal_cfg.max_feed_staleness)
-                && feed.bid.is_finite()
-                && feed.ask.is_finite()
-                && feed.bid > 0.0
-                && feed.ask > 0.0
-                && feed.mid_history.len() >= signal_cfg.min_mid_samples
-                && feed.trade_history.len() >= signal_cfg.min_trade_samples
-        };
-        let exchange_ready = exec_system_mode.can_trade() && matches!(exec_state, ExecutionState::Idle);
-        let balance_ready = total_balance_usd.is_finite()
-            && total_balance_usd > 0.0
-            && (buy_power > 0.0 || sell_inventory > 0.0);
-        let sizing_ready = allocation.qty.is_finite()
-            && allocation.qty > 0.0
-            && order_notional.is_finite()
-            && allocation.min_notional.is_finite()
-            && order_notional >= allocation.min_notional.max(MIN_TRADE_NOTIONAL_USD);
-        let risk_ready = !effective_cfg.guards.kill_switch
-            && portfolio_controls.is_empty()
-            && guard_reasons.is_empty();
-        let valid_side = chosen.side == "BUY" || chosen.side == "SELL";
-        let execution_mode_ready = execution_mode == ExecutionMode::LiveSpot;
-        let blocker = if mode != AuthorityMode::Auto {
-            "AUTHORITY_NOT_AUTO"
-        } else if !execution_mode_ready {
-            "EXECUTION_MODE_NOT_LIVE_SPOT"
-        } else if !feed_warmed_up {
-            "FEED_NOT_WARMED_UP"
-        } else if !exchange_ready {
-            "EXCHANGE_UNAVAILABLE"
-        } else if !balance_ready {
-            "BALANCE_NOT_READY"
-        } else if !valid_side {
-            "INVALID_SIDE_NOT_SPOT_COMPATIBLE"
-        } else if !sizing_ready {
-            "INVALID_SIZE_OR_NOTIONAL"
-        } else if !risk_ready {
-            "RISK_HARD_RAIL_BLOCK"
-        } else {
-            ""
-        };
+    let signal_cfg = { state.signal.lock().await.config.clone() };
+    let feed_warmed_up = {
+        let feed = state.feed.lock().await;
+        feed.last_seen.is_some()
+            && feed.is_fresh(signal_cfg.max_feed_staleness)
+            && feed.bid.is_finite()
+            && feed.ask.is_finite()
+            && feed.bid > 0.0
+            && feed.ask > 0.0
+            && feed.mid_history.len() >= signal_cfg.min_mid_samples
+            && feed.trade_history.len() >= signal_cfg.min_trade_samples
+    };
+    let exchange_ready = exec_system_mode.can_trade() && matches!(exec_state, ExecutionState::Idle);
+    let balance_ready = total_balance_usd.is_finite()
+        && total_balance_usd > 0.0
+        && (buy_power > 0.0 || sell_inventory > 0.0);
+    let sizing_ready = allocation.qty.is_finite()
+        && allocation.qty > 0.0
+        && order_notional.is_finite()
+        && allocation.min_notional.is_finite()
+        && order_notional >= allocation.min_notional.max(MIN_TRADE_NOTIONAL_USD);
+    let risk_ready = !effective_cfg.guards.kill_switch
+        && portfolio_controls.is_empty()
+        && guard_reasons.is_empty();
+    let valid_side = chosen.side == "BUY" || chosen.side == "SELL";
+    let execution_mode_ready = execution_mode == ExecutionMode::LiveSpot;
+    let buy_min_notional = allocation.min_notional.max(MIN_TRADE_NOTIONAL_USD);
+    let sell_flat_block = chosen.side == "SELL" && position_size <= 0.0 && !bootstrap_rebalance_sell;
+    let buy_min_notional_block = chosen.side == "BUY" && buy_power < buy_min_notional;
+    let blocker = if mode != AuthorityMode::Auto {
+        "AUTHORITY_NOT_AUTO".to_string()
+    } else if !execution_mode_ready {
+        "EXECUTION_MODE_NOT_LIVE_SPOT".to_string()
+    } else if !feed_warmed_up {
+        "FEED_NOT_WARMED_UP".to_string()
+    } else if !exchange_ready {
+        "EXCHANGE_UNAVAILABLE".to_string()
+    } else if sell_flat_block {
+        "POSITION_ZERO_SELL_BLOCK".to_string()
+    } else if buy_min_notional_block {
+        format!(
+            "USDT_BELOW_MIN_NOTIONAL:available_usdt={:.8}<min_notional={:.8}",
+            buy_power, buy_min_notional
+        )
+    } else if !balance_ready {
+        "BALANCE_NOT_READY".to_string()
+    } else if !valid_side {
+        "INVALID_SIDE_NOT_SPOT_COMPATIBLE".to_string()
+    } else if !sizing_ready {
+        "INVALID_SIZE_OR_NOTIONAL".to_string()
+    } else if !risk_ready {
+        "RISK_HARD_RAIL_BLOCK".to_string()
+    } else {
+        String::new()
+    };
 
-        if !blocker.is_empty() {
-            rt.order_sent_to_binance = false;
-            rt.last_live_order_result = format!(
-                "ORDER_SENT_TO_BINANCE=false side={} qty={:.8} notional={:.8} rejection_reason={}",
-                chosen.side, allocation.qty, order_notional, blocker
-            );
-            log_npc_event(
-                &*state.store,
-                "live_order_dispatch",
-                &rt.last_live_order_result,
-            );
-            let block_reason = format!("LIVE_NOT_READY:{}", blocker);
-            lifecycle(
-                &*state.store,
-                chosen.role,
-                &chosen.action_id,
-                NpcLifecycleState::Rejected,
-                &block_reason,
-            );
-            rt.perf.entry(chosen.role).or_default().blocked += 1;
-            observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
-            return NpcCycleReport {
-                cycle_id,
-                last_action: "NO_ACTION".to_string(),
-                execution_result: block_reason.clone(),
-                status: "blocked".to_string(),
-                last_agent_decision: format!(
-                    "HOLD — {} {} authorized but blocked: {}",
-                    chosen.side.to_uppercase(),
-                    chosen.role.as_str(),
-                    blocker
-                ),
-                no_trade_reason: format!("Live readiness block: {}", blocker),
-                pipeline_state: "Trigger Matched — Blocked".to_string(),
-                final_decision: "BLOCKED".to_string(),
-                balance_block_reason: if blocker == "BALANCE_NOT_READY" {
-                    blocker.to_string()
-                } else {
-                    String::new()
-                },
-                risk_block_reason: if blocker == "RISK_HARD_RAIL_BLOCK" {
-                    blocker.to_string()
-                } else {
-                    String::new()
-                },
-                execution_block_reason: if blocker == "BALANCE_NOT_READY" || blocker == "RISK_HARD_RAIL_BLOCK" {
-                    String::new()
-                } else {
-                    block_reason
-                },
-                cooldown_active: false,
-                cooldown_remaining_ms: 0,
-                effective_threshold: effective_cutoff,
-                threshold_mode: threshold_mode.to_string(),
-                raw_score: chosen.raw_score,
-                normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
-                top_score_penalties: chosen.score_parts.top_penalties_str(),
-                regime_override: false,
-                final_blocker_reason: blocker.to_string(),
-                sizing_bumped: false,
-            };
-        }
+    if !blocker.is_empty() {
+        rt.order_sent_to_binance = false;
+        rt.last_reject_reason = blocker.clone();
+        rt.last_live_order_result = format!(
+            "DISPATCH_RESULT {{ ORDER_SENT_TO_BINANCE: false, exchange_response: \"\", reject_reason: \"{}\" }}",
+            blocker
+        );
+        log_npc_event(
+            &*state.store,
+            "live_order_dispatch",
+            &rt.last_live_order_result,
+        );
+        let block_reason = format!("LIVE_NOT_READY:{}", blocker);
+        lifecycle(
+            &*state.store,
+            chosen.role,
+            &chosen.action_id,
+            NpcLifecycleState::Rejected,
+            &block_reason,
+        );
+        rt.perf.entry(chosen.role).or_default().blocked += 1;
+        observe_and_learn(&effective_cfg, &mut rt, &*state.store, metrics.mid);
+        return NpcCycleReport {
+            cycle_id,
+            last_action: "NO_ACTION".to_string(),
+            execution_result: block_reason.clone(),
+            status: "blocked".to_string(),
+            last_agent_decision: format!(
+                "HOLD — {} {} authorized but blocked: {}",
+                chosen.side.to_uppercase(),
+                chosen.role.as_str(),
+                blocker
+            ),
+            no_trade_reason: format!("Live readiness block: {}", blocker),
+            pipeline_state: "Trigger Matched — Blocked".to_string(),
+            final_decision: "BLOCKED".to_string(),
+            balance_block_reason: if blocker.starts_with("USDT_BELOW_MIN_NOTIONAL") || blocker == "BALANCE_NOT_READY" {
+                blocker.clone()
+            } else {
+                String::new()
+            },
+            risk_block_reason: if blocker == "RISK_HARD_RAIL_BLOCK" {
+                blocker.clone()
+            } else {
+                String::new()
+            },
+            execution_block_reason: if blocker.starts_with("USDT_BELOW_MIN_NOTIONAL")
+                || blocker == "BALANCE_NOT_READY"
+                || blocker == "RISK_HARD_RAIL_BLOCK" {
+                String::new()
+            } else {
+                block_reason
+            },
+            cooldown_active: false,
+            cooldown_remaining_ms: 0,
+            effective_threshold: effective_cutoff,
+            threshold_mode: threshold_mode.to_string(),
+            raw_score: chosen.raw_score,
+            normalized_score: chosen.raw_score / effective_cutoff.max(f64::EPSILON),
+            top_score_penalties: chosen.score_parts.top_penalties_str(),
+            regime_override: false,
+            final_blocker_reason: blocker,
+            sizing_bumped: false,
+        };
     }
 
     lifecycle(&*state.store, chosen.role, &chosen.action_id, NpcLifecycleState::Queued, "ready for dispatch");
 
-    if effective_cfg.mode == NpcTradingMode::Simulation
-        || (effective_cfg.mode != NpcTradingMode::Live && is_micro_safe_execution)
-    {
-        lifecycle(
-            &*state.store,
-            chosen.role,
-            &chosen.action_id,
-            NpcLifecycleState::Executing,
-            "simulation mode dispatch",
-        );
-        lifecycle(
-            &*state.store,
-            chosen.role,
-            &chosen.action_id,
-            NpcLifecycleState::Executed,
-            "simulation fill accepted",
-        );
-        rt.last_action_at.insert(chosen.role, Instant::now());
-        rt.perf.entry(chosen.role).or_default().executed += 1;
-    } else {
-        let Some(url) = state.web_base_url.as_ref().map(|b| format!("{}/trade/request", b)) else {
+    let Some(url) = state.web_base_url.as_ref().map(|b| format!("{}/trade/request", b)) else {
             rt.order_sent_to_binance = false;
+            rt.last_reject_reason = "WEB_UI_ADDR_MISSING".to_string();
             rt.last_live_order_result = format!(
-                "ORDER_SENT_TO_BINANCE=false side={} qty={:.8} notional={:.8} rejection_reason=WEB_UI_ADDR_MISSING",
-                chosen.side, allocation.qty, order_notional
+                "DISPATCH_RESULT {{ ORDER_SENT_TO_BINANCE: false, exchange_response: \"\", reject_reason: \"{}\" }}",
+                rt.last_reject_reason
             );
             log_npc_event(
                 &*state.store,
@@ -3961,44 +4036,55 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                     final_blocker_reason: String::new(),
                     sizing_bumped: false,
             };
-        };
+    };
 
-        let mut form = HashMap::new();
-        form.insert("symbol".to_string(), state.symbol.clone());
-        form.insert("side".to_string(), chosen.side.clone());
-        form.insert("size".to_string(), format!("{:.8}", allocation.qty));
-        form.insert(
-            "reason".to_string(),
-            format!(
-                "npc cycle={} role={} action_id={} regime={} score={:.4} expected_edge={:.4}",
-                cycle_id,
-                chosen.role.as_str(),
-                chosen.action_id,
-                regime.as_str(),
-                chosen.score,
-                chosen.score_parts.edge_estimate
-            ),
-        );
+    log_npc_event(
+        &*state.store,
+        "live_order_dispatch",
+        &format!(
+            "DISPATCH_ATTEMPT {{ side: {}, qty: {:.8}, notional: {:.8}, symbol: {}, execution_mode: {} }}",
+            chosen.side,
+            allocation.qty,
+            order_notional,
+            state.symbol,
+            execution_mode.as_str()
+        ),
+    );
+    let mut form = HashMap::new();
+    form.insert("symbol".to_string(), state.symbol.clone());
+    form.insert("side".to_string(), chosen.side.clone());
+    form.insert("size".to_string(), format!("{:.8}", allocation.qty));
+    form.insert(
+        "reason".to_string(),
+        format!(
+            "npc cycle={} role={} action_id={} regime={} score={:.4} expected_edge={:.4}",
+            cycle_id,
+            chosen.role.as_str(),
+            chosen.action_id,
+            regime.as_str(),
+            chosen.score,
+            chosen.score_parts.edge_estimate
+        ),
+    );
 
-        lifecycle(
-            &*state.store,
-            chosen.role,
-            &chosen.action_id,
-            NpcLifecycleState::Executing,
-            &format!(
-                "dispatching trade request to web layer side={} qty={:.8} symbol={}",
-                chosen.side, allocation.qty, state.symbol
-            ),
-        );
-        match reqwest::Client::new().post(&url).form(&form).send().await {
+    lifecycle(
+        &*state.store,
+        chosen.role,
+        &chosen.action_id,
+        NpcLifecycleState::Executing,
+        &format!(
+            "dispatching trade request to web layer side={} qty={:.8} symbol={}",
+            chosen.side, allocation.qty, state.symbol
+        ),
+    );
+    match reqwest::Client::new().post(&url).form(&form).send().await {
             Ok(resp) if resp.status().is_success() => {
                 rt.order_sent_to_binance = execution_mode == ExecutionMode::LiveSpot;
+                rt.last_reject_reason.clear();
                 rt.last_live_order_result = format!(
-                    "ORDER_SENT_TO_BINANCE={} side={} qty={:.8} notional={:.8} rejection_reason=",
+                    "DISPATCH_RESULT {{ ORDER_SENT_TO_BINANCE: {}, exchange_response: \"http_status={}\", reject_reason: \"\" }}",
                     rt.order_sent_to_binance,
-                    chosen.side,
-                    allocation.qty,
-                    order_notional
+                    resp.status()
                 );
                 log_npc_event(
                     &*state.store,
@@ -4014,7 +4100,6 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                 );
                 rt.last_action_at.insert(chosen.role, Instant::now());
                 rt.perf.entry(chosen.role).or_default().executed += 1;
-                rt.paper_executions += 1;
             }
             Ok(resp) => {
                 let status_code = resp.status();
@@ -4026,9 +4111,10 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                 };
                 let rejection_reason = format!("HTTP_STATUS_{}", status_code);
                 rt.order_sent_to_binance = false;
+                rt.last_reject_reason = rejection_reason.clone();
                 rt.last_live_order_result = format!(
-                    "ORDER_SENT_TO_BINANCE=false side={} qty={:.8} notional={:.8} rejection_reason={}",
-                    chosen.side, allocation.qty, order_notional, rejection_reason
+                    "DISPATCH_RESULT {{ ORDER_SENT_TO_BINANCE: false, exchange_response: \"http_status={} body={}\", reject_reason: \"{}\" }}",
+                    status_code, short_body, rejection_reason
                 );
                 log_npc_event(
                     &*state.store,
@@ -4075,9 +4161,10 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             }
             Err(e) => {
                 rt.order_sent_to_binance = false;
+                rt.last_reject_reason = format!("REQUEST_ERROR:{}", e);
                 rt.last_live_order_result = format!(
-                    "ORDER_SENT_TO_BINANCE=false side={} qty={:.8} notional={:.8} rejection_reason=REQUEST_ERROR:{}",
-                    chosen.side, allocation.qty, order_notional, e
+                    "DISPATCH_RESULT {{ ORDER_SENT_TO_BINANCE: false, exchange_response: \"\", reject_reason: \"{}\" }}",
+                    rt.last_reject_reason
                 );
                 log_npc_event(
                     &*state.store,
@@ -4119,7 +4206,6 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                     sizing_bumped: false,
                 };
             }
-        }
     }
 
     let expected_edge = chosen.score_parts.edge_estimate - chosen.score_parts.spread_cost - chosen.score_parts.slippage_risk;
@@ -4649,6 +4735,7 @@ fn evaluate_guards(
     sell_inventory: f64,
     order_notional: f64,
     is_micro_active: bool,
+    bootstrap_rebalance_sell: bool,
 ) -> (Vec<String>, bool, u64) {
     let is_micro_safe_execution = cfg.behavior_profile.eq_ignore_ascii_case("MICRO_SAFE_EXECUTION");
     let mut reasons = Vec::new();
@@ -4661,16 +4748,19 @@ fn evaluate_guards(
     // orders when inventory is available and the order has positive notional.
     let is_sell = side.eq_ignore_ascii_case("SELL");
     let small_account = total_balance_usd < MICRO_ACCOUNT_MODE_BALANCE_USD && total_balance_usd > 0.0;
-    let relax_liquidity_guards = small_account && is_sell && sell_inventory > 0.0 && order_notional > 0.0;
+    let relax_liquidity_guards =
+        (small_account && is_sell && sell_inventory > 0.0 && order_notional > 0.0)
+            || bootstrap_rebalance_sell;
 
     if relax_liquidity_guards {
         info!(
             total_balance_usd,
             sell_inventory,
             order_notional,
-            "[GUARD] Small account mode: liquidity depth checks relaxed for SELL \
-             (total_balance_usd={:.2} < $100, sell_inventory={:.8}, order_notional={:.4})",
-            total_balance_usd, sell_inventory, order_notional,
+            bootstrap_rebalance_sell,
+            "[GUARD] SELL bootstrap rebalance path: spread/slippage/liquidity penalties bypassed \
+             (total_balance_usd={:.2}, sell_inventory={:.8}, order_notional={:.4}, bootstrap_rebalance_sell={})",
+            total_balance_usd, sell_inventory, order_notional, bootstrap_rebalance_sell,
         );
     }
 
@@ -5577,6 +5667,7 @@ mod tests {
             /* sell_inventory    */ 0.001,
             /* order_notional    */ 50.0,
             /* is_micro_active   */ false,
+        /* bootstrap_rebalance_sell */ false,
         );
 
         // Liquidity depth guards must be absent.
@@ -5607,6 +5698,7 @@ mod tests {
             /* sell_inventory    */ 0.001,
             /* order_notional    */ 20.0,
             /* is_micro_active   */ false,
+        /* bootstrap_rebalance_sell */ false,
         );
 
         assert!(
@@ -5743,6 +5835,7 @@ mod tests {
             /* sell_inventory    */ 0.001,
             /* order_notional    */ 50.0,
             /* is_micro_active   */ false,
+        /* bootstrap_rebalance_sell */ false,
         );
 
         assert!(
@@ -5769,6 +5862,7 @@ mod tests {
             /* sell_inventory    */ 0.0,
             /* order_notional    */ 50.0,
             /* is_micro_active   */ false,
+        /* bootstrap_rebalance_sell */ false,
         );
 
         assert!(
@@ -5791,6 +5885,7 @@ mod tests {
             /* sell_inventory    */ 0.001,
             /* order_notional    */ 50.0,
             /* is_micro_active   */ false,
+        /* bootstrap_rebalance_sell */ false,
         );
 
         assert!(
@@ -5819,6 +5914,7 @@ mod tests {
             /* sell_inventory    */ 0.001,
             /* order_notional    */ 50.0,
             /* is_micro_active   */ false,
+        /* bootstrap_rebalance_sell */ false,
         );
         assert!(!cooldown_active, "cooldown must be inactive when no prior action, reasons: {:?}", reasons);
         assert_eq!(cooldown_remaining_ms, 0);
@@ -5847,6 +5943,7 @@ mod tests {
             /* sell_inventory    */ 0.001,
             /* order_notional    */ 50.0,
             /* is_micro_active   */ false,
+        /* bootstrap_rebalance_sell */ false,
         );
         // cooldown IS active, but should NOT block because no other guards fired.
         assert!(cooldown_active, "cooldown should be detected as active");
@@ -5878,6 +5975,7 @@ mod tests {
             /* sell_inventory    */ 0.001,
             /* order_notional    */ 50.0,
             /* is_micro_active   */ false,
+        /* bootstrap_rebalance_sell */ false,
         );
         assert!(cooldown_active);
         assert!(
@@ -5912,6 +6010,7 @@ mod tests {
             /* sell_inventory    */ 0.001,
             /* order_notional    */ 50.0,
             /* is_micro_active   */ false,
+        /* bootstrap_rebalance_sell */ false,
         );
         assert!(!cooldown_active, "small account cooldown (300ms) should be expired after 400ms");
 
@@ -5923,6 +6022,7 @@ mod tests {
             /* sell_inventory    */ 0.001,
             /* order_notional    */ 50.0,
             /* is_micro_active   */ false,
+        /* bootstrap_rebalance_sell */ false,
         );
         assert!(cooldown_active_normal, "normal account cooldown (10s) should still be active after 400ms");
         assert!(remaining_normal > 0);
@@ -6892,6 +6992,29 @@ mod diagnostic_tests {
     }
 
     #[tokio::test]
+    async fn non_live_mode_is_hard_blocked() {
+        let store = InMemoryEventStore::new();
+        let authority = Arc::new(AuthorityLayer::new());
+        authority.set_mode_auto(&*store).await;
+        let state = make_agent_state(
+            Arc::clone(&store) as Arc<dyn crate::store::EventStore>,
+            Arc::clone(&authority),
+            None,
+        );
+        let mut cfg = active_npc_cfg();
+        cfg.mode = NpcTradingMode::Paper;
+        cfg.behavior_profile = "ACTIVE".to_string();
+        let runtime = Arc::new(Mutex::new(NpcRuntimeState::default()));
+        let report = run_cycle(&cfg, &state, runtime).await;
+        assert_eq!(report.final_decision, "BLOCKED");
+        assert!(
+            report.execution_result.contains("NON_LIVE_PATH_DETECTED"),
+            "non-live modes must fail hard with explicit reason; got {}",
+            report.execution_result
+        );
+    }
+
+    #[tokio::test]
     async fn live_mode_blocks_when_exchange_not_ready() {
         let store = InMemoryEventStore::new();
         let authority = Arc::new(AuthorityLayer::new());
@@ -7737,6 +7860,7 @@ mod micro_active_tests {
             /* sell_inventory */ 0.0,
             /* order_notional */ 35.0,
             /* is_micro_active */ true,
+        /* bootstrap_rebalance_sell */ false,
         );
 
         assert!(
@@ -7761,6 +7885,7 @@ mod micro_active_tests {
             /* sell_inventory */ 0.0,
             /* order_notional */ 35.0,
             /* is_micro_active */ true,
+        /* bootstrap_rebalance_sell */ false,
         );
 
         assert!(
@@ -7860,6 +7985,7 @@ mod micro_active_tests {
             0.0, &metrics, 0.5,
             /* total_balance_usd */ 35.0, /* sell_inventory */ 0.0, /* order_notional */ 35.0,
             /* is_micro_active */ true,
+        /* bootstrap_rebalance_sell */ false,
         );
         assert!(!cooldown_micro_active,
             "FLIP_HYPER cooldown (50ms) must be expired after 200ms");
@@ -7870,6 +7996,7 @@ mod micro_active_tests {
             0.0, &metrics, 0.5,
             /* total_balance_usd */ 35.0, /* sell_inventory */ 0.0, /* order_notional */ 35.0,
             /* is_micro_active */ false,
+        /* bootstrap_rebalance_sell */ false,
         );
         assert!(cooldown_small,
             "Small account cooldown (300ms) must still be active after 200ms");
