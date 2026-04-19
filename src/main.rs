@@ -1,6 +1,7 @@
 mod assistant;
 mod agent;
 mod authority;
+mod closed_loop;
 mod client;
 mod events;
 mod npc;
@@ -542,7 +543,7 @@ async fn main() -> Result<()> {
             withdrawals: Arc::clone(&withdrawals),
             client: Arc::clone(&client),
             symbol: symbol.clone(),
-            web_base_url,
+            web_base_url: web_base_url.clone(),
         },
     );
 
@@ -614,6 +615,9 @@ async fn main() -> Result<()> {
     // ── 9. Spawn timeout watchdog ─────────────────────────────────────────────
     info!("=== Starting execution watchdog ===");
     let _wd_handle = exec.spawn_watchdog(Arc::clone(&client), Arc::clone(&truth));
+
+    // ── 9b. Closed-loop execution controller ──────────────────────────────────
+    closed_loop::maybe_spawn_from_env(runtime_profile.as_str().to_string(), web_base_url.clone());
 
     if !live_trade {
         info!("LIVE_TRADE=false — monitor mode. Set LIVE_TRADE=true to enable signal loop.");
