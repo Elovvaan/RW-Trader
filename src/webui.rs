@@ -224,7 +224,15 @@ async fn handle_post(path: &str, _query: &str, body: &str, state: &AppState) -> 
     if path == "/assistant/profile" {
         let form = parse_form_body(body);
         let profile_str = form.get("profile").map(|s| s.as_str()).unwrap_or("ACTIVE");
-        let new_profile = RuntimeProfile::from_str(profile_str);
+        let new_profile = match RuntimeProfile::parse_strict(profile_str) {
+            Ok(profile) => profile,
+            Err(e) => {
+                return redirect_with_err(
+                    "/assistant",
+                    &format!("Unknown runtime profile '{}': {}", profile_str, e),
+                );
+            }
+        };
         let profile_cfg = ProfileConfig::for_profile(new_profile);
         if let Err(e) = persist_active_profile(new_profile) {
             return redirect_with_err("/assistant", &format!("Failed to persist runtime profile: {}", e));
