@@ -19,19 +19,14 @@ struct CombinedMessage {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct BookTicker {
-    #[serde(rename = "u")]
-    update_id: u64,
     #[serde(rename = "s")]
     symbol: String,
     #[serde(rename = "b")]
     bid_price: String,
-    #[serde(rename = "B")]
-    bid_qty: String,
     #[serde(rename = "a")]
     ask_price: String,
-    #[serde(rename = "A")]
-    ask_qty: String,
 }
 
 #[derive(Debug, Deserialize)]
