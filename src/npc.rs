@@ -1377,10 +1377,17 @@ impl NpcAutonomousController {
             contract_last_trade_result,
             contract_paper_mode,
         ) = contract;
-        let active_profile = RuntimeProfile::parse_strict(&cfg.behavior_profile).unwrap_or_default();
+        let parsed_behavior_profile = RuntimeProfile::parse_strict(&cfg.behavior_profile);
+        let active_profile = parsed_behavior_profile.unwrap_or_default();
+        let active_profile_display = parsed_behavior_profile
+            .map(|profile| profile.to_string())
+            .unwrap_or_else(|| format!("INVALID_PROFILE:{}", cfg.behavior_profile));
+        let invalid_behavior_profile = parsed_behavior_profile.is_none();
         let execution_mode = ExecutionMode::from_trading_mode(cfg.mode);
         let paper_mode_enabled = execution_mode == ExecutionMode::Paper;
-        let contract_executor_enabled = paper_mode_enabled && active_profile == RuntimeProfile::Swing;
+        let contract_executor_enabled = paper_mode_enabled
+            && !invalid_behavior_profile
+            && active_profile == RuntimeProfile::Swing;
         let exchange_ready = exec_system_mode.can_trade() && matches!(exec_state, ExecutionState::Idle);
         let balance_ready = truth_can_place_order
             && truth_total_balance_usd.is_finite()
