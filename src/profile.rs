@@ -6,7 +6,26 @@
 // Spread guard, kill switch, risk engine, and side-aware balance checks are
 // always active regardless of profile.
 
+use std::fs;
+use std::path::PathBuf;
 use std::time::Duration;
+
+const ACTIVE_PROFILE_STATE_FILE_DEFAULT: &str = "rw-trader-active-profile.txt";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileSource {
+    Persisted,
+    Default,
+}
+
+impl ProfileSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Persisted => "persisted",
+            Self::Default => "default",
+        }
+    }
+}
 
 // ── RuntimeProfile enum ───────────────────────────────────────────────────────
 
@@ -51,18 +70,22 @@ pub enum RuntimeProfile {
 }
 
 impl RuntimeProfile {
+    fn parse_known(s: &str) -> Option<Self> {
+        match s.to_ascii_uppercase().as_str() {
+            "CONSERVATIVE" => Some(Self::Conservative),
+            "ACTIVE" => Some(Self::Active),
+            "MICRO_TEST" | "MICROTEST" => Some(Self::MicroTest),
+            "MICRO_ACTIVE" | "MICROACTIVE" => Some(Self::MicroActive),
+            "MICRO_SAFE_EXECUTION" | "MICROSAFEEXECUTION" => Some(Self::MicroSafeExecution),
+            "FLIP_HYPER" | "FLIPHYPER" => Some(Self::FlipHyper),
+            "SWING" | "SWING_TRADER" => Some(Self::Swing),
+            _ => None,
+        }
+    }
+
     /// Parse from an env-var / UI string (case-insensitive).
     pub fn from_str(s: &str) -> Self {
-        match s.to_ascii_uppercase().as_str() {
-            "CONSERVATIVE" => Self::Conservative,
-            "ACTIVE"       => Self::Active,
-            "MICRO_TEST" | "MICROTEST"     => Self::MicroTest,
-            "MICRO_ACTIVE" | "MICROACTIVE" => Self::MicroActive,
-            "MICRO_SAFE_EXECUTION" | "MICROSAFEEXECUTION" => Self::MicroSafeExecution,
-            "FLIP_HYPER" | "FLIPHYPER"     => Self::FlipHyper,
-            "SWING" | "SWING_TRADER"       => Self::Swing,
-            _              => Self::default(),
-        }
+        Self::parse_known(s).unwrap_or_default()
     }
 
     pub fn as_str(self) -> &'static str {
@@ -100,6 +123,29 @@ impl RuntimeProfile {
             Self::MicroTest | Self::MicroActive | Self::MicroSafeExecution | Self::FlipHyper
         )
     }
+}
+
+fn active_profile_state_path() -> PathBuf {
+    std::env::var("ACTIVE_PROFILE_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(ACTIVE_PROFILE_STATE_FILE_DEFAULT))
+}
+
+pub fn persist_active_profile(profile: RuntimeProfile) -> Result<(), String> {
+    let path = active_profile_state_path();
+    fs::write(&path, format!("{}\n", profile.as_str()))
+        .map_err(|e| format!("failed to persist active profile to {}: {}", path.display(), e))
+}
+
+pub fn load_active_profile(default_profile: RuntimeProfile) -> (RuntimeProfile, ProfileSource) {
+    let path = active_profile_state_path();
+    if let Ok(raw) = fs::read_to_string(&path) {
+        let trimmed = raw.trim();
+        if let Some(persisted) = RuntimeProfile::parse_known(trimmed) {
+            return (persisted, ProfileSource::Persisted);
+        }
+    }
+    (default_profile, ProfileSource::Default)
 }
 
 impl std::fmt::Display for RuntimeProfile {
@@ -632,5 +678,37 @@ mod tests {
         assert!(cfg.signal_min_confidence >= 0.70);
         assert!(cfg.entry_cooldown_after_exit.as_secs() >= 30);
         assert_eq!(cfg.signal_max_hold_secs, Some(14_400));
+    }
+
+    #[test]
+    fn persist_and_load_active_profile_round_trip() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("active_profile.txt");
+        std::env::set_var("ACTIVE_PROFILE_PATH", &path);
+        let _guard = EnvGuard("ACTIVE_PROFILE_PATH".to_string());
+
+        persist_active_profile(RuntimeProfile::Swing).expect("persist profile");
+        let (profile, source) = load_active_profile(RuntimeProfile::Active);
+        assert_eq!(profile, RuntimeProfile::Swing);
+        assert_eq!(source, ProfileSource::Persisted);
+    }
+
+    #[test]
+    fn load_active_profile_uses_default_when_no_persisted_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("missing_active_profile.txt");
+        std::env::set_var("ACTIVE_PROFILE_PATH", &path);
+        let _guard = EnvGuard("ACTIVE_PROFILE_PATH".to_string());
+
+        let (profile, source) = load_active_profile(RuntimeProfile::Active);
+        assert_eq!(profile, RuntimeProfile::Active);
+        assert_eq!(source, ProfileSource::Default);
+    }
+
+    struct EnvGuard(String);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(&self.0);
+        }
     }
 }

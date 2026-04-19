@@ -27,7 +27,7 @@ use tracing::{debug, error, info};
 use crate::assistant;
 use crate::authority::{AuthorityLayer, AuthorityMode};
 use crate::executor::Executor;
-use crate::profile::{ProfileConfig, RuntimeProfile};
+use crate::profile::{persist_active_profile, ProfileConfig, RuntimeProfile};
 use crate::reader::{get_trade_timeline, summarise_event, LifecycleStage, TradeOutcome};
 use crate::reconciler::TruthState;
 use crate::risk::{self, RiskEngine, RiskVerdict};
@@ -225,6 +225,9 @@ async fn handle_post(path: &str, _query: &str, body: &str, state: &AppState) -> 
         let form = parse_form_body(body);
         let profile_str = form.get("profile").map(|s| s.as_str()).unwrap_or("ACTIVE");
         let new_profile = RuntimeProfile::from_str(profile_str);
+        if let Err(e) = persist_active_profile(new_profile) {
+            return redirect_with_err("/assistant", &format!("Failed to persist runtime profile: {}", e));
+        }
         *state.profile.lock().await = new_profile;
         state.npc.set_active_profile(new_profile).await;
         *state.strategy.lock().await = StrategyEngine::with_profile(&ProfileConfig::for_profile(new_profile));
@@ -727,7 +730,7 @@ async fn agent_status_json(state: &AppState) -> String {
     let override_used = snap.last_agent_decision.contains("override_used=true")
         || snap.last_no_trade_reason.contains("override_used=true");
     let body = format!(
-        r#"{{"mode":"{mode_str}","state":"{state_label}","agent_state":"{status_str}","last_action":"{last_action}","last_reason":"{last_reason}","last_agent_decision":"{last_decision}","last_no_trade_reason":"{no_trade_reason}","pipeline_state":"{pipeline}","final_decision":"{final_decision}","balance_block_reason":"{balance_block}","risk_block_reason":"{risk_block}","execution_block_reason":"{exec_block}","max_concurrent_positions":{max_concurrent_positions},"counted_open_positions":{counted_open_positions},"counted_pending_orders":{counted_pending_orders},"counted_reserved_slots":{counted_reserved_slots},"slot_block_reason":"{slot_block_reason}","slot_source_ids":"{slot_source_ids}","risk_override":{risk_override},"regime_override":{regime_override},"active_profile":"{active_profile}","active_profile_label":"{active_profile_label}","PROFILE_LOCK":"{profile_lock}","current_equity":{current_equity},"peak_equity":{peak_equity},"drawdown_pct":{drawdown_pct},"drawdown_limit":{drawdown_limit},"cycle_count":{cycle_count},"running":{running},"cooldown_active":{cooldown_active},"cooldown_remaining_ms":{cooldown_remaining_ms},"effective_threshold":{effective_threshold},"threshold_mode":"{threshold_mode}","raw_score":{raw_score},"adjusted_score":{adjusted_score},"threshold_used":{threshold_used},"penalty_clamped":{penalty_clamped},"override_used":{override_used},"compound_position_size_usd":{compound_pos_usd},"compound_position_size_btc":{compound_pos_btc},"compound_last_trade_pnl":{compound_last_pnl},"compound_session_pnl":{compound_sess_pnl},"compound_peak_balance":{compound_peak_bal},"compound_current_balance":{compound_cur_bal},"compound_consecutive_losses":{compound_consec},"compound_size_scalar":{compound_scalar},"compound_loss_pause_active":{compound_paused},"raw_position_size_usd":{raw_position_size_usd},"adjusted_position_size_usd":{adjusted_position_size_usd},"min_notional":{min_notional},"sizing_adjustment_reason":"{sizing_adjustment_reason}","sizing_bumped":{sizing_bumped},"flip_cycle_phase":"{flip_cycle_phase}","flip_session_pnl":{flip_session_pnl},"flip_rotation_count":{flip_rotation_count},"flip_last_entry_price":{flip_last_entry_price},"flip_last_exit_price":{flip_last_exit_price},"flip_last_pnl_usd":{flip_last_pnl_usd},"flip_last_pnl_pct":{flip_last_pnl_pct},"flip_min_profit_floor":{flip_min_profit_floor},"flip_blocker":"{flip_blocker}","contract_side":"{contract_side}","contract_leverage":{contract_leverage},"contract_entry_price":{contract_entry_price},"contract_mark_price":{contract_mark_price},"contract_notional_usd":{contract_notional_usd},"contract_unrealized_pnl":{contract_unrealized_pnl},"contract_realized_pnl_session":{contract_realized_pnl_session},"contract_liquidation_price":{contract_liquidation_price},"contract_stop_loss":{contract_stop_loss},"contract_take_profit":{contract_take_profit},"contract_liquidation_buffer_pct":{contract_liquidation_buffer_pct},"contract_duration_secs":{contract_duration_secs},"contract_exit_reason":"{contract_exit_reason}","contract_last_trade_result":{contract_last_trade_result},"contract_paper_mode":{contract_paper_mode},"contract_last_no_open_reason":"{contract_last_no_open_reason}","rebalance_status":"{rebalance_status}","rebalance_triggered":{rebalance_triggered},"rebalance_reason":"{rebalance_reason}","rebalance_side":"{rebalance_side}","rebalance_qty":{rebalance_qty},"rebalance_value_usd":{rebalance_value_usd},"free_usdt_before":{free_usdt_before},"free_usdt_after":{free_usdt_after},"btc_before":{btc_before},"btc_after":{btc_after},"final_blocker_reason":"{final_blocker_reason}"}}"#,
+        r#"{{"mode":"{mode_str}","state":"{state_label}","agent_state":"{status_str}","last_action":"{last_action}","last_reason":"{last_reason}","last_agent_decision":"{last_decision}","last_no_trade_reason":"{no_trade_reason}","pipeline_state":"{pipeline}","final_decision":"{final_decision}","balance_block_reason":"{balance_block}","risk_block_reason":"{risk_block}","execution_block_reason":"{exec_block}","max_concurrent_positions":{max_concurrent_positions},"counted_open_positions":{counted_open_positions},"counted_pending_orders":{counted_pending_orders},"counted_reserved_slots":{counted_reserved_slots},"slot_block_reason":"{slot_block_reason}","slot_source_ids":"{slot_source_ids}","risk_override":{risk_override},"regime_override":{regime_override},"active_profile":"{active_profile}","active_profile_label":"{active_profile_label}","profile_source":"{profile_source}","strategy_profile_bound":"{strategy_profile_bound}","PROFILE_LOCK":"{profile_lock}","execution_mode":"{execution_mode}","paper_mode_enabled":{paper_mode_enabled},"contract_executor_enabled":{contract_executor_enabled},"live_ready":{live_ready},"feed_warmed_up":{feed_warmed_up},"exchange_ready":{exchange_ready},"sizing_ready":{sizing_ready},"final_live_blocker_reason":"{final_live_blocker_reason}","ORDER_SENT_TO_BINANCE":{order_sent_to_binance},"last_live_order_result":"{last_live_order_result}","current_equity":{current_equity},"peak_equity":{peak_equity},"drawdown_pct":{drawdown_pct},"drawdown_limit":{drawdown_limit},"cycle_count":{cycle_count},"running":{running},"cooldown_active":{cooldown_active},"cooldown_remaining_ms":{cooldown_remaining_ms},"effective_threshold":{effective_threshold},"threshold_mode":"{threshold_mode}","raw_score":{raw_score},"adjusted_score":{adjusted_score},"threshold_used":{threshold_used},"penalty_clamped":{penalty_clamped},"override_used":{override_used},"compound_position_size_usd":{compound_pos_usd},"compound_position_size_btc":{compound_pos_btc},"compound_last_trade_pnl":{compound_last_pnl},"compound_session_pnl":{compound_sess_pnl},"compound_peak_balance":{compound_peak_bal},"compound_current_balance":{compound_cur_bal},"compound_consecutive_losses":{compound_consec},"compound_size_scalar":{compound_scalar},"compound_loss_pause_active":{compound_paused},"raw_position_size_usd":{raw_position_size_usd},"adjusted_position_size_usd":{adjusted_position_size_usd},"min_notional":{min_notional},"sizing_adjustment_reason":"{sizing_adjustment_reason}","sizing_bumped":{sizing_bumped},"flip_cycle_phase":"{flip_cycle_phase}","flip_session_pnl":{flip_session_pnl},"flip_rotation_count":{flip_rotation_count},"flip_last_entry_price":{flip_last_entry_price},"flip_last_exit_price":{flip_last_exit_price},"flip_last_pnl_usd":{flip_last_pnl_usd},"flip_last_pnl_pct":{flip_last_pnl_pct},"flip_min_profit_floor":{flip_min_profit_floor},"flip_blocker":"{flip_blocker}","contract_side":"{contract_side}","contract_leverage":{contract_leverage},"contract_entry_price":{contract_entry_price},"contract_mark_price":{contract_mark_price},"contract_notional_usd":{contract_notional_usd},"contract_unrealized_pnl":{contract_unrealized_pnl},"contract_realized_pnl_session":{contract_realized_pnl_session},"contract_liquidation_price":{contract_liquidation_price},"contract_stop_loss":{contract_stop_loss},"contract_take_profit":{contract_take_profit},"contract_liquidation_buffer_pct":{contract_liquidation_buffer_pct},"contract_duration_secs":{contract_duration_secs},"contract_exit_reason":"{contract_exit_reason}","contract_last_trade_result":{contract_last_trade_result},"contract_paper_mode":{contract_paper_mode},"contract_last_no_open_reason":"{contract_last_no_open_reason}","rebalance_status":"{rebalance_status}","rebalance_triggered":{rebalance_triggered},"rebalance_reason":"{rebalance_reason}","rebalance_side":"{rebalance_side}","rebalance_qty":{rebalance_qty},"rebalance_value_usd":{rebalance_value_usd},"free_usdt_before":{free_usdt_before},"free_usdt_after":{free_usdt_after},"btc_before":{btc_before},"btc_after":{btc_after},"final_blocker_reason":"{final_blocker_reason}"}}"#,
         current_equity  = snap.current_equity,
         peak_equity     = snap.peak_equity,
         drawdown_pct    = snap.drawdown_pct,
@@ -752,7 +755,19 @@ async fn agent_status_json(state: &AppState) -> String {
         regime_override       = snap.regime_override,
         active_profile        = snap.active_profile.replace('"', "\\\""),
         active_profile_label  = snap.active_profile_label.replace('"', "\\\""),
+        profile_source        = snap.profile_source.replace('"', "\\\""),
+        strategy_profile_bound = snap.strategy_profile_bound.replace('"', "\\\""),
         profile_lock          = snap.profile_lock.replace('"', "\\\""),
+        execution_mode        = snap.execution_mode.replace('"', "\\\""),
+        paper_mode_enabled    = snap.paper_mode_enabled,
+        contract_executor_enabled = snap.contract_executor_enabled,
+        live_ready            = snap.live_ready,
+        feed_warmed_up        = snap.feed_warmed_up,
+        exchange_ready        = snap.exchange_ready,
+        sizing_ready          = snap.sizing_ready,
+        final_live_blocker_reason = snap.final_live_blocker_reason.replace('"', "\\\""),
+        order_sent_to_binance = snap.order_sent_to_binance,
+        last_live_order_result = snap.last_live_order_result.replace('"', "\\\""),
         compound_pos_usd   = snap.compound_position_size_usd,
         compound_pos_btc   = snap.compound_position_size_btc,
         compound_last_pnl  = snap.compound_last_trade_pnl,
@@ -1067,7 +1082,6 @@ async fn page_events(state: &AppState, query: &str) -> String {
 
     let sys_mode = state.exec.system_mode().await;
     let exec_state = state.exec.execution_state().await;
-    let current_profile = *state.profile.lock().await;
     let (symbol, pos_size, open_orders, total_balance_usd, buy_power, sell_inventory, balance_status, raw_balances) = {
         let t = state.truth.lock().await;
         (
@@ -1083,6 +1097,7 @@ async fn page_events(state: &AppState, query: &str) -> String {
     };
     let kill = state.risk.lock().await.kill_switch_active();
     let npc_loop = state.npc.snapshot().await;
+    let current_profile = RuntimeProfile::from_str(&npc_loop.active_profile);
     let phase1_status = state.strategy.lock().await.phase1_status();
 
     let best_summary = events.first().map(summarise_event).unwrap_or_else(|| "No fresh event yet; waiting for next snapshot.".to_string());
@@ -1222,12 +1237,20 @@ async fn page_events(state: &AppState, query: &str) -> String {
           <div class='metric-card'><div class='metric-label'>System status</div><div class='metric-value'>{} / {}</div></div>\
           <div class='metric-card'><div class='metric-label'>Risk status</div><div class='metric-value {}'>{}</div></div>\
           <div class='metric-card'><div class='metric-label'>Agent Mode</div><div class='metric-value'>{}</div></div>\
+          <div class='metric-card'><div class='metric-label'>Execution Mode</div><div class='metric-value'>{}</div></div>\
           <div class='metric-card'><div class='metric-label'>Agent Cycles</div><div class='metric-value'>{}</div></div>\
         </div>\
         <div class='summary-strip' style='margin-top:10px'>\
           <div class='summary-pill'><div class='label'>Trading Readiness</div><div>{}</div></div>\
           <div class='summary-pill'><div class='label'>System Health</div><div>System healthy • Executor {}</div></div>\
           <div class='summary-pill'><div class='label'>Operator Note</div><div>{}</div></div>\
+        </div>\
+        <div class='signal-box' style='margin-top:10px'>\
+          <div class='label'>LIVE Runtime Telemetry</div>\
+          <div class='sum'>active_profile={} • active_profile_label={} • profile_source={} • strategy_profile_bound={}</div>\
+          <div class='sum'>execution_mode={} • paper_mode_enabled={} • contract_executor_enabled={}</div>\
+          <div class='sum'>live_ready={} • feed_warmed_up={} • exchange_ready={} • sizing_ready={}</div>\
+          <div class='sum'>final_live_blocker_reason={} • ORDER_SENT_TO_BINANCE={} • last_live_order_result={}</div>\
         </div>\
         <div class='sr-only'>SELL READY BUY READY BUY DISABLED (NO USDT) Latest recommendation summary Recent event context</div>",
         format_usd(total_balance_usd),
@@ -1241,10 +1264,25 @@ async fn page_events(state: &AppState, query: &str) -> String {
         if kill { "err" } else { "ok" },
         risk_status,
         esc(npc_loop.agent_mode.as_str().to_uppercase().as_str()),
+        esc(&npc_loop.execution_mode),
         npc_loop.cycle_count,
         esc(&signal_label.to_uppercase()),
         esc(&exec_state.to_string()),
-        esc(&balance_note)
+        esc(&balance_note),
+        esc(&npc_loop.active_profile),
+        esc(&npc_loop.active_profile_label),
+        esc(&npc_loop.profile_source),
+        esc(&npc_loop.strategy_profile_bound),
+        esc(&npc_loop.execution_mode),
+        npc_loop.paper_mode_enabled,
+        npc_loop.contract_executor_enabled,
+        npc_loop.live_ready,
+        npc_loop.feed_warmed_up,
+        npc_loop.exchange_ready,
+        npc_loop.sizing_ready,
+        esc(&npc_loop.final_live_blocker_reason),
+        npc_loop.order_sent_to_binance,
+        esc(&npc_loop.last_live_order_result)
     );
 
     let buy_btn_attrs = if buy_btn_enabled {
@@ -2378,7 +2416,7 @@ async fn page_assistant(state: &AppState, query: &str) -> String {
     let exec_state = state.exec.execution_state().await;
     let kill_active = state.risk.lock().await.kill_switch_active();
     let npc_loop = state.npc.snapshot().await;
-    let current_profile = *state.profile.lock().await;
+    let current_profile = RuntimeProfile::from_str(&npc_loop.active_profile);
     let (health_class, health_text) = system_health_summary(sys_mode, exec_state.clone(), kill_active);
     let recent_events = state.store.fetch_recent(10).unwrap_or_default();
 
@@ -2432,7 +2470,7 @@ async fn page_assistant(state: &AppState, query: &str) -> String {
           {}\
           <button class='btn' type='submit'>Apply</button>\
         </form>\
-        <div class='sum' style='margin-top:6px;font-size:11px'>Note: profile change takes effect on the next trading cycle. Spread guard, kill switch, and risk engine remain active on all profiles.</div>\
+        <div class='sum' style='margin-top:6px;font-size:11px'>Note: profile change is applied immediately to the active runtime. Spread guard, kill switch, and risk engine remain active on all profiles.</div>\
       </div>\
       <div class='signal-box'><div class='label'>Agent Mode</div><div class='sum'>Background autonomous trading loop with idempotent single-instance guard.</div>\
         <div class='sum' style='margin-top:6px'>State: <strong>{}</strong> · Last decision: {} · Result: {} · Updated: {}</div>\
@@ -2836,6 +2874,14 @@ mod tests {
     use crate::risk::{RiskConfig, RiskEngine};
     use crate::store::InMemoryEventStore;
     use std::time::Duration;
+    use tempfile::tempdir;
+
+    struct EnvGuard(String);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(&self.0);
+        }
+    }
 
     fn make_state() -> AppState {
         let pos  = Position::new("BTCUSDT");
@@ -2869,14 +2915,16 @@ mod tests {
             min_mid_samples: 1,
             min_trade_samples: 1,
         })));
+        let mut npc_cfg = crate::npc::NpcConfig::from_trade_cfg(&crate::agent::TradeAgentConfig {
+            enabled: false,
+            trade_size: 0.0,
+            momentum_threshold: 0.0,
+            poll_interval: Duration::from_millis(1000),
+            max_spread_bps: 5.0,
+        });
+        npc_cfg.behavior_profile = crate::profile::RuntimeProfile::Conservative.as_str().to_string();
         let npc = Arc::new(crate::npc::NpcAutonomousController::new(
-            crate::npc::NpcConfig::from_trade_cfg(&crate::agent::TradeAgentConfig {
-                enabled: false,
-                trade_size: 0.0,
-                momentum_threshold: 0.0,
-                poll_interval: Duration::from_millis(1000),
-                max_spread_bps: 5.0,
-            }),
+            npc_cfg,
             crate::agent::AgentState {
                 store: Arc::clone(&store),
                 exec: Arc::clone(&exec),
@@ -3204,6 +3252,7 @@ mod tests {
     async fn test_events_micro_test_banner() {
         let state = make_state();
         *state.profile.lock().await = crate::profile::RuntimeProfile::MicroTest;
+        state.npc.set_active_profile(crate::profile::RuntimeProfile::MicroTest).await;
         let r = page_events(&state, "").await;
         assert!(r.contains("Runtime Profile"), "LIVE page must show 'Runtime Profile' heading");
         assert!(
@@ -3220,6 +3269,7 @@ mod tests {
     async fn test_events_micro_active_banner() {
         let state = make_state();
         *state.profile.lock().await = crate::profile::RuntimeProfile::MicroActive;
+        state.npc.set_active_profile(crate::profile::RuntimeProfile::MicroActive).await;
         let r = page_events(&state, "").await;
         assert!(r.contains("Runtime Profile"), "LIVE page must show 'Runtime Profile' heading");
         assert!(
@@ -3248,6 +3298,7 @@ mod tests {
     async fn test_assistant_micro_active_selected_matches_state() {
         let state = make_state();
         *state.profile.lock().await = crate::profile::RuntimeProfile::MicroActive;
+        state.npc.set_active_profile(crate::profile::RuntimeProfile::MicroActive).await;
         let r = page_assistant(&state, "").await;
         assert!(
             r.contains("value='MICRO_ACTIVE' checked"),
@@ -3274,6 +3325,7 @@ mod tests {
     async fn test_assistant_profile_selected_matches_state() {
         let state = make_state();
         *state.profile.lock().await = crate::profile::RuntimeProfile::MicroTest;
+        state.npc.set_active_profile(crate::profile::RuntimeProfile::MicroTest).await;
         let r = page_assistant(&state, "").await;
         // MICRO_TEST option must carry the `checked` attribute.
         assert!(
@@ -3291,6 +3343,30 @@ mod tests {
         let state = make_state();
         let r = page_assistant(&state, "").await;
         assert!(r.contains("CURRENT ACTIVE PROFILE"));
+    }
+
+    #[tokio::test]
+    async fn test_apply_profile_persists_and_live_reads_same_profile() {
+        let dir = tempdir().expect("temp dir");
+        let persisted_path = dir.path().join("active_profile.txt");
+        std::env::set_var("ACTIVE_PROFILE_PATH", &persisted_path);
+        let _guard = EnvGuard("ACTIVE_PROFILE_PATH".to_string());
+
+        let state = make_state();
+        let resp = handle_post("/assistant/profile", "", "profile=SWING", &state).await;
+        assert!(resp.contains("Runtime%20profile%20set%20to%20SWING"));
+
+        let snap = state.npc.snapshot().await;
+        assert_eq!(snap.active_profile, "SWING");
+        assert_eq!(snap.profile_source, "persisted");
+
+        let live = page_events(&state, "").await;
+        assert!(live.contains("SWING"), "LIVE page must show SWING after Apply");
+        assert!(!live.contains("ACTIVE — balanced defaults"), "LIVE page must not silently fall back to ACTIVE");
+
+        let (loaded, source) = crate::profile::load_active_profile(crate::profile::RuntimeProfile::Active);
+        assert_eq!(loaded, crate::profile::RuntimeProfile::Swing);
+        assert_eq!(source, crate::profile::ProfileSource::Persisted);
     }
 
     // ── Agent Control Panel ───────────────────────────────────────────────────
@@ -3517,7 +3593,19 @@ mod tests {
         assert!(r.contains("\"threshold_used\""), "JSON must contain threshold_used");
         assert!(r.contains("\"active_profile\""), "JSON must contain active_profile");
         assert!(r.contains("\"active_profile_label\""), "JSON must contain active_profile_label");
+        assert!(r.contains("\"profile_source\""), "JSON must contain profile_source");
+        assert!(r.contains("\"strategy_profile_bound\""), "JSON must contain strategy_profile_bound");
         assert!(r.contains("\"PROFILE_LOCK\""), "JSON must contain PROFILE_LOCK");
+        assert!(r.contains("\"execution_mode\""), "JSON must contain execution_mode");
+        assert!(r.contains("\"paper_mode_enabled\""), "JSON must contain paper_mode_enabled");
+        assert!(r.contains("\"contract_executor_enabled\""), "JSON must contain contract_executor_enabled");
+        assert!(r.contains("\"live_ready\""), "JSON must contain live_ready");
+        assert!(r.contains("\"feed_warmed_up\""), "JSON must contain feed_warmed_up");
+        assert!(r.contains("\"exchange_ready\""), "JSON must contain exchange_ready");
+        assert!(r.contains("\"sizing_ready\""), "JSON must contain sizing_ready");
+        assert!(r.contains("\"final_live_blocker_reason\""), "JSON must contain final_live_blocker_reason");
+        assert!(r.contains("\"ORDER_SENT_TO_BINANCE\""), "JSON must contain ORDER_SENT_TO_BINANCE");
+        assert!(r.contains("\"last_live_order_result\""), "JSON must contain last_live_order_result");
         assert!(r.contains("\"max_concurrent_positions\""), "JSON must contain max_concurrent_positions");
         assert!(r.contains("\"counted_open_positions\""), "JSON must contain counted_open_positions");
         assert!(r.contains("\"counted_pending_orders\""), "JSON must contain counted_pending_orders");

@@ -11,7 +11,7 @@ use crate::agent::{AgentState, TradeAgentConfig};
 use crate::authority::AuthorityMode;
 use crate::events::{OperatorActionPayload, StoredEvent, TradingEvent};
 use crate::executor::ExecutionState;
-use crate::profile::RuntimeProfile;
+use crate::profile::{ProfileSource, RuntimeProfile};
 use crate::store::EventStore;
 
 const NPC_STATUS_SCANNING: &str = "scanning market";
@@ -155,6 +155,28 @@ impl NpcTradingMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionMode {
+    LiveSpot,
+    Paper,
+}
+
+impl ExecutionMode {
+    fn from_trading_mode(mode: NpcTradingMode) -> Self {
+        match mode {
+            NpcTradingMode::Live => Self::LiveSpot,
+            NpcTradingMode::Simulation | NpcTradingMode::Paper => Self::Paper,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LiveSpot => "LIVE_SPOT",
+            Self::Paper => "PAPER",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum MarketRegime {
     TrendingUp,
@@ -253,6 +275,7 @@ pub struct NpcConfig {
     /// Behavior profile name (uppercase).  "FLIP_HYPER" activates the
     /// capital-rotation state machine.  Set via `RUNTIME_PROFILE` env var.
     pub behavior_profile: String,
+    pub profile_source: ProfileSource,
     pub target_usdt_ratio: f64,
     pub target_btc_ratio: f64,
     pub rebalance_min_notional_usd: f64,
@@ -284,6 +307,7 @@ impl NpcConfig {
                 .unwrap_or_else(|_| DEFAULT_ACTIVE_PROFILE.to_string())
                 .trim()
                 .to_ascii_uppercase(),
+            profile_source: ProfileSource::Default,
             target_usdt_ratio: env_f64("NPC_TARGET_USDT_RATIO", 0.35).clamp(0.05, 0.95),
             target_btc_ratio: env_f64("NPC_TARGET_BTC_RATIO", 0.65).clamp(0.05, 0.95),
             rebalance_min_notional_usd: env_f64("NPC_REBALANCE_MIN_NOTIONAL_USD", 5.0).max(1.0),
@@ -652,6 +676,8 @@ struct NpcRuntimeState {
     btc_before: f64,
     btc_after: f64,
     rebalance_cooldown_until: Option<Instant>,
+    order_sent_to_binance: bool,
+    last_live_order_result: String,
 }
 
 impl Default for NpcRuntimeState {
@@ -718,6 +744,8 @@ impl Default for NpcRuntimeState {
             btc_before: 0.0,
             btc_after: 0.0,
             rebalance_cooldown_until: None,
+            order_sent_to_binance: false,
+            last_live_order_result: String::new(),
         }
     }
 }
@@ -763,7 +791,14 @@ pub struct NpcLoopSnapshot {
     pub regime_override: bool,
     pub active_profile: String,
     pub active_profile_label: String,
+    pub profile_source: String,
+    pub strategy_profile_bound: String,
     pub profile_lock: String,
+    pub execution_mode: String,
+    pub paper_mode_enabled: bool,
+    pub contract_executor_enabled: bool,
+    pub order_sent_to_binance: bool,
+    pub last_live_order_result: String,
     pub max_concurrent_positions: usize,
     pub counted_open_positions: usize,
     pub counted_pending_orders: usize,
@@ -978,6 +1013,7 @@ impl NpcAutonomousController {
         {
             let mut cfg = self.cfg.lock().await;
             cfg.behavior_profile = profile.as_str().to_string();
+            cfg.profile_source = ProfileSource::Persisted;
         }
         {
             let mut rt = self.runtime.lock().await;
@@ -1015,6 +1051,8 @@ impl NpcAutonomousController {
             rt.btc_before = 0.0;
             rt.btc_after = 0.0;
             rt.rebalance_cooldown_until = None;
+            rt.order_sent_to_binance = false;
+            rt.last_live_order_result.clear();
         }
         {
             let mut t = self.telemetry.lock().await;
@@ -1146,7 +1184,7 @@ impl NpcAutonomousController {
                 && feed.mid_history.len() >= signal.config.min_mid_samples
                 && feed.trade_history.len() >= signal.config.min_trade_samples
         };
-        let (current_equity, peak_equity, drawdown_pct, compound, sizing, flip, contract, rebalance, contract_last_no_open_reason, slot_usage) = {
+        let (current_equity, peak_equity, drawdown_pct, compound, sizing, flip, contract, rebalance, contract_last_no_open_reason, slot_usage, order_sent_to_binance, last_live_order_result) = {
             // Compute current equity and drawdown from runtime state (same formula as evaluate_portfolio_controls).
             let rt = self.runtime.lock().await;
             let aggregate_pnl: f64 = rt.perf.values().map(|p| p.gross_pnl).sum();
@@ -1272,7 +1310,20 @@ impl NpcAutonomousController {
                 truth_pending_order_slots,
                 &truth_pending_order_ids,
             );
-            (equity, peak, dd, c, sizing, f, k, reb, rt.contract_last_no_open_reason.clone(), slot_usage)
+            (
+                equity,
+                peak,
+                dd,
+                c,
+                sizing,
+                f,
+                k,
+                reb,
+                rt.contract_last_no_open_reason.clone(),
+                slot_usage,
+                rt.order_sent_to_binance,
+                rt.last_live_order_result.clone(),
+            )
         };
         let (
             compound_pos_btc, compound_pos_usd,
@@ -1321,8 +1372,10 @@ impl NpcAutonomousController {
             contract_last_trade_result,
             contract_paper_mode,
         ) = contract;
-        let selected_profile = RuntimeProfile::from_str(&cfg.behavior_profile);
-        let active_profile = resolve_runtime_profile(selected_profile, truth_total_balance_usd);
+        let active_profile = RuntimeProfile::from_str(&cfg.behavior_profile);
+        let execution_mode = ExecutionMode::from_trading_mode(cfg.mode);
+        let paper_mode_enabled = execution_mode == ExecutionMode::Paper;
+        let contract_executor_enabled = paper_mode_enabled && active_profile == RuntimeProfile::Swing;
         let exchange_ready = exec_system_mode.can_trade() && matches!(exec_state, ExecutionState::Idle);
         let balance_ready = truth_can_place_order
             && truth_total_balance_usd.is_finite()
@@ -1385,7 +1438,14 @@ impl NpcAutonomousController {
             regime_override: telemetry.regime_override,
             active_profile: active_profile.as_str().to_string(),
             active_profile_label: active_profile.label().to_string(),
+            profile_source: cfg.profile_source.as_str().to_string(),
+            strategy_profile_bound: cfg.behavior_profile.clone(),
             profile_lock: active_profile.as_str().to_string(),
+            execution_mode: execution_mode.as_str().to_string(),
+            paper_mode_enabled,
+            contract_executor_enabled,
+            order_sent_to_binance,
+            last_live_order_result,
             max_concurrent_positions: slot_usage.max_concurrent_positions,
             counted_open_positions: slot_usage.counted_open_positions,
             counted_pending_orders: slot_usage.counted_pending_orders,
@@ -1825,13 +1885,8 @@ fn profile_threshold(
 }
 
 fn resolve_runtime_profile(selected: RuntimeProfile, total_balance_usd: f64) -> RuntimeProfile {
-    if selected == RuntimeProfile::MicroSafeExecution
-        || (total_balance_usd > 0.0 && total_balance_usd < MICRO_ACCOUNT_MODE_BALANCE_USD)
-    {
-        RuntimeProfile::MicroSafeExecution
-    } else {
-        selected
-    }
+    let _ = total_balance_usd;
+    selected
 }
 
 fn swing_conviction_threshold(base_threshold: f64, total_balance_usd: f64) -> f64 {
@@ -2295,8 +2350,8 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
     let exec_system_mode = state.exec.system_mode().await;
     let pending = state.authority.pending_proposals().await;
 
-    let selected_profile = RuntimeProfile::from_str(&cfg.behavior_profile);
-    let active_profile = resolve_runtime_profile(selected_profile, total_balance_usd);
+    let active_profile = RuntimeProfile::from_str(&cfg.behavior_profile);
+    let execution_mode = ExecutionMode::from_trading_mode(cfg.mode);
     let (effective_threshold, threshold_mode) =
         profile_threshold(active_profile, total_balance_usd, cfg.mode);
     let is_micro_safe_execution = active_profile == RuntimeProfile::MicroSafeExecution;
@@ -2310,6 +2365,7 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
     );
 
     let mut rt = runtime.lock().await;
+    rt.order_sent_to_binance = false;
     rt.cycle_seq = rt.cycle_seq.saturating_add(1);
     let cycle_id = rt.cycle_seq;
     if metrics.mid.is_finite() && metrics.mid > 0.0 {
@@ -2324,7 +2380,8 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             rt.spread_history.pop_front();
         }
     }
-    if is_swing_profile {
+    rt.contract_paper_mode = execution_mode == ExecutionMode::Paper;
+    if is_swing_profile && execution_mode == ExecutionMode::Paper {
         let bias = swing_bias(&swing_signals);
         let vol_estimate = realized_volatility_bps(&rt.mid_history, 16).unwrap_or(0.0) / 10_000.0;
         update_contract_executor(
@@ -2335,6 +2392,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
             vol_estimate,
             total_balance_usd,
         );
+    } else if execution_mode == ExecutionMode::LiveSpot {
+        rt.contract_position = None;
+        rt.contract_last_no_open_reason = "LIVE_SPOT_CONTRACT_PATH_DISABLED".to_string();
     }
 
     // ── SWING_TRADER: update open-position telemetry each cycle ──────────────
@@ -3746,14 +3806,20 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         let risk_ready = !effective_cfg.guards.kill_switch
             && portfolio_controls.is_empty()
             && guard_reasons.is_empty();
+        let valid_side = chosen.side == "BUY" || chosen.side == "SELL";
+        let execution_mode_ready = execution_mode == ExecutionMode::LiveSpot;
         let blocker = if mode != AuthorityMode::Auto {
             "AUTHORITY_NOT_AUTO"
+        } else if !execution_mode_ready {
+            "EXECUTION_MODE_NOT_LIVE_SPOT"
         } else if !feed_warmed_up {
             "FEED_NOT_WARMED_UP"
         } else if !exchange_ready {
             "EXCHANGE_UNAVAILABLE"
         } else if !balance_ready {
             "BALANCE_NOT_READY"
+        } else if !valid_side {
+            "INVALID_SIDE_NOT_SPOT_COMPATIBLE"
         } else if !sizing_ready {
             "INVALID_SIZE_OR_NOTIONAL"
         } else if !risk_ready {
@@ -3763,6 +3829,16 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         };
 
         if !blocker.is_empty() {
+            rt.order_sent_to_binance = false;
+            rt.last_live_order_result = format!(
+                "ORDER_SENT_TO_BINANCE=false side={} qty={:.8} notional={:.8} rejection_reason={}",
+                chosen.side, allocation.qty, order_notional, blocker
+            );
+            log_npc_event(
+                &*state.store,
+                "live_order_dispatch",
+                &rt.last_live_order_result,
+            );
             let block_reason = format!("LIVE_NOT_READY:{}", blocker);
             lifecycle(
                 &*state.store,
@@ -3818,7 +3894,9 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
 
     lifecycle(&*state.store, chosen.role, &chosen.action_id, NpcLifecycleState::Queued, "ready for dispatch");
 
-    if effective_cfg.mode == NpcTradingMode::Simulation || is_micro_safe_execution {
+    if effective_cfg.mode == NpcTradingMode::Simulation
+        || (effective_cfg.mode != NpcTradingMode::Live && is_micro_safe_execution)
+    {
         lifecycle(
             &*state.store,
             chosen.role,
@@ -3837,6 +3915,16 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         rt.perf.entry(chosen.role).or_default().executed += 1;
     } else {
         let Some(url) = state.web_base_url.as_ref().map(|b| format!("{}/trade/request", b)) else {
+            rt.order_sent_to_binance = false;
+            rt.last_live_order_result = format!(
+                "ORDER_SENT_TO_BINANCE=false side={} qty={:.8} notional={:.8} rejection_reason=WEB_UI_ADDR_MISSING",
+                chosen.side, allocation.qty, order_notional
+            );
+            log_npc_event(
+                &*state.store,
+                "live_order_dispatch",
+                &rt.last_live_order_result,
+            );
             lifecycle(
                 &*state.store,
                 chosen.role,
@@ -3904,6 +3992,19 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
         );
         match reqwest::Client::new().post(&url).form(&form).send().await {
             Ok(resp) if resp.status().is_success() => {
+                rt.order_sent_to_binance = execution_mode == ExecutionMode::LiveSpot;
+                rt.last_live_order_result = format!(
+                    "ORDER_SENT_TO_BINANCE={} side={} qty={:.8} notional={:.8} rejection_reason=",
+                    rt.order_sent_to_binance,
+                    chosen.side,
+                    allocation.qty,
+                    order_notional
+                );
+                log_npc_event(
+                    &*state.store,
+                    "live_order_dispatch",
+                    &rt.last_live_order_result,
+                );
                 lifecycle(
                     &*state.store,
                     chosen.role,
@@ -3923,6 +4024,17 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                 } else {
                     body_preview.clone()
                 };
+                let rejection_reason = format!("HTTP_STATUS_{}", status_code);
+                rt.order_sent_to_binance = false;
+                rt.last_live_order_result = format!(
+                    "ORDER_SENT_TO_BINANCE=false side={} qty={:.8} notional={:.8} rejection_reason={}",
+                    chosen.side, allocation.qty, order_notional, rejection_reason
+                );
+                log_npc_event(
+                    &*state.store,
+                    "live_order_dispatch",
+                    &rt.last_live_order_result,
+                );
                 lifecycle(
                     &*state.store,
                     chosen.role,
@@ -3962,6 +4074,16 @@ async fn run_cycle(cfg: &NpcConfig, state: &AgentState, runtime: Arc<Mutex<NpcRu
                 };
             }
             Err(e) => {
+                rt.order_sent_to_binance = false;
+                rt.last_live_order_result = format!(
+                    "ORDER_SENT_TO_BINANCE=false side={} qty={:.8} notional={:.8} rejection_reason=REQUEST_ERROR:{}",
+                    chosen.side, allocation.qty, order_notional, e
+                );
+                log_npc_event(
+                    &*state.store,
+                    "live_order_dispatch",
+                    &rt.last_live_order_result,
+                );
                 lifecycle(
                     &*state.store,
                     chosen.role,
@@ -5972,10 +6094,10 @@ mod tests {
     }
 
     #[test]
-    fn sub_250_balance_auto_resolves_to_micro_safe_profile() {
+    fn selected_profile_remains_bound_without_balance_override() {
         let selected = RuntimeProfile::Active;
         let resolved = resolve_runtime_profile(selected, 100.0);
-        assert_eq!(resolved, RuntimeProfile::MicroSafeExecution);
+        assert_eq!(resolved, RuntimeProfile::Active);
     }
 
     #[test]
@@ -6466,6 +6588,9 @@ mod diagnostic_tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
     use tokio::sync::Mutex;
 
     use super::*;
@@ -6523,6 +6648,24 @@ mod diagnostic_tests {
             symbol: "BTCUSDT".into(),
             web_base_url,
         }
+    }
+
+    async fn spawn_trade_request_server() -> (String, oneshot::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock trade server");
+        let addr = listener.local_addr().expect("local addr");
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = vec![0_u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let _ = tx.send(req);
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+                    .await;
+            }
+        });
+        (format!("http://{}", addr), rx)
     }
 
     fn active_npc_cfg() -> NpcConfig {
@@ -6702,8 +6845,8 @@ mod diagnostic_tests {
         }
 
         let report = run_cycle(&cfg, &state, runtime).await;
-        assert_eq!(report.threshold_mode, "micro_safe_execution");
-        assert!((report.effective_threshold - THRESHOLD_MICRO_SAFE_EXECUTION).abs() < f64::EPSILON);
+        assert_ne!(report.threshold_mode, "micro_safe_execution");
+        assert!(report.effective_threshold > 0.0);
         assert_eq!(report.final_decision, "EXECUTE");
     }
 
@@ -6714,11 +6857,12 @@ mod diagnostic_tests {
         let store = InMemoryEventStore::new();
         let authority = Arc::new(AuthorityLayer::new());
         authority.set_mode_auto(&*store).await;
+        let (base_url, req_rx) = spawn_trade_request_server().await;
 
         let state = make_agent_state(
             Arc::clone(&store) as Arc<dyn crate::store::EventStore>,
             Arc::clone(&authority),
-            None,
+            Some(base_url),
         );
         let mut cfg = active_npc_cfg();
         cfg.mode = NpcTradingMode::Live;
@@ -6743,6 +6887,8 @@ mod diagnostic_tests {
         let report = run_cycle(&cfg, &state, runtime).await;
         assert_eq!(report.final_decision, "EXECUTE");
         assert_ne!(report.execution_result, "LIVE_REQUIRES_PAPER_EXECUTION");
+        let req = req_rx.await.expect("mock server received request");
+        assert!(req.contains("POST /trade/request"), "live mode must dispatch real trade request path");
     }
 
     #[tokio::test]
@@ -6773,6 +6919,39 @@ mod diagnostic_tests {
         let report = run_cycle(&cfg, &state, runtime).await;
         assert_eq!(report.final_decision, "BLOCKED");
         assert!(report.execution_result.contains("EXCHANGE_UNAVAILABLE"));
+    }
+
+    #[tokio::test]
+    async fn live_spot_disables_contract_executor_for_swing_profile() {
+        let store = InMemoryEventStore::new();
+        let authority = Arc::new(AuthorityLayer::new());
+        authority.set_mode_auto(&*store).await;
+        let state = make_agent_state(
+            Arc::clone(&store) as Arc<dyn crate::store::EventStore>,
+            Arc::clone(&authority),
+            None,
+        );
+        let mut cfg = active_npc_cfg();
+        cfg.mode = NpcTradingMode::Live;
+        cfg.behavior_profile = "SWING".to_string();
+        state.exec.set_mode_ready().await;
+        {
+            let mut feed = state.feed.lock().await;
+            populate_feed(&mut feed, 50_000.0, 40);
+        }
+        {
+            let mut truth = state.truth.lock().await;
+            truth.buy_power = 100.0;
+            truth.sell_inventory = 0.001;
+            truth.total_balance_usd = 100.0;
+        }
+
+        let runtime = Arc::new(Mutex::new(NpcRuntimeState::default()));
+        let _ = run_cycle(&cfg, &state, Arc::clone(&runtime)).await;
+        let rt = runtime.lock().await;
+        assert_eq!(rt.contract_last_no_open_reason, "LIVE_SPOT_CONTRACT_PATH_DISABLED");
+        assert!(!rt.contract_paper_mode, "live runtime must disable paper contract executor");
+        assert_eq!(ExecutionMode::from_trading_mode(cfg.mode).as_str(), "LIVE_SPOT");
     }
 
     #[tokio::test]
@@ -7346,10 +7525,9 @@ mod diagnostic_tests {
 
         let report = run_cycle(&cfg, &state, runtime).await;
 
-        // Sub-$250 accounts are now forced into MICRO_SAFE_EXECUTION and should
-        // prefer safe executability over FLIP_HYPER profit-floor blocking.
-        assert_eq!(report.threshold_mode, "micro_safe_execution");
-        assert_eq!(report.final_decision, "EXECUTE");
+        // FLIP_HYPER must stay bound as selected; no micro-safe profile override.
+        assert_eq!(report.threshold_mode, "flip_hyper");
+        assert_ne!(report.threshold_mode, "micro_safe_execution");
     }
 
     /// Proves that FLIP_HYPER threshold mode is set when behavior_profile ==
@@ -7382,8 +7560,8 @@ mod diagnostic_tests {
 
         let report = run_cycle(&cfg, &state, runtime).await;
 
-        assert_eq!(report.threshold_mode, "micro_safe_execution");
-        assert!((report.effective_threshold - THRESHOLD_MICRO_SAFE_EXECUTION).abs() < f64::EPSILON);
+        assert_eq!(report.threshold_mode, "flip_hyper");
+        assert!((report.effective_threshold - THRESHOLD_FLIP_HYPER_SMALL).abs() < f64::EPSILON);
     }
 
 }

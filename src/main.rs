@@ -220,13 +220,15 @@ async fn main() -> Result<()> {
     let bnb_price: f64 = env_f64("BNB_PRICE_USD", 0.0);
 
     // ── Runtime profile ──────────────────────────────────────────────────────
-    // RUNTIME_PROFILE env-var: CONSERVATIVE | ACTIVE | MICRO_TEST | MICRO_ACTIVE (default: ACTIVE)
-    let runtime_profile = profile::RuntimeProfile::from_str(
+    // Default profile is used only when no persisted active profile exists.
+    let default_profile = profile::RuntimeProfile::from_str(
         &std::env::var("RUNTIME_PROFILE").unwrap_or_else(|_| "ACTIVE".into()),
     );
+    let (runtime_profile, profile_source) = profile::load_active_profile(default_profile);
     let profile_cfg = profile::ProfileConfig::for_profile(runtime_profile);
     info!(
         profile = runtime_profile.as_str(),
+        source  = profile_source.as_str(),
         label   = runtime_profile.label(),
         min_confidence            = profile_cfg.signal_min_confidence,
         entry_cooldown_secs       = profile_cfg.entry_cooldown_after_exit.as_secs(),
@@ -473,8 +475,11 @@ async fn main() -> Result<()> {
     } else {
         warn!("[DISPATCH] No dispatch base URL resolved — trade dispatch will be blocked (WEB_UI_ADDR_MISSING)");
     }
+    let mut npc_cfg = npc::NpcConfig::from_trade_cfg(&trade_cfg);
+    npc_cfg.behavior_profile = runtime_profile.as_str().to_string();
+    npc_cfg.profile_source = profile_source;
     let npc_controller = Arc::new(npc::NpcAutonomousController::new(
-        npc::NpcConfig::from_trade_cfg(&trade_cfg),
+        npc_cfg,
         agent::AgentState {
             store: Arc::clone(&event_store),
             exec: Arc::clone(&exec),
