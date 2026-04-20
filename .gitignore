@@ -1,1 +1,5 @@
 /target/
+
+# SAIN-FLIGHTS TypeScript build artifacts and dependencies
+sain-flights/node_modules/
+sain-flights/dist/
